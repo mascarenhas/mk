@@ -7,8 +7,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v1
+      - name: Build docker image
+        run: docker build . --file Dockerfile --tag image:latest
       - name: Run tests
-        run: lua test/test_routes.lua
+        run: docker run -it image:latest lua test/test_routes.lua
   deploy:
     runs-on: ubuntu-latest
     steps:
