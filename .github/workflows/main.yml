@@ -8,9 +8,9 @@ jobs:
     steps:
       - uses: actions/checkout@v1
       - name: Build docker image
-        run: docker build . --file Dockerfile --tag image:latest
+        run: docker build . -t image
       - name: Run tests
-        run: docker run -it image:latest lua test/test_routes.lua
+        run: docker run image lua test/test_routes.lua
   deploy:
     runs-on: ubuntu-latest
     steps:
