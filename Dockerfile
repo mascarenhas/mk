@@ -19,6 +19,7 @@ RUN apk --no-cache add \
 
 ADD *.lua ./
 ADD mk mk
+ADD test test
 
 EXPOSE ${PORT}
 
