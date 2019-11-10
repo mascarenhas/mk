@@ -1,2 +1,1 @@
-# cnluapoc
-Cloud Native Lua Service
+# "Cloud Native" Lua PoC

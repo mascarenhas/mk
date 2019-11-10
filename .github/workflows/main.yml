@@ -3,6 +3,12 @@ name: CI
 on: [push]
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+      - name: Run tests
+        run: lua test/test_routes.lua
   deploy:
     runs-on: ubuntu-latest
     steps:

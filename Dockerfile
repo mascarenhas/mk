@@ -17,7 +17,8 @@ RUN apk --no-cache add \
   && luarocks install http \
   && apk del build-deps
 
-ADD *.lua /app/
+ADD *.lua ./
+ADD mk mk
 
 EXPOSE ${PORT}
 
