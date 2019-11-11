@@ -32,4 +32,4 @@ jobs:
           PROJECT_ID: ${{secrets.GCLOUD_PROJECT_ID}}
           APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
         with:
-          args: components install beta && gcloud beta run services add-iam-policy-binding --region=us-east1 --member=allUsers --role=roles/run.invoker cnluapoc-${{steps.extract_branch.outputs.branch}} && gcloud beta run deploy cnluapoc-${{steps.extract_branch.outputs.branch}} --quiet --platform managed --region us-east1 --allow-unauthenticated --image gcr.io/${{secrets.GCLOUD_PROJECT_ID}}/luahttp:${{steps.extract_branch.outputs.branch}}
+          args: components install beta && gcloud beta run services add-iam-policy-binding --region=us-east1 --member=allUsers --role=roles/run.invoker mkpoc-${{steps.extract_branch.outputs.branch}} && gcloud beta run deploy mkpoc-${{steps.extract_branch.outputs.branch}} --quiet --platform managed --region us-east1 --allow-unauthenticated --image gcr.io/${{secrets.GCLOUD_PROJECT_ID}}/luahttp:${{steps.extract_branch.outputs.branch}}
