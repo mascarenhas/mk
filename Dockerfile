@@ -18,10 +18,10 @@ RUN apk --no-cache add \
   && luarocks install http \
   && apk del build-deps
 
-ADD *.lua ./
-ADD mk mk
-ADD test test
+ADD src ./
+ADD test ./
+ADD examples examples
 
 EXPOSE ${PORT}
 
-CMD ["lua", "server.lua"]
+CMD ["lua", "examples/server.lua"]
