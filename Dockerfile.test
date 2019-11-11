@@ -19,8 +19,6 @@ RUN apk --no-cache add \
   && apk del build-deps
 
 ADD src ./
-ADD examples examples
+ADD test ./
 
-EXPOSE ${PORT}
-
-CMD ["lua", "samples/service.lua"]
+CMD ["lua", "test_routes.lua"]
