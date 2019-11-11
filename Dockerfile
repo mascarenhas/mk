@@ -14,6 +14,7 @@ RUN apk --no-cache add \
   git \
   unzip \
   openssl-dev \
+  && luarocks install lua-cjson 2.1.0 \
   && luarocks install http \
   && apk del build-deps
 

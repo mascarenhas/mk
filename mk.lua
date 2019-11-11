@@ -14,21 +14,21 @@ mk._DESCRIPTION = "Mini-Kepler rebooted for Lua web services"
 mk.methods = {}
 
 local function not_found(req, res)
-  res:status(404)
-  res:content_type("text/html")
-  res:write [[<html>
-        <head><title>Not Found</title></head>
-        <body><p>Resource not found</p></body></html>]]
+  return 404, [[
+    <html>
+      <head><title>Not Found</title></head>
+      <body><p>Resource not found</p></body>
+    </html>
+  ]]
 end
 
 local function server_error(req, res, error)
-  res:status(500)
-  res:content_type("text/html")
-  res:write(
-    [[<html>
-        <head><title>Server Error</title></head>
-        <body>Interval server error</body></html>]]
-  )
+  return 500, [[
+    <html>
+      <head><title>Server Error</title></head>
+      <body>Interval server error</body>
+    </html>
+  ]]
 end
 
 local http_methods = {"all", "head", "get", "options", "post", "put", "delete", "patch"}
@@ -51,6 +51,10 @@ end
 for _, method in ipairs(http_methods) do
   local http_method = string.upper(method)
   mk.methods[method] = function(self, route, handler, name)
+    if type(route) == "function" then
+      handler = route
+      route = "/**"
+    end
     name = name or route
     local compiled_route = R(route)
     self.routes[name] = compiled_route.build
@@ -121,27 +125,20 @@ function mk.methods:handle(stream)
   }
   local res_headers = http_headers.new()
   res_headers:append(":status", "200")
-  res_headers:append("content-type", "text/plain")
+  res_headers:append("content-type", "text/html")
   local res = {
     headers = res_headers,
-    status = function(self, status)
-      self.headers:upsert(":status", tostring(status))
-    end,
     content_type = function(self, mime_type)
       self.headers:upsert("content-type", mime_type)
     end,
     stream = stream,
-    parts = {},
-    write = function(self, s)
-      table.insert(self.parts, s)
-    end
   }
   local function match_handler(index)
-    local handler, match, index = self:match(method, path)
+    local handler, match, index = self:match(method, path, index)
     handler = handler or self.not_found
     match = match or {}
     repeat
-      local ok, error =
+      local ok, status_or_error, response =
         xpcall(
         function()
           return handler(req, res, match, function ()
@@ -151,21 +148,21 @@ function mk.methods:handle(stream)
         debug.traceback
       )
       if not ok then
-        self:log(req, error, "error")
-        handler, match = self.server_error, error
+        self:log(req, status_or_error, "error")
+        handler, match = self.server_error, status_or_error
       else
         self:log(req, res.headers:get(":status"))
+        return status_or_error, response
       end
     until ok
   end
-  match_handler()
+  local status, response = match_handler()
+  res.headers:upsert(":status", tostring(status))
   if method == "HEAD" then
     stream:write_headers(res.headers, true)
   else
-    local body = table.concat(res.parts)
-    res.headers:upsert("content-length", tostring(#body))
     stream:write_headers(res.headers, false)
-    stream:write_chunk(body, true)
+    stream:write_chunk(tostring(response), true)
   end
 end
 
