@@ -34,7 +34,7 @@ app:get(
 )
 
 app:post(
-	"/show",
+	"/json",
 	function (req, res)
 		local json = req:json()
 		res:json()
