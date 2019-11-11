@@ -7,7 +7,6 @@ app:get("/", function (req, res)
 	res:status(200)
 	res:content_type("application/json")
 	res:write('{"foo": "bar"}')
-	res:finish()
 end)
 
 app:get("/error", function (req, res)

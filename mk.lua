@@ -19,7 +19,6 @@ local function not_found(req, res)
   res:write [[<html>
         <head><title>Not Found</title></head>
         <body><p>Resource not found</p></body></html>]]
-  res:finish()
 end
 
 local function server_error(req, res, error)
@@ -30,7 +29,6 @@ local function server_error(req, res, error)
         <head><title>Server Error</title></head>
         <body>Interval server error</body></html>]]
   )
-  res:finish()
 end
 
 local http_methods = {"head", "get", "options", "post", "put", "delete", "patch"}
@@ -136,36 +134,39 @@ function mk.methods:handle(stream)
     parts = {},
     write = function(self, s)
       table.insert(self.parts, s)
-    end,
-    finish = function(self)
-      if method == "HEAD" then
-        self.stream:write_headers(self.headers, true)
-      else
-        local body = table.concat(self.parts)
-        res_headers:upsert("content-length", tostring(#body))
-        self.stream:write_headers(self.headers, false)
-        self.stream:write_chunk(body, true)
-      end
     end
   }
-  local handler, match, index = self:match(method, path)
-  handler = handler or self.not_found
-  match = match or {}
-  repeat
-    local ok, error =
-      xpcall(
-      function()
-        return handler(req, res, match)
-      end,
-      debug.traceback
-    )
-    if not ok then
-      self:log(req, error, "error")
-      handler, match = self.server_error, error
-    else
-      self:log(req, res.headers:get(":status"))
-    end
-  until ok
+  local function match_handler(index)
+    local handler, match, index = self:match(method, path)
+    handler = handler or self.not_found
+    match = match or {}
+    repeat
+      local ok, error =
+        xpcall(
+        function()
+          return handler(req, res, match, function ()
+            return match_handler(index)
+          end)
+        end,
+        debug.traceback
+      )
+      if not ok then
+        self:log(req, error, "error")
+        handler, match = self.server_error, error
+      else
+        self:log(req, res.headers:get(":status"))
+      end
+    until ok
+  end
+  match_handler()
+  if method == "HEAD" then
+    stream:write_headers(res.headers, true)
+  else
+    local body = table.concat(res.parts)
+    res.headers:upsert("content-length", tostring(#body))
+    stream:write_headers(res.headers, false)
+    stream:write_chunk(body, true)
+  end
 end
 
 function mk.methods:run(port)
