@@ -11,7 +11,7 @@ app:get(
 	function(req, res)
 		return 200, [[
 		<html>
-			<head>Hello World</head>
+			<head><title>Hello World</title></head>
 			<body><h1>Hello World!</h1></body>
 		</html>
 	]]
