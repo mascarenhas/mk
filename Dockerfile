@@ -19,7 +19,7 @@ RUN apk --no-cache add \
   && apk del build-deps
 
 ADD src ./
-ADD examples examples
+ADD samples samples
 
 EXPOSE ${PORT}
 
