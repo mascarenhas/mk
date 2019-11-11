@@ -31,7 +31,7 @@ local function server_error(req, res, error)
   )
 end
 
-local http_methods = {"head", "get", "options", "post", "put", "delete", "patch"}
+local http_methods = {"all", "head", "get", "options", "post", "put", "delete", "patch"}
 
 function mk.new(app)
   if type(app) == "string" then
@@ -70,7 +70,7 @@ function mk.methods:match(method, path, index)
   index = index or 0
   for index = index + 1, #self.routes do
     local entry = self.routes[index]
-    if entry.method == method then
+    if entry.method == "ALL" or entry.method == method then
       local match = entry.route:match(path)
       if match then
         return entry.handler, match, index
