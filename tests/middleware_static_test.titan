@@ -22,8 +22,14 @@ local function within(ms: integer, what: string, action: function (): ())
     return nil
   end)
   defer do
-    if not deadline:status():has_finished() then deadline:cancel() end
-    if not worker:status():has_finished() then worker:cancel() end
+    if not deadline:status():has_finished() then
+      deadline:cancel()
+      async.join(deadline)
+    end
+    if not worker:status():has_finished() then
+      worker:cancel()
+      async.join(worker)
+    end
   end
   case async.race_two(worker, deadline)
   when first(status) then
@@ -101,10 +107,13 @@ local function make_fixture(context: test.Context): Fixture
   fs.write_file(root .. "/<b>&.txt", "markup")
   fs.write_file(root .. "/con.txt", "device")
   fs.write_file(root .. "/sub/page.txt", "0123456789")
+  fs.write_file(root .. "/LICENSE", "license text")
+  fs.mkdir(root .. "/linked")
   fs.write_file(base .. "/public2/file.txt", "outside sibling")
   fs.write_file(base .. "/secret.txt", "top secret")
   symlink("../secret.txt", root .. "/link.txt")
   symlink("../public2", root .. "/escape")
+  symlink("../index.html", root .. "/linked/index.html")
   return Fixture(base, root)
 end
 
@@ -272,5 +281,91 @@ function test_static_on_pool_worker(context: test.Context)
     local text = out:drain()
     expect(strings.sub(text, 1, 12) == "HTTP/1.1 200" and strings.sub(text, -10) == "0123456789",
       "served by a pool worker: " .. text)
+  end)
+end
+
+function test_unservable_paths_are_404(context: test.Context)
+  local fixture = make_fixture(context)
+  local app = mk.App()
+  app:get("/assets/*", static.new(fixture.root))
+  local expect_404 = function (target: string, what: string)
+    context:run(what, function (_: test.Context)
+      local response = call(app, "GET", target)
+      expect(response.status == 404, what .. " -> " .. response.status .. " " .. response.body)
+    end)
+  end
+  expect_404("/assets/app.js/child", "not_a_directory")
+  expect_404("/assets/" .. strings.rep("x", 300) .. ".txt", "name_too_long")
+  expect_404("/assets/a%00b", "nul_escape")
+  expect_404("/assets/linked/", "symlinked_index_is_skipped")
+end
+
+function test_listing_links_stay_origin_relative(context: test.Context)
+  local fixture = make_fixture(context)
+  context:run("route", function (_: test.Context)
+    local app = mk.App()
+    app:get("/*", static.new(fixture.root, static.Config { browse = true, index_names = {} }))
+    local response = call(app, "GET", "//")
+    expect(response.status == 200, "root listing: " .. response.status)
+    expect(strings.find(response.body, "href=\"//") == nil, "no protocol-relative links: " .. response.body)
+    expect(strings.find(response.body, "href=\"/sub/\"") ~= nil, "collapsed base")
+    expect(strings.find(response.body, "con.txt") == nil, "device names are not listed")
+  end)
+  context:run("middleware", function (_: test.Context)
+    local app = mk.App()
+    app:use(static.new(fixture.root, static.Config { browse = true, index_names = {} }))
+    local response = call(app, "GET", "//sub//")
+    expect(response.status == 200 and strings.find(response.body, "href=\"//") == nil,
+      "no protocol-relative links below a subdirectory: " .. response.body)
+    expect(strings.find(response.body, "href=\"/sub/page.txt\"") ~= nil, "collapsed nested base")
+  end)
+end
+
+function test_percent_encoded_mount_prefix(context: test.Context)
+  local fixture = make_fixture(context)
+  local files = mk.App()
+  files:use(static.new(fixture.root))
+  local app = mk.App()
+  app:mount("/files", files)
+  expect(call(app, "GET", "/%66iles/app.js").body == "console.log(1)", "encoded mount prefix is stripped")
+end
+
+function test_response_headers_by_outcome(context: test.Context)
+  local fixture = make_fixture(context)
+  local app = mk.App()
+  app:get("/x/*", static.new(fixture.root, static.Config {
+    byte_range = true, download = true, max_age = 60,
+  }))
+  app:get("/hook/*", static.new(fixture.root, static.Config {
+    modify_response = function (ctx: mk.Context) ctx:send_string("hooked"):commit() end,
+  }))
+  context:run("extensionless_download_has_a_type", function (_: test.Context)
+    local response = call(app, "GET", "/x/LICENSE")
+    expect(response.body == "license text", "license body")
+    expect(response:header("Content-Type") == "application/octet-stream", "default type: " ..
+      (response:header("Content-Type") or "nil"))
+    expect(response:header("Content-Disposition") == "attachment; filename=\"LICENSE\"", "attachment")
+  end)
+  context:run("unsatisfiable_range_carries_only_content_range", function (_: test.Context)
+    local response = call(app, "GET", "/x/sub/page.txt", {"Range", "bytes=50-"})
+    expect(response.status == 416 and response:header("Content-Range") == "bytes */10", "416")
+    expect(response:header("Content-Disposition") == nil and response:header("Cache-Control") == nil and
+      response:header("ETag") == nil, "no representation headers on 416")
+  end)
+  context:run("malformed_ranges_serve_the_file", function (_: test.Context)
+    expect(call(app, "GET", "/x/sub/page.txt", {"Range", "bytes=0x0-0x5"}).status == 200, "hex range")
+    expect(call(app, "GET", "/x/sub/page.txt", {"Range", "bytes=+0-+5"}).status == 200, "signed range")
+  end)
+  context:run("malformed_if_modified_since_is_ignored", function (_: test.Context)
+    expect(call(app, "GET", "/x/sub/page.txt",
+      {"If-Modified-Since", "Sun, 06 Nov 2094 08:49:37 GMX"}).status == 200, "bad zone")
+    expect(call(app, "GET", "/x/sub/page.txt",
+      {"If-Modified-Since", "Sun, +6 Nov 2094 08:49:37 GMT"}).status == 200, "signed day")
+    expect(call(app, "GET", "/x/sub/page.txt",
+      {"If-Modified-Since", "Sun, 06 Nov 2094 08:49:61 GMT"}).status == 200, "out-of-range second")
+  end)
+  context:run("modify_response_may_finish_the_response", function (_: test.Context)
+    local response = call(app, "GET", "/hook/sub/page.txt")
+    expect(response.status == 200 and response.body == "hooked", "the hook's committed response stands")
   end)
 end

@@ -21,8 +21,14 @@ local function within(ms: integer, what: string, action: function (): ())
     return nil
   end)
   defer do
-    if not deadline:status():has_finished() then deadline:cancel() end
-    if not worker:status():has_finished() then worker:cancel() end
+    if not deadline:status():has_finished() then
+      deadline:cancel()
+      async.join(deadline)
+    end
+    if not worker:status():has_finished() then
+      worker:cancel()
+      async.join(worker)
+    end
   end
   case async.race_two(worker, deadline)
   when first(status) then
@@ -415,10 +421,13 @@ function test_timeout_preserves_shutdown_cancellation(_: test.Context)
     timer.sleep(60000)
   end)
   local server = app:listen_test()
+  defer server:close()
   local client = async.run<|string, value|>(function (): string
     return fetch_once(server.host, server.port, "GET /hang HTTP/1.1\r\nHost: t\r\n\r\n")
   end)
-  while not entered do timer.yield() end
+  within(3000, "handler entry", function ()
+    while not entered do timer.yield() end
+  end)
   within(5000, "shutdown", function () server:close() end)
   within(3000, "client", function ()
     local text = ""
@@ -428,5 +437,97 @@ function test_timeout_preserves_shutdown_cancellation(_: test.Context)
     end
     -- Cancellation is not converted into a 503 timeout response.
     expect(text == "", "the cancelled request was aborted without a response: " .. text)
+  end)
+end
+
+function test_keyauth_validation_and_chained_challenge(context: test.Context)
+  context:run("invalid_extractors_and_text", function (_: test.Context)
+    local rejects = function (extractor: keyauth.Extractor): string
+      return raises(function ()
+        keyauth.new(keyauth.Config { validator = secret_validator, extractor = extractor })
+      end)
+    end
+    expect(rejects(keyauth.Extractor.auth_header("")) == "keyauth: auth_header scheme must be an HTTP token",
+      "empty scheme")
+    expect(rejects(keyauth.Extractor.auth_header("Bear er")) == "keyauth: auth_header scheme must be an HTTP token",
+      "scheme with a space")
+    expect(rejects(keyauth.Extractor.header("bad name")) == "keyauth: header name must be an HTTP token", "header")
+    expect(rejects(keyauth.Extractor.query("")) == "keyauth: query name must not be empty", "query")
+    expect(rejects(keyauth.Extractor.cookie("")) == "keyauth: cookie name must not be empty", "cookie")
+    expect(rejects(keyauth.Extractor.chain({})) == "keyauth: chain needs at least one extractor", "empty chain")
+    expect(rejects(keyauth.Extractor.chain({keyauth.Extractor.single_header("")})) ==
+      "keyauth: header name must be an HTTP token", "nested chain entries are validated")
+    expect(raises(function ()
+      keyauth.new(keyauth.Config { validator = secret_validator, realm = "a\nb" })
+    end) == "keyauth: realm contains a forbidden byte", "header-forbidden realm")
+  end)
+  context:run("chain_uses_the_authorization_scheme", function (_: test.Context)
+    local app = mk.App()
+    app:use(keyauth.new(keyauth.Config {
+      validator = secret_validator, error_code = "invalid_token", scope = "",
+      extractor = keyauth.Extractor.chain({keyauth.Extractor.header("X-Key"),
+        keyauth.Extractor.auth_header("Token")}),
+    }))
+    app:get("/", echo_token)
+    expect(call(app, "GET", "/"):header("WWW-Authenticate") ==
+      "Token realm=\"Restricted\", error=\"invalid_token\"", "RFC 6750 challenge through a chain, empty scope omitted")
+    expect(call(app, "GET", "/", {"Authorization", "token s3cret"}).body == "token s3cret", "chained auth header")
+  end)
+end
+
+function test_timeout_middleware_options(context: test.Context)
+  local app = mk.App()
+  app:use_path("/zero", timeout.middleware(0))
+  app:get("/zero/slow", function (ctx: mk.Context)
+    timer.sleep(30)
+    ctx:send_string("deadline " .. (ctx:deadline_ns() == nil and "none" or "set"))
+  end)
+  app:use_path("/custom", timeout.middleware(20, timeout.Config {
+    next = function (ctx: mk.Context): boolean return ctx:query_opt("skip") ~= nil end,
+    on_timeout = function (ctx: mk.Context) ctx:status(504):send_string("custom") end,
+  }))
+  app:get("/custom/slow", slow_handler)
+  app:get("/custom/deadline", function (ctx: mk.Context)
+    ctx:send_string(ctx:deadline_ns() == nil and "none" or "set")
+  end)
+  context:run("zero_disables_the_deadline", function (_: test.Context)
+    expect(call(app, "GET", "/zero/slow").body == "deadline none", "0 ms runs inline")
+  end)
+  context:run("on_timeout_and_next", function (_: test.Context)
+    local timed_out = call(app, "GET", "/custom/slow")
+    expect(timed_out.status == 504 and timed_out.body == "custom", "middleware on_timeout")
+    expect(call(app, "GET", "/custom/deadline").body == "set", "the chain runs under the deadline")
+    expect(call(app, "GET", "/custom/deadline?skip=1").body == "none", "next skips the deadline")
+  end)
+  context:run("negative_middleware_timeout", function (_: test.Context)
+    expect(raises(function () timeout.middleware(-5) end) == "timeout: timeout_ms must be non-negative",
+      "negative middleware timeout")
+  end)
+end
+
+function test_security_middleware_on_a_worker(context: test.Context)
+  local app = mk.App()
+  app:use(helmet.new())
+  app:get("/guarded", keyauth.new(keyauth.Config {
+    validator = secret_validator,
+    extractor = keyauth.Extractor.chain({keyauth.Extractor.query("key"),
+      keyauth.Extractor.auth_header("Bearer")}),
+  }), timeout.new(function (ctx: mk.Context)
+    ctx:send_string("worker " .. ctx:worker_id() .. " deadline " ..
+      (ctx:deadline_ns() ~= nil and "set" or "none"))
+  end, 1000)):workers(mk.WorkerMode.pool())
+  local server = app:listen_test()
+  context:cleanup(function () server:close() end)
+  within(5000, "worker request", function ()
+    local text = fetch_once(server.host, server.port,
+      "GET /guarded?key=s3cret HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+    expect(status_of(text) == "200" and strings.sub(body_of(text), 1, 7) == "worker " and
+      body_of(text) ~= "worker 0 deadline set" and strings.sub(body_of(text), -12) == "deadline set",
+      "keyauth chain and timeout ran on a pool worker: " .. text)
+    expect(header_line(text, "X-Frame-Options") == "SAMEORIGIN", "helmet ran on the worker")
+    local denied = fetch_once(server.host, server.port,
+      "GET /guarded HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+    expect(status_of(denied) == "401" and header_line(denied, "WWW-Authenticate") == "Bearer realm=\"Restricted\"",
+      "worker rejection with the chained challenge: " .. denied)
   end)
 end
