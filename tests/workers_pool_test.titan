@@ -315,36 +315,106 @@ function test_serving_task_cancelled_before_handler_entry(_: test.Context)
   test.assert(finished_text(client) == "", "the never-served exchange was aborted")
 end
 
-function test_stop_worker_aborts_and_respawns(_: test.Context)
-  local gate_tx, gate_rx = thread.channel<|boolean|>(1)
-  local app = mk.App(mk.Config { workers = mk.WorkerMode.pool() })
+-- Start `app` on a scanned loopback port and serve it in a Task whose
+-- result is App:serve's raised error text ("" after an ordinary shutdown).
+local function start_serving(app: mk.App): (integer, async.Task<|string, value|>)
+  local port = 41000 + (os.pid() % 100) * 64
+  for _ = 1, 64 do
+    local bound = false
+    do
+      app:start("127.0.0.1:" .. port)
+      bound = true
+    catch
+      if not (error is async.OperationError) then raise end
+      local failure = error as async.OperationError
+      if failure.name ~= "EADDRINUSE" then raise end
+    end
+    if bound then
+      return port, async.run<|string, value|>(function (): string
+        app:serve()
+        return ""
+      catch
+        if error is async.CancellationReason then raise end
+        return string.tostring(error)
+      end)
+    end
+    port = port + 1
+  end
+  raise "no free port"
+end
+
+function test_pool_worker_exit_fails_the_app(_: test.Context)
+  local _gate_tx, gate_rx = thread.channel<|boolean|>(1)
+  local post_failure = "none"
+  local app = mk.App(mk.Config { workers = mk.WorkerMode.pool(mk.PoolOptions { size = 2 }) })
+  app:hooks():on_post_shutdown(function (failure: async.Error?)
+    if failure ~= nil then post_failure = string.tostring(failure.error) end
+  end)
   app:get("/block", function (ctx: mk.Context)
     gate_rx:receive()
-    ctx:send_string("released")
+    ctx:send_string("never")
   end)
-  app:get("/who", function (ctx: mk.Context) ctx:send_string("" .. ctx:worker_id()) end)
+  local port, serving = start_serving(app)
+  local infos = app:pool_workers()
+  local victim = (infos[1] as mk.WorkerInfo).id
+  local survivor = (infos[2] as mk.WorkerInfo).id
+  local blocked = spawn_fetch("127.0.0.1", port, "/block")
+  timer.sleep(50)
+  test.assert(app:stop_worker(victim), "stop_worker accepted a live pool worker")
+  local expected = "mk: pool worker " .. victim .. " was cancelled"
+  within(5000, "forced shutdown", function ()
+    local raised = finished_text(serving)
+    test.assert(raised == expected, "App:serve raised the pool failure: " .. raised)
+  end)
+  test.assert(not app:is_running(), "the App stopped")
+  test.assert(not app:is_worker_alive(victim) and not app:is_worker_alive(survivor),
+    "every pool worker was retired")
+  test.assert(not app:stop_worker(victim), "a retired worker cannot be stopped again")
+  test.assert(post_failure == expected, "on_post_shutdown observed the failure: " .. post_failure)
+  within(3000, "blocked client released", function ()
+    test.assert(finished_text(blocked) == "", "the in-flight exchange was aborted")
+  end)
+end
+
+function test_keep_alive_requests_rotate_pool_workers(_: test.Context)
+  local app = mk.App(mk.Config { workers = mk.WorkerMode.pool(mk.PoolOptions { size = 3 }) })
+  app:options("/health", function (ctx: mk.Context)
+    ctx:set("X-Owner", "" .. ctx:worker_id()):no_content()
+  end)
   local server = app:listen_test()
   defer server:close()
-  local original = (app:pool_workers()[1] as mk.WorkerInfo).id
-  local blocked = spawn_fetch(server.host, server.port, "/block")
-  timer.sleep(50)
-  test.assert(app:stop_worker(original), "stop_worker accepted a live worker")
-  within(5000, "worker stop", function ()
-    test.assert(finished_text(blocked) == "", "the active exchange was aborted")
-    while app:is_worker_alive(original) do timer.yield() end
-    while true do
-      local info? = app:pool_workers()[1]
-      if info ~= nil and info.id ~= original and info.alive then break end
-      timer.yield()
+  local infos = app:pool_workers()
+  test.assert(#infos == 3 and app:pool_next_index() == 1, "three workers, dispatch starts at 1")
+  within(10000, "keep-alive rotation", function ()
+    local connection = net.connect(server.host, server.port)
+    defer connection:close()
+    for index = 1, 7 do
+      connection:write("OPTIONS /health HTTP/1.1\r\nHost: t\r\n\r\n")
+      local status, owner = read_owner(connection)
+      local expected = (infos[(index - 1) % 3 + 1] as mk.WorkerInfo).id
+      test.assert(status == 204 and owner == "" .. expected,
+        "request " .. index .. " ran on " .. owner .. ", expected " .. expected)
+      test.assert(app:pool_next_index() == index % 3 + 1,
+        "keep-alive request " .. index .. " did not advance round-robin dispatch")
     end
   end)
-  test.assert(not app:stop_worker(original), "a stopped worker cannot be stopped again")
-  local replacement = (app:pool_workers()[1] as mk.WorkerInfo).id
-  within(5000, "replacement serves", function ()
-    test.assert(body_of(fetch_once(server.host, server.port, "/who")) == "" .. replacement,
-      "the replacement worker serves new requests")
-  end)
-  gate_tx:close()
+end
+
+function test_app_test_rejects_worker_routes(_: test.Context)
+  local app = mk.App()
+  app:get("/parent", function (ctx: mk.Context) ctx:send_string("parent") end)
+  app:get("/pooled", function (ctx: mk.Context) ctx:send_string("pooled") end)
+    :workers(mk.WorkerMode.pool())
+  test.assert(app:test(mk.TestRequest("GET", "/parent")).body == "parent", "parent routes run in memory")
+  local rejected = false
+  do
+    app:test(mk.TestRequest("GET", "/pooled"))
+  catch
+    rejected = true
+    test.assert(string.find(string.tostring(error), "App:listen_test") ~= nil,
+      "the error points to App:listen_test: " .. string.tostring(error))
+  end
+  test.assert(rejected, "pool routes must not run on the calling state")
 end
 
 function test_shutdown_with_blocked_pool_handler(_: test.Context)

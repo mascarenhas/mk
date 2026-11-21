@@ -79,9 +79,11 @@ local function Context:run_in_memory(): async.Error?
   return failure
 end
 
---- Dispatch `req` strictly in memory on the calling state (no sockets; worker
--- routes run here too). Unexpected handler errors propagate; an aborted
--- response raises "mk: connection aborted".
+--- Dispatch `req` strictly in memory on the calling state, without sockets.
+-- Requests that would execute on a pool or session worker raise (use
+-- `App:listen_test`); session-selector errors and nil-session fallbacks to
+-- a parent root still run here. Unexpected handler errors propagate; an
+-- aborted response raises "mk: connection aborted".
 function App:test(req: TestRequest, config: TestConfig?): TestResponse
   self:freeze()
   local timeout = 1000
@@ -123,7 +125,16 @@ function App:test(req: TestRequest, config: TestConfig?): TestResponse
       terminal = HttpError(500, "session selector returned no session for the root dispatcher",
                            "no_session", nil)
     end
-    if terminal ~= nil then chain_id = -1 end
+    if terminal ~= nil then
+      chain_id = -1
+      dispatcher = self.dispatchers[1] as Dispatcher
+    elseif session_id == nil then
+      dispatcher = self.root_dispatcher
+    end
+  end
+  if dispatcher.kind ~= DISPATCH_PARENT then
+    raise "mk: App:test runs only parent-dispatched requests in memory; " ..
+      "pool and session worker routes need App:listen_test"
   end
   local ctx = Context.create(core, meta, raw_path, target_error, chain_id, head_fallback)
   local capture = TestCapture(200, http.headers(nil), string.writer(), false, false)
@@ -194,8 +205,13 @@ function App:listen_test(host: string?, listen_config: ListenConfig?): TestServe
       if failure.name ~= "EADDRINUSE" then raise end
     end
     if bound then
+      -- A forced shutdown (for example a pool worker exit) already reached
+      -- on_post_shutdown observers; the test server only stops serving.
       local serve_task = async.run<|nil, value|>(function (): nil
         self:serve()
+        return nil
+      catch
+        if error is async.CancellationReason then raise end
         return nil
       end)
       return TestServer {

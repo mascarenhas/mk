@@ -341,3 +341,26 @@ function test_on_exit_cannot_deadlock_shutdown(_: test.Context)
   test.assert(guarded, "App:shutdown() inside on_exit raised instead of deadlocking")
   test.assert(#app:active_session_ids() == 0, "sessions retired at shutdown")
 end
+
+function test_app_test_session_routes(context: test.Context)
+  local app = mk.App()
+  app:use(function (ctx: mk.Context)
+    ctx:set("X-Global", "yes")
+    ctx:next()
+  end)
+  app:get("/relay", whoami):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = required_sid }))
+  app:get("/optional", whoami):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid }))
+  context:run("selector_error_runs_in_memory", function (_: test.Context)
+    local response = app:test(mk.TestRequest("GET", "/relay"))
+    test.assert(response.status == 400 and response.body == "sid is required" and
+      response:header("X-Global") == "yes", "parent pre-dispatch pipeline in memory")
+  end)
+  context:run("nil_session_falls_back_to_parent_root", function (_: test.Context)
+    test.assert(app:test(mk.TestRequest("GET", "/optional")).body == "0:nil", "fallback runs in memory")
+  end)
+  context:run("session_execution_is_rejected", function (_: test.Context)
+    local rejected = false
+    do app:test(mk.TestRequest("GET", "/relay?sid=a")) catch rejected = true end
+    test.assert(rejected, "a selected session worker cannot run in memory")
+  end)
+end

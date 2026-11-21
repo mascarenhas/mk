@@ -133,7 +133,8 @@ function TransferableWorkerInit.from_transfer_payload(payload: string): Transfer
   return TransferableWorkerInit(restored)
 end
 
---- One detached `http.Exchange` payload queued for a worker or the parent.
+--- Internal wire record: one detached `http.Exchange` payload queued for a
+-- worker or the parent.
 record ExchangeEnvelope
   const payload: string
   const method: string
@@ -248,7 +249,8 @@ local function ExchangePipe:discard_queued()
   end
 end
 
---- Worker-to-parent notice: readiness after `on_start`, or a retirement request.
+--- Internal wire record (public only so it can cross threads): a worker's
+-- readiness after `on_start`, or its retirement request.
 record RetireNotice
   const ready: boolean
   const dispatcher_id: integer
@@ -257,7 +259,8 @@ record RetireNotice
   const ack_tx: thread.Sender<|boolean|>?
 end
 
---- One routing entry shipped to a worker (handlers only for reachable entries).
+--- Internal wire record: one routing entry shipped to a worker. Entries the
+-- worker never executes carry no handlers and only drive classification.
 record EntrySpec
   const is_route: boolean
   const methods: {string}
@@ -269,7 +272,7 @@ record EntrySpec
   const handlers: {TransferableHandler}
 end
 
---- Scalar routing and policy settings shipped to a worker.
+--- Internal wire record: scalar routing and policy settings for a worker.
 record WorkerSettings
   const app_name: string
   const server_header: string
@@ -284,7 +287,8 @@ record WorkerSettings
   const log_level: string
 end
 
---- Everything one worker thread needs, scoped to its dispatcher.
+--- Internal wire record: everything one worker thread needs, scoped to its
+-- dispatcher (no parent-only handlers, Hooks, or SessionOptions.on_exit).
 record WorkerBootstrap
   const worker_id: integer
   const dispatcher_id: integer
@@ -434,23 +438,23 @@ local function WorkerState:return_exchange(request: http.Request, response: http
   end
 end
 
--- Handle one request of an adopted connection on this worker.
+-- Handle one request of an adopted connection on this worker. Only the
+-- request delivered in the envelope runs here: every keep-alive follow-up
+-- returns to the parent, which classifies it again (pool round-robin,
+-- session selection, or parent dispatch), so connections never pin a worker.
 local function WorkerState:handle(active: ActiveExchange, first: boolean,
                                   request: http.Request, response: http.Response)
   active.phase = PHASE_HANDLING
+  if not first then
+    self:return_exchange(request, response, 0, "", false)
+    return
+  end
   local core = self.core
   local meta, raw_path, target_error? = core:meta(request.method, request.target,
                                                  request.headers, request.url.scheme)
   local route?, found?, head_fallback = core:classify(request.method, raw_path)
   local chain_id = core.root_dispatcher_id
   if route ~= nil then chain_id = route.dispatcher_id end
-  if not first then
-    local own = chain_id == self.boot.dispatcher_id
-    if self.retiring or core.closing or core.session_id ~= nil or not own then
-      self:return_exchange(request, response, 0, "", false)
-      return
-    end
-  end
   if found ~= nil then meta.params_map = found.params end
   local ctx = Context.create(core, meta, raw_path, target_error, chain_id, head_fallback)
   ctx.raw_request = request

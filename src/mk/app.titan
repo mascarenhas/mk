@@ -124,6 +124,7 @@ record App
   local slots: {integer: WorkerSlot}
   local workers_changed: Signal
   local first_failure: async.Error?
+  local fatal_failure: async.Error?
 end
 
 local function positive_or(supplied: integer?, fallback: integer, subject: string): integer
@@ -171,6 +172,7 @@ function App.new(config: Config?): App
     return_pipe = nil, return_task = nil, retire_tx = nil, retire_task = nil,
     log_tx = nil, log_task = nil, next_worker_id = 1, slots = {},
     workers_changed = Signal.create("mk.workers"), first_failure = nil,
+    fatal_failure = nil,
   }
   local workers? = cfg.workers
   if workers ~= nil then
@@ -591,20 +593,26 @@ local function App:monitor_slot(slot: WorkerSlot)
   while slot.in_flight_sends > 0 do slot.drained:wait() end
   slot.pipe:discard_queued()
   do slot.pipe.data_rx:close() catch end
-  local dispatcher = slot.dispatcher
-  if dispatcher.kind == DISPATCH_POOL and slot.ready and not self.closing and
-      dispatcher.slots[slot.pool_index] == slot then
-    do
-      local replacement = self:spawn_worker(dispatcher, nil)
-      replacement.pool_index = slot.pool_index
-      dispatcher.slots[slot.pool_index] = replacement
-    catch
-      log.emit(self.core.logger, "error", "worker_respawn_failed", {
-        ["worker_id"] = slot.id, ["error"] = string.tostring(error),
-      })
+  -- A pool never silently loses capacity: an exit outside shutdown fails
+  -- the whole App. A session exit stays isolated to its session.
+  if slot.dispatcher.kind == DISPATCH_POOL and not self.closing then
+    local reason = "exited"
+    case status
+    when failed(failure) then reason = "failed: " .. string.tostring(failure.error)
+    when cancelled() then reason = "was cancelled"
+    else
     end
+    self:begin_shutdown(async.Error("mk: pool worker " .. slot.id .. " " .. reason,
+                                    thread_traceback(status)))
   end
   self.workers_changed:notify()
+end
+
+local function thread_traceback(status: thread.ThreadStatus<|nil|>): string
+  case status
+  when failed(failure) then return failure.traceback
+  else return ""
+  end
 end
 
 local function App:spawn_worker(dispatcher: Dispatcher, session_id: string?): WorkerSlot
@@ -983,11 +991,17 @@ function App:start(addr: string, listen_config: ListenConfig?)
   started = true
 end
 
---- Run the accept loop until the listener closes.
+--- Run the accept loop until shutdown closes the listener, then wait for
+-- retirement to finish. Raises the failure that forced the shutdown (for
+-- example a pool worker exit); an ordinary shutdown returns normally.
 function App:serve()
   local server? = self.server
   if server == nil then raise "mk: App:serve() requires App:start()" end
   server:serve()
+  local retirement? = self.retirement
+  if retirement ~= nil then async.join(retirement) end
+  local fatal? = self.fatal_failure
+  if fatal ~= nil then fatal:raise() end
 end
 
 --- `start` then `serve`.
@@ -1112,7 +1126,10 @@ end
 
 local function App:begin_shutdown(cause: async.Error?)
   if self.retirement ~= nil then return end
-  if cause ~= nil and self.first_failure == nil then self.first_failure = cause end
+  if cause ~= nil then
+    self.fatal_failure = cause
+    if self.first_failure == nil then self.first_failure = cause end
+  end
   self.closing = true
   self.core.closing = true
   local retirement = async.run<|nil, value|>(function (): nil
@@ -1189,7 +1206,8 @@ function App:is_worker_alive(worker_id: integer): boolean
   return slot ~= nil and slot.alive
 end
 
---- Cancel a worker thread; pool workers are replaced. False when not alive.
+--- Cancel a worker thread; false when it is not alive. Stopping a session
+-- worker retires only that session; stopping a pool worker fails the App.
 function App:stop_worker(worker_id: integer): boolean
   local slot? = self.slots[worker_id]
   if slot == nil or not slot.alive then return false end
