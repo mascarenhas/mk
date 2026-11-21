@@ -327,6 +327,7 @@ record Context
   local body_read: integer
   local body_done: boolean
   local terminal_error: HttpError?
+  local upgrade_offer: boolean
 end
 
 -- Build request metadata, tolerating malformed targets (exposed through
@@ -402,6 +403,8 @@ local function Context.create(core: Core, meta: RequestMeta, raw_path: string,
     last_err = nil, start_ns = uv.hrtime(), deadline = nil,
     owner_task = nil, in_socket_io = false, close_after_response = false,
     body_cache = nil, body_read = 0, body_done = false, terminal_error = nil,
+    upgrade_offer = #meta.headers:values("Upgrade") > 0 or
+      headers_have_token(meta.headers, "Connection", "upgrade"),
   }
 end
 
@@ -535,8 +538,7 @@ end
 
 --- True when the request offers any HTTP Upgrade; its body is never readable.
 function Context:is_upgrade_offer(): boolean
-  return #self.meta.headers:values("Upgrade") > 0 or
-    headers_have_token(self.meta.headers, "Connection", "upgrade")
+  return self.upgrade_offer
 end
 
 --- True for a CORS preflight (OPTIONS with Origin and Access-Control-Request-Method).
@@ -974,15 +976,16 @@ local function Context:read_raw_chunk(): string?
     return pending
   end
   local request = self.raw_request as http.Request
+  local outer_io = self.in_socket_io
   self.in_socket_io = true
-  defer self.in_socket_io = false
+  defer self.in_socket_io = outer_io
   return request:read()
 end
 
 --- Read the next request-body chunk (nil at EOF), enforcing `body_limit`.
 function Context:read_body_chunk(): string?
   self:own()
-  if self.body_done or self:is_upgrade_offer() then return nil end
+  if self.body_done or self.upgrade_offer then return nil end
   self:check_declared_length()
   local chunk? = self:read_raw_chunk()
   if chunk == nil then
@@ -999,7 +1002,7 @@ function Context:body(): string
   self:own()
   local cached? = self.body_cache
   if cached ~= nil then return cached end
-  if self:is_upgrade_offer() then return "" end
+  if self.upgrade_offer then return "" end
   local out = string.writer()
   for chunk in self:read_body_chunk do out:write(chunk) end
   local result = out:drain()
@@ -1017,7 +1020,7 @@ end
 -- Returns false when the remainder is too large and the transport must abort.
 local function Context:drain_request(): boolean
   if self.capture ~= nil or self.body_done or self.aborted_flag or
-      self.upgraded_ws ~= nil or self:is_upgrade_offer() then
+      self.upgraded_ws ~= nil or self.upgrade_offer then
     return true
   end
   local declared? = self.meta.headers:get("Content-Length")
@@ -1026,8 +1029,9 @@ local function Context:drain_request(): boolean
     if length ~= nil and length > self.core.body_limit then return false end
   end
   local request = self.raw_request as http.Request
+  local outer_io = self.in_socket_io
   self.in_socket_io = true
-  defer self.in_socket_io = false
+  defer self.in_socket_io = outer_io
   while true do
     local chunk? = request:read()
     if chunk == nil then break end
@@ -1308,8 +1312,9 @@ local function Context:io_send_headers()
     local entry = entries[index]
     response:add_header(entry.name, entry.contents)
   end
+  local outer_io = self.in_socket_io
   self.in_socket_io = true
-  defer self.in_socket_io = false
+  defer self.in_socket_io = outer_io
   response:send_headers()
 end
 
@@ -1320,8 +1325,9 @@ local function Context:io_write(data: string)
     return
   end
   local response = self.raw_response as http.Response
+  local outer_io = self.in_socket_io
   self.in_socket_io = true
-  defer self.in_socket_io = false
+  defer self.in_socket_io = outer_io
   response:write(data)
 end
 
@@ -1333,8 +1339,9 @@ local function Context:io_close()
     return
   end
   local response = self.raw_response as http.Response
+  local outer_io = self.in_socket_io
   self.in_socket_io = true
-  defer self.in_socket_io = false
+  defer self.in_socket_io = outer_io
   response:close()
 end
 
@@ -1439,8 +1446,9 @@ function Context:upgrade_websocket(options: websocket.AcceptOptions?): websocket
   end
   local request = self.raw_request as http.Request
   local response = self.raw_response as http.Response
+  local outer_io = self.in_socket_io
   self.in_socket_io = true
-  defer self.in_socket_io = false
+  defer self.in_socket_io = outer_io
   local connection: websocket.Connection? = nil
   do
     connection = websocket.accept(request, response, options)
@@ -1482,8 +1490,9 @@ function Context:reject_upgrade(code: integer)
   end
   local request = self.raw_request as http.Request
   local response = self.raw_response as http.Response
+  local outer_io = self.in_socket_io
   self.in_socket_io = true
-  defer self.in_socket_io = false
+  defer self.in_socket_io = outer_io
   response:reject_upgrade(request, code, self.response_headers)
 end
 
