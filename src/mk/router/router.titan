@@ -1,0 +1,848 @@
+-- Pure, network-free routing support: route-pattern parsing, request-target
+-- splitting, URI percent coding, and PEG path matching. Deterministic patterns
+-- match in one PEG pass; the rest run a bottom-up feasibility table over
+-- PEG-atomized paths in O((M + L) * A) time.
+local peg = import "peg"
+local string = import "string"
+
+const MAX_TARGET_BYTES: integer = 16384
+const MAX_QUERY_FIELDS: integer = 256
+const MAX_PATTERN_BYTES: integer = 1024
+const MAX_PATTERN_PARTS: integer = 64
+const MAX_WILDCARDS: integer = 16
+
+record RouteError
+  const code: string
+  const message: string
+  const position: integer
+  const line: integer
+  const column: integer
+end
+
+union SegmentToken
+  literal(text: string, position: integer)
+  param(name: string, optional: boolean, position: integer)
+  wildcard(index: integer, position: integer)
+  plus(index: integer, position: integer)
+end
+
+record RouteSegment
+  const tokens: const {SegmentToken}
+  const position: integer
+end
+
+record PatternOptions
+  const case_sensitive: boolean?
+  const strict_routing: boolean?
+  const unescape_path: boolean?
+  const prefix: boolean?
+end
+
+record Target
+  const path: string
+  const raw_query: string
+  const segments: const {string}
+  const query: {string: string}
+  const query_values: {string: {string}}
+end
+
+-- One matching step of the general evaluator. Parameter and wildcard keys are
+-- the public params keys ("name", "*1", "+2"). Every decoded literal byte
+-- matches exactly one path atom, so a literal spans exactly `atoms` atoms;
+-- `scanner` captures every atom start where `matcher` succeeds in one pass.
+local union PlanOp
+  slash()
+  literal(matcher: peg.Pattern, scanner: peg.Pattern, atoms: integer)
+  adj_param(key: string, optional: boolean)
+  seg_param(key: string, optional: boolean)
+  opt_slash_param(key: string)
+  wildcard(key: string, min_atoms: integer)
+  opt_slash_wildcard(key: string)
+end
+
+record CompiledPattern
+  const pattern: string
+  const prefix_mode: boolean
+  const segments: const {RouteSegment}
+  const param_names: const {string}
+  local const fast_matcher: peg.Pattern?
+  local const ops: const {PlanOp}
+  local const unescape: boolean
+  local const strict: boolean
+  local const root: boolean
+end
+
+record MatchResult
+  const params: {string: string}
+  const next_pos: integer
+end
+
+-- Per-match scratch state of the general evaluator. Atom a (1..atoms) is one
+-- raw byte or one valid %XX escape; atom atoms + 1 is the end sentinel.
+-- Feasibility rows are packed 64 atoms per integer word.
+local record PathScan
+  const path: string
+  const atoms: integer
+  const truncated: boolean
+  const atom_pos: {integer}
+  const atom_slash: {boolean}
+  const width: integer
+  const bits: {integer}
+  const rightmost_any: {integer}
+  const rightmost_in_seg: {integer}
+  const literal_hits: {boolean}
+end
+
+local const route_messages: {string: string} = {
+  ["expected_slash"] = "route pattern must begin with /",
+  ["expected_parameter_name"] = "route parameter needs an ASCII identifier",
+  ["routing_constraints_unsupported"] = "routing constraints are not supported",
+  ["query_or_fragment"] = "route pattern cannot contain a query or fragment",
+  ["percent_escape"] = "route literal contains an invalid percent escape",
+  ["nul_escape"] = "route literal cannot contain an encoded NUL",
+  ["trailing_escape"] = "route pattern cannot end with a backslash escape",
+  ["invalid_escape"] = "route pattern contains an unsupported backslash escape",
+  ["control_character"] = "route pattern cannot contain control characters",
+  ["duplicate_parameter"] = "route parameter names must be unique",
+  ["route_limit"] = "route pattern exceeds its size, part, or wildcard limit",
+  ["trailing_input"] = "unexpected byte in route pattern",
+}
+
+local const hex_upper = "0123456789ABCDEF"
+
+local const route_grammar: peg.Pattern?
+local const path_atoms: peg.Pattern?
+local const path_atom: peg.Pattern?
+local const segment_atom: peg.Pattern?
+local const end_of_path: peg.Pattern?
+
+local function hex_digit(byte: integer): integer?
+  if byte >= 48 and byte <= 57 then return byte - 48 end
+  if byte >= 65 and byte <= 70 then return byte - 55 end
+  if byte >= 97 and byte <= 102 then return byte - 87 end
+  return nil
+end
+
+-- Decoding is per component: an encoded slash stays inside its segment.
+function percent_decode(subject: string, plus_as_space: boolean?): string
+  local result: string.StringWriter? = nil
+  local span_start = 1
+  local index = 1
+  local length = #subject
+  while index <= length do
+    local byte: integer = string.byte(subject, index)
+    if byte == 37 then
+      if index + 2 > length then raise "incomplete percent escape" end
+      local high? = hex_digit(string.byte(subject, index + 1))
+      local low? = hex_digit(string.byte(subject, index + 2))
+      if high == nil or low == nil then raise "invalid percent escape" end
+      local decoded = high * 16 + low
+      if decoded == 0 then raise "NUL is not allowed in a request target" end
+      local writer = result or string.writer()
+      result = writer
+      if index > span_start then writer:write(string.sub(subject, span_start, index - 1)) end
+      writer:write(string.char(decoded))
+      index = index + 3
+      span_start = index
+    elseif plus_as_space and byte == 43 then
+      local writer = result or string.writer()
+      result = writer
+      if index > span_start then writer:write(string.sub(subject, span_start, index - 1)) end
+      writer:write(" ")
+      index = index + 1
+      span_start = index
+    else
+      if byte < 32 or byte == 127 then raise "control character in request target" end
+      index = index + 1
+    end
+  end
+  if result == nil then return subject end
+  local writer = result
+  if span_start <= length then writer:write(string.sub(subject, span_start, length)) end
+  return writer:drain()
+end
+
+-- RFC 3986 pchar bytes that never need encoding: unreserved, sub-delims, ":" and "@".
+local function is_pchar(byte: integer): boolean
+  return (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or
+    (byte >= 97 and byte <= 122) or byte == 45 or byte == 46 or byte == 95 or
+    byte == 126 or byte == 33 or byte == 36 or (byte >= 38 and byte <= 44) or
+    byte == 59 or byte == 61 or byte == 58 or byte == 64
+end
+
+-- keep_slash preserves raw "/" (wildcard values); keep_escapes preserves the
+-- already validated "%XX" escapes of route literal text.
+local function encode_path_text(subject: string, keep_slash: boolean, keep_escapes: boolean): string
+  local result: string.StringWriter? = nil
+  local span_start = 1
+  local index = 1
+  local length = #subject
+  while index <= length do
+    local byte: integer = string.byte(subject, index)
+    if is_pchar(byte) or (keep_slash and byte == 47) then
+      index = index + 1
+    elseif keep_escapes and byte == 37 then
+      index = index + 3
+    else
+      local writer = result or string.writer()
+      result = writer
+      if index > span_start then writer:write(string.sub(subject, span_start, index - 1)) end
+      writer:write("%")
+      writer:write(string.sub(hex_upper, byte // 16 + 1, byte // 16 + 1))
+      writer:write(string.sub(hex_upper, byte % 16 + 1, byte % 16 + 1))
+      index = index + 1
+      span_start = index
+    end
+  end
+  if result == nil then return subject end
+  local writer = result
+  if span_start <= length then writer:write(string.sub(subject, span_start, length)) end
+  return writer:drain()
+end
+
+function percent_encode_segment(subject: string): string
+  return encode_path_text(subject, false, false)
+end
+
+-- Query maps expose the first value; query_values retains all occurrences in wire order.
+function parse_target(target: string, max_bytes: integer?, max_query_fields: integer?): Target
+  if #target > (max_bytes or MAX_TARGET_BYTES) then raise "request target is too long" end
+  if string.sub(target, 1, 1) ~= "/" then raise "request target must begin with /" end
+  if string.find(target, "#") then raise "request target cannot contain a fragment" end
+  local field_limit = max_query_fields or MAX_QUERY_FIELDS
+  local separator? = string.find(target, "?")
+  local path = target
+  local raw_query = ""
+  if separator then
+    path = string.sub(target, 1, separator - 1)
+    raw_query = string.sub(target, separator + 1)
+  end
+  local segments: {string} = {}
+  if path ~= "/" then
+    for segment in string.split(string.sub(path, 2), "/") do
+      segments[#segments + 1] = percent_decode(segment)
+    end
+  end
+  local query: {string: string} = {}
+  local query_values: {string: {string}} = {}
+  if raw_query ~= "" then
+    local field_count = 1
+    for index = 1, #raw_query do
+      if string.byte(raw_query, index) == 38 then
+        field_count = field_count + 1
+        if field_count > field_limit then raise "too many query parameters" end
+      end
+    end
+    for field in string.split(raw_query, "&") do
+      if field ~= "" then
+        local equals? = string.find(field, "=")
+        local key = field
+        local contents = ""
+        if equals then
+          key = string.sub(field, 1, equals - 1)
+          contents = string.sub(field, equals + 1)
+        end
+        key = percent_decode(key, true)
+        contents = percent_decode(contents, true)
+        local values? = query_values[key]
+        if values == nil then
+          query[key] = contents
+          query_values[key] = {contents}
+        else
+          values[#values + 1] = contents
+        end
+      end
+    end
+  end
+  local frozen_segments = segments as const {string}
+  return Target(path, raw_query, frozen_segments, query, query_values)
+end
+
+local function route_error(pattern: string, code: string, position: integer): RouteError
+  local line, column = peg.line_column(pattern, position)
+  return RouteError(code, route_messages[code] or "invalid route pattern", position, line, column)
+end
+
+local function literal_token(position: integer, text: string): SegmentToken
+  return SegmentToken.literal(text, position)
+end
+
+local function param_token(position: integer, name: string, flag: string): SegmentToken
+  return SegmentToken.param(name, flag == "?", position)
+end
+
+local function wildcard_token(position: integer): SegmentToken
+  return SegmentToken.wildcard(0, position)
+end
+
+local function plus_token(position: integer): SegmentToken
+  return SegmentToken.plus(0, position)
+end
+
+local function token_position(token: SegmentToken): integer
+  case token
+  when literal{at = position} then return at
+  when param{at = position} then return at
+  when wildcard{at = position} then return at
+  when plus{at = position} then return at
+  end
+  return 1
+end
+
+-- A declaration mismatch is data here; compile_pattern raises the same RouteError.
+function parse_pattern(pattern: string): (const {RouteSegment}?, RouteError?)
+  if #pattern > MAX_PATTERN_BYTES then
+    return nil, route_error(pattern, "route_limit", MAX_PATTERN_BYTES + 1)
+  end
+  local captured, label, failure_position = route_grammar:match(pattern)
+  if captured == nil then
+    local code = "trailing_input"
+    if label ~= nil then code = label as string end
+    local at = 1
+    if failure_position ~= nil then at = failure_position as integer end
+    return nil, route_error(pattern, code, at)
+  end
+  local raw = captured as {integer: value}
+  local segments: {RouteSegment} = {}
+  local names: {string: boolean} = {}
+  local token_count = 0
+  local stars = 0
+  local pluses = 0
+  for s = 1, #raw do
+    local fields = raw[s] as {integer: value}
+    local segment_position = fields[1] as integer
+    if s > MAX_PATTERN_PARTS then return nil, route_error(pattern, "route_limit", segment_position) end
+    local tokens: {SegmentToken} = {}
+    for t = 2, #fields do
+      local token = fields[t] as SegmentToken
+      local at = token_position(token)
+      token_count = token_count + 1
+      if token_count > MAX_PATTERN_PARTS then return nil, route_error(pattern, "route_limit", at) end
+      case token
+      when param{name} then
+        if names[name] then return nil, route_error(pattern, "duplicate_parameter", at) end
+        names[name] = true
+      when wildcard() then
+        stars = stars + 1
+        token = SegmentToken.wildcard(stars, at)
+      when plus() then
+        pluses = pluses + 1
+        token = SegmentToken.plus(pluses, at)
+      end
+      if stars + pluses > MAX_WILDCARDS then return nil, route_error(pattern, "route_limit", at) end
+      tokens[t - 1] = token
+    end
+    local frozen_tokens = tokens as const {SegmentToken}
+    segments[s] = RouteSegment(frozen_tokens, segment_position)
+  end
+  local frozen = segments as const {RouteSegment}
+  return frozen, nil
+end
+
+local function hex_nibble(nibble: integer): peg.Pattern
+  local upper = string.sub(hex_upper, nibble + 1, nibble + 1)
+  if nibble < 10 then return peg.literal(upper) end
+  return peg.set(upper .. string.lower(upper))
+end
+
+local function escaped_byte(byte: integer): peg.Pattern
+  return peg.sequence(peg.literal("%"), hex_nibble(byte // 16), hex_nibble(byte % 16))
+end
+
+-- One decoded route byte against one path atom. "/", "%", and control bytes
+-- match only their escapes, so a pattern escape never matches a raw delimiter.
+local function literal_unit(byte: integer, case_sensitive: boolean): peg.Pattern
+  if byte == 47 or byte == 37 or byte < 32 or byte == 127 then return escaped_byte(byte) end
+  local letter = (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+  if letter and not case_sensitive then
+    local lower = byte | 32
+    local upper = byte & 223
+    return peg.choice(peg.set(string.char(lower, upper)), escaped_byte(lower), escaped_byte(upper))
+  end
+  return peg.choice(peg.literal(string.char(byte)), escaped_byte(byte))
+end
+
+-- Returns the matcher and the number of path atoms it always spans.
+local function literal_matcher(text: string, case_sensitive: boolean): (peg.Pattern, integer)
+  local decoded = percent_decode(text)
+  local result = peg.succeed()
+  for index = 1, #decoded do
+    result = peg.sequence(result, literal_unit(string.byte(decoded, index), case_sensitive))
+  end
+  return result, #decoded
+end
+
+-- One PEG pass recording each path atom start where `matcher` succeeds.
+local function literal_scanner(matcher: peg.Pattern): peg.Pattern
+  return peg.table_capture(peg.zero_or_more(peg.sequence(
+    peg.optional(peg.sequence(peg.lookahead(matcher), peg.position())), path_atom)))
+end
+
+local function flag(candidate: boolean?, default: boolean): boolean
+  if candidate == nil then return default end
+  return candidate
+end
+
+function compile_pattern(pattern: string, options: PatternOptions?): CompiledPattern
+  local segments?, problem? = parse_pattern(pattern)
+  if problem then raise problem end
+  local selected = options or PatternOptions()
+  local case_sensitive = flag(selected.case_sensitive, false)
+  local strict = flag(selected.strict_routing, false)
+  local unescape = flag(selected.unescape_path, true)
+  local prefix = flag(selected.prefix, false)
+
+  -- A trailing slash is insignificant for prefixes and non-strict routes.
+  local planned = #segments
+  if (prefix or not strict) and planned > 1 and #segments[planned].tokens == 0 then
+    planned = planned - 1
+  end
+
+  local ops: {PlanOp} = {}
+  local names: {string} = {}
+  local fast = true
+  local body = peg.succeed()
+  for s = 1, planned do
+    local tokens = segments[s].tokens
+    local count = #tokens
+    local terminal = s == planned and not prefix
+    local whole = false
+    if count == 1 then
+      local only = tokens[1]
+      case only
+      when param{name, optional} then
+        whole = true
+        names[#names + 1] = name
+        if optional then
+          ops[#ops + 1] = PlanOp.opt_slash_param(name)
+          fast = false
+        else
+          ops[#ops + 1] = PlanOp.slash()
+          ops[#ops + 1] = PlanOp.seg_param(name, false)
+          body = peg.sequence(body, peg.literal("/"),
+            peg.group(peg.capture(peg.one_or_more(segment_atom)), name))
+        end
+      when wildcard(index) then
+        whole = true
+        local key = "*" .. index
+        names[#names + 1] = key
+        ops[#ops + 1] = PlanOp.opt_slash_wildcard(key)
+        if terminal then
+          body = peg.sequence(body, peg.choice(
+            peg.sequence(peg.literal("/"), peg.group(peg.capture(peg.zero_or_more(path_atom)), key)),
+            peg.group(peg.capture(peg.literal("")), key)))
+        else
+          fast = false
+        end
+      when plus(index) then
+        whole = true
+        local key = "+" .. index
+        names[#names + 1] = key
+        ops[#ops + 1] = PlanOp.slash()
+        ops[#ops + 1] = PlanOp.wildcard(key, 1)
+        if terminal then
+          body = peg.sequence(body, peg.literal("/"),
+            peg.group(peg.capture(peg.one_or_more(path_atom)), key))
+        else
+          fast = false
+        end
+      end
+    end
+    if not whole then
+      -- Mixed segments always enter the general evaluator.
+      if count > 1 then fast = false end
+      ops[#ops + 1] = PlanOp.slash()
+      body = peg.sequence(body, peg.literal("/"))
+      for t = 1, count do
+        local token = tokens[t]
+        case token
+        when literal(text) then
+          local matcher, atoms = literal_matcher(text, case_sensitive)
+          ops[#ops + 1] = PlanOp.literal(matcher, literal_scanner(matcher), atoms)
+          body = peg.sequence(body, matcher)
+        when param{name, optional} then
+          names[#names + 1] = name
+          local adjacent = false
+          if t < count then
+            case tokens[t + 1]
+            when param() then adjacent = true
+            end
+          end
+          if adjacent then ops[#ops + 1] = PlanOp.adj_param(name, optional)
+          else ops[#ops + 1] = PlanOp.seg_param(name, optional)
+          end
+        when wildcard(index) then
+          local key = "*" .. index
+          names[#names + 1] = key
+          ops[#ops + 1] = PlanOp.wildcard(key, 0)
+        when plus(index) then
+          local key = "+" .. index
+          names[#names + 1] = key
+          ops[#ops + 1] = PlanOp.wildcard(key, 1)
+        end
+      end
+    end
+  end
+
+  -- The root prefix matches every path and consumes only its slash.
+  local root = prefix and planned == 1 and #segments[1].tokens == 0
+  local fast_matcher: peg.Pattern? = nil
+  if root then
+    fast_matcher = peg.table_capture(peg.sequence(peg.literal("/"), peg.position()))
+  elseif fast then
+    local terminator = end_of_path
+    if prefix then terminator = peg.lookahead(peg.choice(peg.literal("/"), end_of_path))
+    elseif not strict then terminator = peg.sequence(peg.optional(peg.literal("/")), end_of_path)
+    end
+    fast_matcher = peg.table_capture(peg.sequence(body, terminator, peg.position()))
+  end
+
+  local frozen_names = names as const {string}
+  local frozen_ops = ops as const {PlanOp}
+  local result: CompiledPattern = {pattern = pattern, prefix_mode = prefix,
+    segments = segments, param_names = frozen_names, fast_matcher = fast_matcher,
+    ops = frozen_ops, unescape = unescape, strict = strict, root = root}
+  return result
+end
+
+local function CompiledPattern:store(params: {string: string}, key: string, raw: string)
+  local item = raw
+  if self.unescape then item = percent_decode(raw) end
+  params[key] = item
+  if key == "*1" then params["*"] = item
+  elseif key == "+1" then params["+"] = item
+  end
+end
+
+local function PathScan:feasible(row: integer, a: integer): boolean
+  local word = self.bits[(row - 1) * self.width + ((a - 1) >> 6) + 1]
+  return (word >> ((a - 1) & 63)) & 1 ~= 0
+end
+
+local function PathScan:mark(row: integer, a: integer)
+  local index = (row - 1) * self.width + ((a - 1) >> 6) + 1
+  self.bits[index] = self.bits[index] | (1 << ((a - 1) & 63))
+end
+
+-- One right-to-left pass over a feasibility row: the largest feasible end at or
+-- after a, overall and within a's path segment (bounded by the next raw "/").
+local function PathScan:fill_suffix(row: integer)
+  local last = self.atoms + 1
+  local bits = self.bits
+  local base = (row - 1) * self.width + 1
+  local atom_slash = self.atom_slash
+  local rightmost_any = self.rightmost_any
+  local rightmost_in_seg = self.rightmost_in_seg
+  local best = 0
+  local segment_best = 0
+  for a = last, 1, -1 do
+    local open = (bits[base + ((a - 1) >> 6)] >> ((a - 1) & 63)) & 1 ~= 0
+    if a == last or atom_slash[a] then
+      segment_best = 0
+      if open then segment_best = a end
+    elseif segment_best == 0 and open then
+      segment_best = a
+    end
+    if best == 0 and open then best = a end
+    rightmost_any[a] = best
+    rightmost_in_seg[a] = segment_best
+  end
+end
+
+local function PlanOp:uses_suffix(): boolean
+  case self
+  when slash() then return false
+  when literal() then return false
+  when adj_param() then return false
+  end
+  return true
+end
+
+-- Records where a literal op's matcher succeeds: at every atom start with one
+-- PEG pass over the path, or only at atom `at` when a single cell is needed.
+local function PathScan:load_literal(op: PlanOp, at: integer?)
+  case op
+  when literal{matcher, scanner} then
+    local hits = self.literal_hits
+    if at then
+      hits[at] = matcher:match(self.path, self.atom_pos[at]) ~= nil
+      return
+    end
+    local last = self.atoms + 1
+    for a = 1, last do hits[a] = false end
+    -- Scanner positions ascend and each one starts an atom.
+    local positions = scanner:match(self.path) as {integer: value}
+    local a = 1
+    for index = 1, #positions do
+      local position = positions[index] as integer
+      while self.atom_pos[a] < position do a = a + 1 end
+      hits[a] = true
+    end
+  end
+end
+
+-- The greedy end atom of op at atom a given the next row, or 0 when infeasible.
+-- Suffix-reading ops require fill_suffix(next_row) first; literal ops require
+-- load_literal for this row.
+local function PathScan:choose(op: PlanOp, next_row: integer, a: integer): integer
+  local last = self.atoms + 1
+  case op
+  when slash() then
+    if a < last and self.atom_slash[a] and self:feasible(next_row, a + 1) then return a + 1 end
+  when literal{atoms} then
+    local a_end = a + atoms
+    if a_end <= last and self.literal_hits[a] and self:feasible(next_row, a_end) then
+      return a_end
+    end
+  when adj_param{optional} then
+    if a < last and not self.atom_slash[a] and self:feasible(next_row, a + 1) then return a + 1 end
+    if optional and self:feasible(next_row, a) then return a end
+  when seg_param{optional} then
+    if optional then
+      local e = self.rightmost_in_seg[a]
+      if e >= a then return e end
+    elseif a < last and not self.atom_slash[a] then
+      local e = self.rightmost_in_seg[a + 1]
+      if e > a then return e end
+    end
+  when opt_slash_param() then
+    if a + 1 < last and self.atom_slash[a] and not self.atom_slash[a + 1] then
+      local e = self.rightmost_in_seg[a + 2]
+      if e > a + 1 then return e end
+    end
+    if self:feasible(next_row, a) then return a end
+  when wildcard{min_atoms} then
+    local min_e = a + min_atoms
+    if min_e <= last then
+      local e = self.rightmost_any[min_e]
+      if e >= min_e then return e end
+    end
+  when opt_slash_wildcard() then
+    if a < last and self.atom_slash[a] then
+      local e = self.rightmost_any[a + 1]
+      if e > a then return e end
+    end
+    if self:feasible(next_row, a) then return a end
+  end
+  return 0
+end
+
+local function CompiledPattern:accepts(scan: PathScan, a: integer): boolean
+  local last = scan.atoms + 1
+  if self.root then return a == 2 end
+  if self.prefix_mode then
+    return (a == last and not scan.truncated) or (a < last and scan.atom_slash[a])
+  end
+  if a == last then return true end
+  return not self.strict and a == scan.atoms and scan.atom_slash[a]
+end
+
+local function CompiledPattern:match_general(path: string): MatchResult?
+  local captured, stop_value = path_atoms:match(path)
+  local starts = captured as {integer: value}
+  local stop = stop_value as integer
+  local truncated = stop ~= #path + 1
+  -- An exact match must cover the whole path; prefixes stop before bad bytes.
+  if truncated and not self.prefix_mode then return nil end
+  local atoms = #starts
+  local last = atoms + 1
+  local atom_pos: {integer} = {}
+  local atom_slash: {boolean} = {}
+  for a = 1, atoms do
+    local position = starts[a] as integer
+    atom_pos[a] = position
+    atom_slash[a] = string.byte(path, position) == 47
+  end
+  atom_pos[last] = stop
+  atom_slash[last] = false
+
+  local ops = self.ops
+  local count = #ops
+  local width = atoms // 64 + 1
+  local bits: {integer} = {}
+  for k = 1, (count + 1) * width do bits[k] = 0 end
+  local scan = PathScan { path = path, atoms = atoms, truncated = truncated,
+    atom_pos = atom_pos, atom_slash = atom_slash,
+    width = width, bits = bits, rightmost_any = {}, rightmost_in_seg = {}, literal_hits = {} }
+
+  for a = 1, last do
+    if self:accepts(scan, a) then scan:mark(count + 1, a) end
+  end
+  for row = count, 1, -1 do
+    scan:fill_suffix(row + 1)
+    if scan.rightmost_any[1] == 0 then return nil end
+    local op = ops[row]
+    local limit = last
+    if row == 1 then
+      limit = 1
+      scan:load_literal(op, 1)
+    else
+      scan:load_literal(op, nil)
+    end
+    for a = 1, limit do
+      -- Every op ends at or after its start, so nothing further can succeed.
+      if scan.rightmost_any[a] == 0 then break end
+      if scan:choose(op, row + 1, a) > 0 then scan:mark(row, a) end
+    end
+  end
+  if not scan:feasible(1, 1) then return nil end
+
+  local params: {string: string} = {}
+  local a = 1
+  for row = 1, count do
+    local op = ops[row]
+    if op:uses_suffix() then scan:fill_suffix(row + 1) end
+    scan:load_literal(op, a)
+    local e = scan:choose(op, row + 1, a)
+    -- Required parameters always span atoms; an empty optional one is absent.
+    case op
+    when adj_param(key) then
+      if e > a then self:store(params, key, string.sub(path, atom_pos[a], atom_pos[e] - 1)) end
+    when seg_param(key) then
+      if e > a then self:store(params, key, string.sub(path, atom_pos[a], atom_pos[e] - 1)) end
+    when opt_slash_param(key) then
+      if e > a then self:store(params, key, string.sub(path, atom_pos[a + 1], atom_pos[e] - 1)) end
+    when wildcard(key) then
+      self:store(params, key, string.sub(path, atom_pos[a], atom_pos[e] - 1))
+    when opt_slash_wildcard(key) then
+      if e > a then self:store(params, key, string.sub(path, atom_pos[a + 1], atom_pos[e] - 1))
+      else self:store(params, key, "")
+      end
+    end
+    a = e
+  end
+  local next_pos = #path + 1
+  if self.prefix_mode then next_pos = atom_pos[a] end
+  return MatchResult(params, next_pos)
+end
+
+function CompiledPattern:match(path: string): MatchResult?
+  if self.fast_matcher == nil then return self:match_general(path) end
+  local captured = self.fast_matcher:match(path)
+  if captured == nil then return nil end
+  local fields = captured as {value: value}
+  local params: {string: string} = {}
+  for index = 1, #self.param_names do
+    local key = self.param_names[index]
+    self:store(params, key, fields[key] as string)
+  end
+  return MatchResult(params, fields[1] as integer)
+end
+
+-- Builds a request path from the declared pattern. Values are percent-encoded;
+-- wildcard values keep their "/" separators. Omitted optional segments vanish.
+function CompiledPattern:build(params: {string: string}?): string
+  local values: {string: string} = {}
+  if params then values = params end
+  local out = string.writer()
+  for s = 1, #self.segments do
+    local tokens = self.segments[s].tokens
+    local whole_optional = false
+    if #tokens == 1 then
+      case tokens[1]
+      when param{name, optional} then
+        if optional then
+          whole_optional = true
+          local item? = values[name]
+          if item ~= nil and item ~= "" then
+            out:write("/")
+            out:write(percent_encode_segment(item))
+          end
+        end
+      when wildcard(index) then
+        whole_optional = true
+        local item = values["*" .. index] or (index == 1 and values["*"]) or ""
+        if item ~= "" then
+          out:write("/")
+          out:write(encode_path_text(item, true, false))
+        end
+      end
+    end
+    if not whole_optional then
+      out:write("/")
+      for t = 1, #tokens do
+        case tokens[t]
+        when literal(text) then
+          out:write(encode_path_text(text, false, true))
+        when param{name, optional} then
+          local item? = values[name]
+          if item == nil then
+            if not optional then raise "route parameter '" .. name .. "' is required" end
+          else
+            out:write(percent_encode_segment(item))
+          end
+        when wildcard(index) then
+          local item = values["*" .. index] or (index == 1 and values["*"]) or ""
+          out:write(encode_path_text(item, true, false))
+        when plus(index) then
+          local item = values["+" .. index] or (index == 1 and values["+"]) or ""
+          if item == "" then raise "route parameter '+" .. index .. "' is required" end
+          out:write(encode_path_text(item, true, false))
+        end
+      end
+    end
+  end
+  local result = out:drain()
+  if result == "" then return "/" end
+  return result
+end
+
+-- Joins a group or mount prefix with a child route path.
+function join_paths(prefix: string, child: string): string
+  if child == "" then
+    if prefix == "" then return "/" end
+    return prefix
+  end
+  local base = prefix
+  while string.sub(base, -1) == "/" do base = string.sub(base, 1, -2) end
+  if string.sub(child, 1, 1) == "/" then return base .. child end
+  return base .. "/" .. child
+end
+
+function allow_header(methods: const? {string}): string
+  local result = string.writer()
+  for index = 1, #methods do
+    if index > 1 then result:write(", ") end
+    result:write(methods[index])
+  end
+  return result:drain()
+end
+
+do
+  local hex = peg.ranges("09", "AF", "af")
+  local control = peg.choice(peg.ranges("\0\31"), peg.literal("\127"))
+  local escaped = peg.sequence(peg.literal("%"), peg.negative(peg.literal("00")), hex, hex)
+  path_atom = peg.choice(escaped, peg.difference(peg.any(), peg.literal("%"), control))
+  segment_atom = peg.choice(escaped, peg.difference(peg.any(), peg.set("%/"), control))
+  path_atoms = peg.sequence(
+    peg.table_capture(peg.zero_or_more(peg.sequence(peg.position(), path_atom))),
+    peg.position())
+  end_of_path = peg.negative(peg.any())
+  route_grammar = peg.compile([==[
+    Route <- {| ('/' / %{expected_slash}) Segment ('/' Segment)* (!. / Invalid) |}
+    Segment <- {| {} Token* |}
+    Token <- Literal / Param / Wildcard / Plus
+    Literal <- ({} {~ Piece+ ~}) -> literal_token
+    Piece <- Escape / Percent / Colon / Plain
+    Escape <- ('\' -> '') ([:?*+\<] / !. %{trailing_escape} / %{invalid_escape})
+    Percent <- '%' (&'00' %{nul_escape} / Hex^percent_escape Hex^percent_escape)
+    Colon <- ':' &(':' [A-Za-z_])
+    Plain <- !('%' / [/*+?#:\<] / %ctl) .
+    Param <- ({} ':' {Name / %{expected_parameter_name}} Constraint {'?'?}) -> param_token
+    Constraint <- !'<' / %{routing_constraints_unsupported}
+    Wildcard <- ({} '*') -> wildcard_token
+    Plus <- ({} '+') -> plus_token
+    Name <- [A-Za-z_] [A-Za-z0-9_]*
+    Hex <- [0-9A-Fa-f]
+    Invalid <- &[?#] %{query_or_fragment}
+      / &'<' %{routing_constraints_unsupported}
+      / &%ctl %{control_character}
+      / %{trailing_input}
+  ]==], {
+    peg.define("ctl", control),
+    peg.define_value("literal_token", literal_token),
+    peg.define_value("param_token", param_token),
+    peg.define_value("wildcard_token", wildcard_token),
+    peg.define_value("plus_token", plus_token),
+  })
+end

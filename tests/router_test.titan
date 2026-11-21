@@ -1,0 +1,660 @@
+local iteration = import "iteration"
+local os = import "os"
+local router = import "mk.router.titan"
+local string = import "string"
+local test = import "test"
+
+type Params = {string: string}
+
+local function describe(params: Params): string
+  local out = string.writer()
+  out:write("{")
+  for key, item in iteration.pairs(params) do
+    out:write(" ")
+    out:write(key)
+    out:write("=")
+    out:write(item)
+  end
+  out:write(" }")
+  return out:drain()
+end
+
+local function same_params(actual: Params, expected: Params): boolean
+  local count = 0
+  for key, item in iteration.pairs(actual) do
+    count = count + 1
+    if expected[key] ~= item then return false end
+  end
+  for _, _ in iteration.pairs(expected) do count = count - 1 end
+  return count == 0
+end
+
+-- Every match also runs the general evaluator, so each assertion proves the
+-- single-pass matcher and the feasibility table agree.
+local function check(compiled: router.CompiledPattern, path: string): router.MatchResult?
+  local fast? = compiled:match(path)
+  local general? = compiled:match_general(path)
+  if fast == nil then
+    test.assert(general == nil, compiled.pattern .. ": general evaluator matched " .. path)
+  else
+    test.assert(general ~= nil, compiled.pattern .. ": general evaluator rejected " .. path)
+    test.assert(same_params(fast.params, general.params),
+      compiled.pattern .. ": evaluators disagree on params for " .. path ..
+      ": " .. describe(fast.params) .. " vs " .. describe(general.params))
+    test.assert(fast.next_pos == general.next_pos,
+      compiled.pattern .. ": evaluators disagree on next_pos for " .. path)
+  end
+  return fast
+end
+
+local function expect_match(compiled: router.CompiledPattern, path: string, expected: Params,
+                            next_pos: integer?)
+  local result? = check(compiled, path)
+  test.assert(result ~= nil, compiled.pattern .. " did not match " .. path)
+  test.assert(same_params(result.params, expected),
+    compiled.pattern .. " on " .. path .. " captured " .. describe(result.params) ..
+    ", expected " .. describe(expected))
+  local wanted = next_pos or #path + 1
+  test.assert(result.next_pos == wanted,
+    compiled.pattern .. " on " .. path .. " ended at " .. result.next_pos .. ", expected " .. wanted)
+end
+
+local function expect_no_match(compiled: router.CompiledPattern, path: string)
+  test.assert(check(compiled, path) == nil, compiled.pattern .. " unexpectedly matched " .. path)
+end
+
+local function expect_route_error(pattern: string, code: string, position: integer)
+  local segments?, problem? = router.parse_pattern(pattern)
+  test.assert(segments == nil, "pattern was accepted: " .. pattern)
+  test.assert(problem ~= nil, "no RouteError for: " .. pattern)
+  test.assert(problem.code == code, pattern .. " reported " .. problem.code .. ", expected " .. code)
+  test.assert(problem.position == position,
+    pattern .. " reported position " .. problem.position .. ", expected " .. position)
+  test.assert(problem.message ~= "", "RouteError message is empty")
+end
+
+local function error_case(context: test.Context, name: string, pattern: string,
+                          code: string, position: integer)
+  context:run(name, function(_child: test.Context)
+    expect_route_error(pattern, code, position)
+  end)
+end
+
+local function literal_text(token: router.SegmentToken): string
+  case token
+  when literal(text) then return text
+  end
+  raise "token is not a literal"
+end
+
+local function expect_raise(action: function (): (), expected: string)
+  local raised = false
+  do
+    action()
+  catch
+    raised = true
+    test.assert(error == expected, "raised " .. string.tostring(error) .. ", expected " .. expected)
+  end
+  test.assert(raised, "operation did not raise " .. expected)
+end
+
+function test_parse_pattern_tokens(context: test.Context)
+  context:run("static_and_param", function(_child: test.Context)
+    local segments? = router.parse_pattern("/users/:id")
+    test.assert(segments ~= nil and #segments == 2)
+    test.assert(segments[1].position == 2 and #segments[1].tokens == 1)
+    test.assert(literal_text(segments[1].tokens[1]) == "users")
+    test.assert(segments[2].position == 8)
+    case segments[2].tokens[1]
+    when param{name, optional, position} then
+      test.assert(name == "id" and not optional and position == 8)
+    else
+      test.assert(false, "expected a parameter token")
+    end
+  end)
+  context:run("root_is_one_empty_segment", function(_child: test.Context)
+    local segments? = router.parse_pattern("/")
+    test.assert(segments ~= nil and #segments == 1)
+    test.assert(#segments[1].tokens == 0 and segments[1].position == 2)
+  end)
+  context:run("literal_colon_before_parameter", function(_child: test.Context)
+    local segments? = router.parse_pattern("/shop/color::color")
+    test.assert(segments ~= nil and #segments[2].tokens == 2)
+    test.assert(literal_text(segments[2].tokens[1]) == "color:")
+    case segments[2].tokens[2]
+    when param{name, position} then test.assert(name == "color" and position == 13)
+    else test.assert(false, "expected the color parameter")
+    end
+  end)
+  context:run("backslash_escapes_coalesce", function(_child: test.Context)
+    local segments? = router.parse_pattern("/a\\:b\\?\\*\\+\\\\\\<c")
+    test.assert(segments ~= nil and #segments[1].tokens == 1)
+    test.assert(literal_text(segments[1].tokens[1]) == "a:b?*+\\<c")
+  end)
+  context:run("percent_escapes_are_preserved", function(_child: test.Context)
+    local segments? = router.parse_pattern("/caf%C3%A9")
+    test.assert(segments ~= nil and literal_text(segments[1].tokens[1]) == "caf%C3%A9")
+  end)
+  context:run("wildcards_are_numbered_per_kind", function(_child: test.Context)
+    local segments? = router.parse_pattern("/v1/*/shop/+/x/*")
+    test.assert(segments ~= nil and #segments == 6)
+    case segments[2].tokens[1]
+    when wildcard{index, position} then test.assert(index == 1 and position == 5)
+    else test.assert(false, "expected *1")
+    end
+    case segments[4].tokens[1]
+    when plus(index) then test.assert(index == 1)
+    else test.assert(false, "expected +1")
+    end
+    case segments[6].tokens[1]
+    when wildcard(index) then test.assert(index == 2)
+    else test.assert(false, "expected *2")
+    end
+  end)
+  context:run("adjacent_optional_parameters", function(_child: test.Context)
+    local segments? = router.parse_pattern("/:a?:b")
+    test.assert(segments ~= nil and #segments[1].tokens == 2)
+    case segments[1].tokens[1]
+    when param{name, optional} then test.assert(name == "a" and optional)
+    else test.assert(false, "expected :a?")
+    end
+    case segments[1].tokens[2]
+    when param{name, optional} then test.assert(name == "b" and not optional)
+    else test.assert(false, "expected :b")
+    end
+  end)
+  context:run("compiled_metadata", function(_child: test.Context)
+    local compiled = router.compile_pattern("/v1/:a/*/x/+/:b?", router.PatternOptions { prefix = true })
+    test.assert(compiled.pattern == "/v1/:a/*/x/+/:b?" and compiled.prefix_mode)
+    test.assert(#compiled.param_names == 4)
+    test.assert(compiled.param_names[1] == "a" and compiled.param_names[2] == "*1")
+    test.assert(compiled.param_names[3] == "+1" and compiled.param_names[4] == "b")
+    test.assert(#compiled.segments == 6)
+  end)
+end
+
+function test_parse_pattern_errors(context: test.Context)
+  error_case(context, "missing_slash", "users", "expected_slash", 1)
+  error_case(context, "empty", "", "expected_slash", 1)
+  error_case(context, "bare_colon", "/:", "expected_parameter_name", 3)
+  error_case(context, "digit_name", "/:9id", "expected_parameter_name", 3)
+  error_case(context, "query", "/a?b", "query_or_fragment", 3)
+  error_case(context, "fragment", "/a#b", "query_or_fragment", 3)
+  error_case(context, "constraint_after_name", "/:id<int>", "routing_constraints_unsupported", 5)
+  error_case(context, "constraint_after_optional", "/x/:id?<int>", "routing_constraints_unsupported", 8)
+  error_case(context, "unescaped_angle", "/a<b", "routing_constraints_unsupported", 3)
+  error_case(context, "bad_hex", "/%zz", "percent_escape", 3)
+  error_case(context, "short_escape", "/%4", "percent_escape", 4)
+  error_case(context, "nul_escape", "/%00", "nul_escape", 3)
+  error_case(context, "trailing_backslash", "/a\\", "trailing_escape", 4)
+  error_case(context, "unsupported_backslash", "/a\\x", "invalid_escape", 4)
+  error_case(context, "tab", "/a\tb", "control_character", 3)
+  error_case(context, "delete", "/a\127", "control_character", 3)
+  error_case(context, "duplicate", "/:a/:a", "duplicate_parameter", 5)
+  error_case(context, "too_many_wildcards", string.rep("/*", 17), "route_limit", 34)
+  error_case(context, "too_long", "/" .. string.rep("a", 1024), "route_limit", 1025)
+  error_case(context, "too_many_segments", string.rep("/a", 65), "route_limit", 130)
+  context:run("too_many_tokens", function(_child: test.Context)
+    local pattern = string.writer()
+    pattern:write("/")
+    local position = 2
+    local last_param = 0
+    for index = 1, 33 do
+      if index > 1 then
+        pattern:write("-")
+        position = position + 1
+      end
+      last_param = position
+      local name = ":p" .. index
+      pattern:write(name)
+      position = position + #name
+    end
+    expect_route_error(pattern:drain(), "route_limit", last_param)
+  end)
+  context:run("line_and_column", function(_child: test.Context)
+    local segments?, problem? = router.parse_pattern("/a\nb")
+    test.assert(segments == nil)
+    test.assert(problem ~= nil and problem.code == "control_character")
+    test.assert(problem.line == 1 and problem.column == 3)
+  end)
+  context:run("compile_raises_route_error", function(_child: test.Context)
+    local raised = false
+    do
+      router.compile_pattern("/users/:id<int>")
+    catch
+      raised = true
+      test.assert(error is router.RouteError, "compile_pattern raised a non-RouteError")
+      local problem = error as router.RouteError
+      test.assert(problem.code == "routing_constraints_unsupported")
+      test.assert(problem.message == "routing constraints are not supported")
+    end
+    test.assert(raised, "constraint pattern compiled")
+  end)
+end
+
+function test_static_routes(context: test.Context)
+  context:run("case_insensitive_non_strict", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api/users")
+    expect_match(compiled, "/api/users", {})
+    expect_match(compiled, "/API/Users", {})
+    expect_match(compiled, "/api/users/", {})
+    expect_no_match(compiled, "/api/users//")
+    expect_no_match(compiled, "/api/user")
+    expect_no_match(compiled, "/api/usersx")
+    expect_no_match(compiled, "/api")
+  end)
+  context:run("case_sensitive", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api/Users", router.PatternOptions { case_sensitive = true })
+    expect_match(compiled, "/api/Users", {})
+    expect_no_match(compiled, "/api/users")
+    expect_no_match(compiled, "/API/Users")
+  end)
+  context:run("strict_routing", function(_child: test.Context)
+    local options = router.PatternOptions { strict_routing = true }
+    local bare = router.compile_pattern("/api/users", options)
+    expect_match(bare, "/api/users", {})
+    expect_no_match(bare, "/api/users/")
+    local slashed = router.compile_pattern("/api/users/", options)
+    expect_match(slashed, "/api/users/", {})
+    expect_no_match(slashed, "/api/users")
+  end)
+  context:run("non_strict_trailing_pattern_slash", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api/users/")
+    expect_match(compiled, "/api/users", {})
+    expect_match(compiled, "/api/users/", {})
+  end)
+  context:run("root", function(_child: test.Context)
+    local loose = router.compile_pattern("/")
+    expect_match(loose, "/", {})
+    expect_match(loose, "//", {})
+    expect_no_match(loose, "/a")
+    local strict = router.compile_pattern("/", router.PatternOptions { strict_routing = true })
+    expect_match(strict, "/", {})
+    expect_no_match(strict, "//")
+  end)
+  context:run("escaped_specials_match_literally", function(_child: test.Context)
+    local compiled = router.compile_pattern("/v1/name\\:verb\\*")
+    expect_match(compiled, "/v1/name:verb*", {})
+    expect_match(compiled, "/v1/name%3Averb%2a", {})
+    expect_no_match(compiled, "/v1/name:verbx")
+  end)
+end
+
+function test_percent_escapes_are_atomic(context: test.Context)
+  context:run("encoded_literal_bytes", function(_child: test.Context)
+    local compiled = router.compile_pattern("/caf%C3%A9")
+    expect_match(compiled, "/caf%C3%A9", {})
+    expect_match(compiled, "/caf%c3%a9", {})
+    expect_match(compiled, "/caf\xC3\xA9", {})
+    expect_no_match(compiled, "/caf%C3")
+  end)
+  context:run("escaped_letters", function(_child: test.Context)
+    local loose = router.compile_pattern("/abc")
+    expect_match(loose, "/%61bc", {})
+    expect_match(loose, "/%41B%43", {})
+    local strict = router.compile_pattern("/abc", router.PatternOptions { case_sensitive = true })
+    expect_match(strict, "/%61bc", {})
+    expect_no_match(strict, "/%41bc")
+  end)
+  context:run("encoded_slash_never_matches_raw_slash", function(_child: test.Context)
+    local compiled = router.compile_pattern("/a%2Fb")
+    expect_match(compiled, "/a%2fb", {})
+    expect_match(compiled, "/a%2Fb", {})
+    expect_no_match(compiled, "/a/b")
+  end)
+  context:run("encoded_percent", function(_child: test.Context)
+    local compiled = router.compile_pattern("/100%25")
+    expect_match(compiled, "/100%25", {})
+    expect_no_match(compiled, "/100%")
+    expect_no_match(compiled, "/100%2")
+  end)
+  context:run("parameter_decoding", function(_child: test.Context)
+    local decoded = router.compile_pattern("/:x")
+    expect_match(decoded, "/a%2Fb", {["x"] = "a/b"})
+    expect_match(decoded, "/a+b%20c", {["x"] = "a+b c"})
+    local raw = router.compile_pattern("/:x", router.PatternOptions { unescape_path = false })
+    expect_match(raw, "/a%2Fb", {["x"] = "a%2Fb"})
+  end)
+  context:run("invalid_paths_never_match", function(_child: test.Context)
+    local compiled = router.compile_pattern("/:x")
+    expect_no_match(compiled, "/a%2")
+    expect_no_match(compiled, "/a%zz")
+    expect_no_match(compiled, "/a%00")
+    expect_no_match(compiled, "/a\nb")
+    local general = router.compile_pattern("/:x?")
+    expect_no_match(general, "/a%zz")
+    expect_no_match(general, "/a\127")
+  end)
+  context:run("escape_splits_on_atom_boundaries", function(_child: test.Context)
+    local delimited = router.compile_pattern("/:a.:b")
+    expect_match(delimited, "/x%2Ey", {["a"] = "x", ["b"] = "y"})
+    expect_match(delimited, "/x%2E%2Ey", {["a"] = "x.", ["b"] = "y"})
+    local dashed = router.compile_pattern("/:a-:b")
+    expect_match(dashed, "/%2D-x", {["a"] = "-", ["b"] = "x"})
+    local adjacent = router.compile_pattern("/:sign:param")
+    expect_match(adjacent, "/%40v1", {["sign"] = "@", ["param"] = "v1"})
+  end)
+end
+
+function test_parameter_routes(context: test.Context)
+  context:run("whole_segment_parameters", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api/worlds/:world/actors/:id")
+    expect_match(compiled, "/api/worlds/w1/actors/42", {["world"] = "w1", ["id"] = "42"})
+    expect_match(compiled, "/API/worlds/W1/actors/42/", {["world"] = "W1", ["id"] = "42"})
+    expect_no_match(compiled, "/api/worlds/w1/actors/")
+    expect_no_match(compiled, "/api/worlds//actors/42")
+    expect_no_match(compiled, "/api/worlds/w1/actors/42/x")
+  end)
+  context:run("optional_segment", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api/:id?")
+    expect_match(compiled, "/api", {})
+    expect_match(compiled, "/api/", {})
+    expect_match(compiled, "/api/5", {["id"] = "5"})
+    expect_match(compiled, "/api/5/", {["id"] = "5"})
+    expect_no_match(compiled, "/api/5/6")
+    expect_no_match(compiled, "/apix")
+  end)
+  context:run("optional_segment_before_literal", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api/:id?/edit")
+    expect_match(compiled, "/api/edit", {})
+    expect_match(compiled, "/api/5/edit", {["id"] = "5"})
+    expect_no_match(compiled, "/api/5")
+  end)
+  context:run("strict_optional_segment", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api/:id?", router.PatternOptions { strict_routing = true })
+    expect_match(compiled, "/api", {})
+    expect_match(compiled, "/api/7", {["id"] = "7"})
+    expect_no_match(compiled, "/api/")
+  end)
+end
+
+function test_wildcards(context: test.Context)
+  context:run("terminal_star_with_optional_slash", function(_child: test.Context)
+    local compiled = router.compile_pattern("/assets/*")
+    expect_match(compiled, "/assets", {["*"] = "", ["*1"] = ""})
+    expect_match(compiled, "/assets/", {["*"] = "", ["*1"] = ""})
+    expect_match(compiled, "/assets/css/site%20a.css", {["*"] = "css/site a.css", ["*1"] = "css/site a.css"})
+    expect_no_match(compiled, "/assetsx")
+    expect_no_match(compiled, "/assets/%zz")
+  end)
+  context:run("terminal_plus_requires_bytes", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api/+")
+    expect_no_match(compiled, "/api")
+    expect_no_match(compiled, "/api/")
+    expect_match(compiled, "/api/x/y", {["+"] = "x/y", ["+1"] = "x/y"})
+  end)
+  context:run("multiple_wildcards", function(_child: test.Context)
+    local compiled = router.compile_pattern("/v1/*/shop/*")
+    expect_match(compiled, "/v1/brand/4/shop/blue/xs",
+      {["*"] = "brand/4", ["*1"] = "brand/4", ["*2"] = "blue/xs"})
+    expect_match(compiled, "/v1/shop", {["*"] = "", ["*1"] = "", ["*2"] = ""})
+  end)
+  context:run("in_segment_wildcards", function(_child: test.Context)
+    local compiled = router.compile_pattern("/*v1*/proxy")
+    expect_match(compiled, "/customer/v1/cart/proxy",
+      {["*"] = "customer/", ["*1"] = "customer/", ["*2"] = "/cart"})
+    local suffixed = router.compile_pattern("/files/*.txt")
+    expect_match(suffixed, "/files/a/b.txt", {["*"] = "a/b", ["*1"] = "a/b"})
+    expect_no_match(suffixed, "/files/a/b.md")
+  end)
+  context:run("greedy_leftmost", function(_child: test.Context)
+    local compiled = router.compile_pattern("/*/x/*")
+    expect_match(compiled, "/a/x/b/x/c", {["*"] = "a/x/b", ["*1"] = "a/x/b", ["*2"] = "c"})
+  end)
+  context:run("non_terminal_plus", function(_child: test.Context)
+    local compiled = router.compile_pattern("/+/end")
+    expect_match(compiled, "/a/b/end", {["+"] = "a/b", ["+1"] = "a/b"})
+    expect_no_match(compiled, "/end")
+    expect_no_match(compiled, "//end")
+  end)
+end
+
+function test_delimiters(context: test.Context)
+  context:run("dot_delimiter_is_greedy", function(_child: test.Context)
+    local compiled = router.compile_pattern("/plantae/:genus.:species")
+    expect_match(compiled, "/plantae/prunus.persica", {["genus"] = "prunus", ["species"] = "persica"})
+    expect_match(compiled, "/plantae/a.b.c", {["genus"] = "a.b", ["species"] = "c"})
+    expect_no_match(compiled, "/plantae/prunus")
+    expect_no_match(compiled, "/plantae/prunus.")
+    expect_no_match(compiled, "/plantae/.persica")
+  end)
+  context:run("dash_delimiter", function(_child: test.Context)
+    local compiled = router.compile_pattern("/flights/:from-:to")
+    expect_match(compiled, "/flights/LAX-SFO", {["from"] = "LAX", ["to"] = "SFO"})
+  end)
+  context:run("adjacent_parameters", function(_child: test.Context)
+    local compiled = router.compile_pattern("/:sign:param")
+    expect_match(compiled, "/@v1", {["sign"] = "@", ["param"] = "v1"})
+    expect_no_match(compiled, "/@")
+  end)
+  context:run("adjacent_optional_parameter", function(_child: test.Context)
+    local compiled = router.compile_pattern("/:a?:b")
+    expect_match(compiled, "/xy", {["a"] = "x", ["b"] = "y"})
+    expect_match(compiled, "/x", {["b"] = "x"})
+  end)
+  context:run("literal_prefix_parameter", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api-:name")
+    expect_match(compiled, "/api-v1", {["name"] = "v1"})
+    expect_no_match(compiled, "/api-")
+    local colon = router.compile_pattern("/shop/color::color")
+    expect_match(colon, "/shop/color:blue", {["color"] = "blue"})
+  end)
+  context:run("repeated_delimiters", function(_child: test.Context)
+    local compiled = router.compile_pattern("/:a.:b")
+    expect_match(compiled, "/x..y", {["a"] = "x.", ["b"] = "y"})
+    local doubled = router.compile_pattern("/:a-.:b")
+    expect_match(doubled, "/x-.y", {["a"] = "x", ["b"] = "y"})
+    expect_no_match(doubled, "/x.-y")
+  end)
+  context:run("trailing_delimiter", function(_child: test.Context)
+    local compiled = router.compile_pattern("/:a.")
+    expect_match(compiled, "/x.", {["a"] = "x"})
+    expect_match(compiled, "/x..", {["a"] = "x."})
+    expect_no_match(compiled, "/x")
+  end)
+  context:run("optional_after_delimiter", function(_child: test.Context)
+    local compiled = router.compile_pattern("/:a.:b?")
+    expect_match(compiled, "/x.y", {["a"] = "x", ["b"] = "y"})
+    expect_match(compiled, "/x.", {["a"] = "x"})
+    expect_no_match(compiled, "/x")
+  end)
+end
+
+function test_prefix_mode(context: test.Context)
+  local prefix = router.PatternOptions { prefix = true }
+  context:run("literal_prefix", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api", prefix)
+    expect_match(compiled, "/api", {}, 5)
+    expect_match(compiled, "/api/", {}, 5)
+    expect_match(compiled, "/API/users", {}, 5)
+    expect_no_match(compiled, "/apix")
+    expect_no_match(compiled, "/")
+    local slashed = router.compile_pattern("/api/", prefix)
+    expect_match(slashed, "/api/users", {}, 5)
+  end)
+  context:run("root_prefix", function(_child: test.Context)
+    local compiled = router.compile_pattern("/", prefix)
+    expect_match(compiled, "/", {}, 2)
+    expect_match(compiled, "/anything/here", {}, 2)
+    expect_match(compiled, "/%zz", {}, 2)
+  end)
+  context:run("parameter_prefix", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api/:version", prefix)
+    expect_match(compiled, "/api/v1/users", {["version"] = "v1"}, 8)
+    expect_match(compiled, "/api/v1", {["version"] = "v1"}, 8)
+  end)
+  context:run("optional_prefix", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api/:v?", prefix)
+    expect_match(compiled, "/api", {}, 5)
+    expect_match(compiled, "/api/v2", {["v"] = "v2"}, 8)
+    expect_match(compiled, "/api/v2/x", {["v"] = "v2"}, 8)
+  end)
+  context:run("wildcard_prefix", function(_child: test.Context)
+    local compiled = router.compile_pattern("/static/*", prefix)
+    expect_match(compiled, "/static/a/b", {["*"] = "a/b", ["*1"] = "a/b"}, 12)
+  end)
+  context:run("malformed_tail_after_prefix", function(_child: test.Context)
+    local literal = router.compile_pattern("/a", prefix)
+    expect_match(literal, "/a/%zz", {}, 3)
+    expect_no_match(literal, "/a%zz")
+    local optional = router.compile_pattern("/a/:v?", prefix)
+    expect_match(optional, "/a/b/%zz", {["v"] = "b"}, 5)
+    expect_match(optional, "/a/%zz", {}, 3)
+  end)
+end
+
+-- Best of three CPU-time measurements of one rejected match.
+local function rejection_seconds(compiled: router.CompiledPattern, path: string): float
+  local best = -1.0
+  for _ = 1, 3 do
+    local started = os.clock()
+    test.assert(compiled:match(path) == nil, compiled.pattern .. " unexpectedly matched a pathological path")
+    local elapsed = os.clock() - started
+    if best < 0.0 or elapsed < best then best = elapsed end
+  end
+  return best
+end
+
+local function dashes(bytes: integer): string
+  return "/" .. string.rep("-", bytes - 1)
+end
+
+-- Sixteen wildcards with literal separators keep every feasibility row dense
+-- across a 16 KiB path, while a leading literal rejects it only at the top row.
+-- Linear work grows 4x from 4 KiB to 16 KiB; quadratic work would grow 16x.
+function test_rejected_path_bounds(context: test.Context)
+  local pattern = string.writer()
+  pattern:write("/x")
+  for index = 1, router.MAX_WILDCARDS do
+    if index > 1 then pattern:write("-") end
+    pattern:write("*")
+  end
+  local compiled = router.compile_pattern(pattern:drain())
+  context:run("raw_atoms", function(_child: test.Context)
+    local path = dashes(router.MAX_TARGET_BYTES)
+    test.assert(#path == router.MAX_TARGET_BYTES)
+    local large = rejection_seconds(compiled, path)
+    local small = rejection_seconds(compiled, dashes(router.MAX_TARGET_BYTES // 4))
+    test.assert(large < 1.0, "16 KiB rejection took " .. large .. " s")
+    test.assert(large <= 8.0 * small + 0.005,
+      "rejection grew superlinearly: " .. small .. " s at 4 KiB, " .. large .. " s at 16 KiB")
+  end)
+  context:run("escaped_atoms", function(_child: test.Context)
+    local path = "/" .. string.rep("%2D", (router.MAX_TARGET_BYTES - 1) // 3)
+    local elapsed = rejection_seconds(compiled, path)
+    test.assert(elapsed < 1.0, "16 KiB escaped rejection took " .. elapsed .. " s")
+  end)
+  context:run("optional_and_delimited", function(_child: test.Context)
+    local mixed = router.compile_pattern("/:a?/*/x/:b.:c/+")
+    local path = "/" .. string.rep("ab/", (router.MAX_TARGET_BYTES - 1) // 3)
+    local elapsed = rejection_seconds(mixed, path)
+    test.assert(elapsed < 1.0, "16 KiB mixed rejection took " .. elapsed .. " s")
+  end)
+  context:run("long_match_splits_greedily", function(_child: test.Context)
+    local pair = router.compile_pattern("/*-*")
+    local path = "/" .. string.rep("a-", 8000) .. "b"
+    expect_match(pair, path, {["*"] = string.rep("a-", 7999) .. "a",
+      ["*1"] = string.rep("a-", 7999) .. "a", ["*2"] = "b"})
+  end)
+end
+
+function test_parse_target(context: test.Context)
+  context:run("path_query_and_segments", function(_child: test.Context)
+    local target = router.parse_target("/a/b%20c?x=1&y=2&x=3&flag&e=&&")
+    test.assert(target.path == "/a/b%20c")
+    test.assert(target.raw_query == "x=1&y=2&x=3&flag&e=&&")
+    test.assert(#target.segments == 2 and target.segments[1] == "a" and target.segments[2] == "b c")
+    test.assert(target.query["x"] == "1" and target.query["y"] == "2")
+    test.assert(target.query["flag"] == "" and target.query["e"] == "")
+    local xs? = target.query_values["x"]
+    test.assert(xs ~= nil and #xs == 2 and xs[1] == "1" and xs[2] == "3")
+  end)
+  context:run("plus_is_space_only_in_query", function(_child: test.Context)
+    local target = router.parse_target("/a+b?q=a+b%2B")
+    test.assert(target.segments[1] == "a+b")
+    test.assert(target.query["q"] == "a b+")
+  end)
+  context:run("root_and_trailing_slash", function(_child: test.Context)
+    test.assert(#router.parse_target("/").segments == 0)
+    local trailing = router.parse_target("/a/")
+    test.assert(#trailing.segments == 2 and trailing.segments[2] == "")
+    test.assert(router.parse_target("/a").raw_query == "")
+  end)
+  context:run("rejections", function(_child: test.Context)
+    expect_raise(function() router.parse_target("/abcdef", 4) end, "request target is too long")
+    expect_raise(function() router.parse_target("abc") end, "request target must begin with /")
+    expect_raise(function() router.parse_target("/a#b") end, "request target cannot contain a fragment")
+    expect_raise(function() router.parse_target("/%zz") end, "invalid percent escape")
+    expect_raise(function() router.parse_target("/%00") end, "NUL is not allowed in a request target")
+    expect_raise(function() router.parse_target("/?a&b&c", nil, 2) end, "too many query parameters")
+    expect_raise(function() router.parse_target("/" .. string.rep("a", router.MAX_TARGET_BYTES)) end,
+      "request target is too long")
+  end)
+end
+
+function test_percent_coding(context: test.Context)
+  context:run("decode", function(_child: test.Context)
+    test.assert(router.percent_decode("a%2Fb") == "a/b")
+    test.assert(router.percent_decode("a+b", true) == "a b")
+    test.assert(router.percent_decode("a+b") == "a+b")
+    test.assert(router.percent_decode("plain") == "plain")
+    expect_raise(function() router.percent_decode("%") end, "incomplete percent escape")
+    expect_raise(function() router.percent_decode("%4") end, "incomplete percent escape")
+    expect_raise(function() router.percent_decode("%zz") end, "invalid percent escape")
+    expect_raise(function() router.percent_decode("%00") end, "NUL is not allowed in a request target")
+    expect_raise(function() router.percent_decode("a\nb") end, "control character in request target")
+  end)
+  context:run("encode_segment", function(_child: test.Context)
+    test.assert(router.percent_encode_segment("a b/c?d#e%f") == "a%20b%2Fc%3Fd%23e%25f")
+    local safe = "AZaz09-._~!$&'()*+,;=:@"
+    test.assert(router.percent_encode_segment(safe) == safe)
+    test.assert(router.percent_encode_segment("\xC3\xA9") == "%C3%A9")
+    local subject = "x/y z%\xFF"
+    test.assert(router.percent_decode(router.percent_encode_segment(subject)) == subject)
+  end)
+end
+
+function test_build(context: test.Context)
+  context:run("parameters", function(_child: test.Context)
+    local compiled = router.compile_pattern("/users/:id")
+    test.assert(compiled:build({["id"] = "a b/c"}) == "/users/a%20b%2Fc")
+    expect_raise(function() compiled:build() end, "route parameter 'id' is required")
+  end)
+  context:run("optional_segments_vanish", function(_child: test.Context)
+    local compiled = router.compile_pattern("/api/:id?")
+    test.assert(compiled:build() == "/api")
+    test.assert(compiled:build({["id"] = "5"}) == "/api/5")
+    test.assert(router.compile_pattern("/:id?"):build() == "/")
+    test.assert(router.compile_pattern("/:a.:b?"):build({["a"] = "x"}) == "/x.")
+  end)
+  context:run("wildcards", function(_child: test.Context)
+    local star = router.compile_pattern("/assets/*")
+    test.assert(star:build({["*"] = "css/a b.css"}) == "/assets/css/a%20b.css")
+    test.assert(star:build({["*1"] = "x"}) == "/assets/x")
+    test.assert(star:build() == "/assets")
+    local mixed = router.compile_pattern("/v1/*/shop/+")
+    test.assert(mixed:build({["*1"] = "a/b", ["+1"] = "c"}) == "/v1/a/b/shop/c")
+    expect_raise(function() mixed:build({["*1"] = "a"}) end, "route parameter '+1' is required")
+  end)
+  context:run("literals", function(_child: test.Context)
+    test.assert(router.compile_pattern("/"):build() == "/")
+    test.assert(router.compile_pattern("/a\\:b/caf%C3%A9"):build() == "/a:b/caf%C3%A9")
+    test.assert(router.compile_pattern("/a\\?b"):build() == "/a%3Fb")
+  end)
+end
+
+function test_join_paths(_context: test.Context)
+  test.assert(router.join_paths("/api", "/users") == "/api/users")
+  test.assert(router.join_paths("/api/", "/users") == "/api/users")
+  test.assert(router.join_paths("/", "/users") == "/users")
+  test.assert(router.join_paths("/api", "users") == "/api/users")
+  test.assert(router.join_paths("/api", "") == "/api")
+  test.assert(router.join_paths("", "") == "/")
+  test.assert(router.join_paths("/api", "/") == "/api/")
+  test.assert(router.join_paths("", "/x") == "/x")
+end
+
+function test_allow_header(_context: test.Context)
+  test.assert(router.allow_header({"GET", "HEAD", "POST"}) == "GET, HEAD, POST")
+  test.assert(router.allow_header({}) == "")
+end
