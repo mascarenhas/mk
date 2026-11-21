@@ -3,7 +3,7 @@
 -- match in one PEG pass; the rest run a bottom-up feasibility table over
 -- PEG-atomized paths in O((M + L) * A) time.
 local peg = import "peg"
-local string = import "string"
+local strings = import "string"
 
 const MAX_TARGET_BYTES: integer = 16384
 const MAX_QUERY_FIELDS: integer = 256
@@ -125,29 +125,29 @@ end
 
 -- Decoding is per component: an encoded slash stays inside its segment.
 function percent_decode(subject: string, plus_as_space: boolean?): string
-  local result: string.StringWriter? = nil
+  local result: strings.StringWriter? = nil
   local span_start = 1
   local index = 1
   local length = #subject
   while index <= length do
-    local byte: integer = string.byte(subject, index)
+    local byte: integer = strings.byte(subject, index)
     if byte == 37 then
       if index + 2 > length then raise "incomplete percent escape" end
-      local high? = hex_digit(string.byte(subject, index + 1))
-      local low? = hex_digit(string.byte(subject, index + 2))
+      local high? = hex_digit(strings.byte(subject, index + 1))
+      local low? = hex_digit(strings.byte(subject, index + 2))
       if high == nil or low == nil then raise "invalid percent escape" end
       local decoded = high * 16 + low
       if decoded == 0 then raise "NUL is not allowed in a request target" end
-      local writer = result or string.writer()
+      local writer = result or strings.writer()
       result = writer
-      if index > span_start then writer:write(string.sub(subject, span_start, index - 1)) end
-      writer:write(string.char(decoded))
+      if index > span_start then writer:write(strings.sub(subject, span_start, index - 1)) end
+      writer:write(strings.char(decoded))
       index = index + 3
       span_start = index
     elseif plus_as_space and byte == 43 then
-      local writer = result or string.writer()
+      local writer = result or strings.writer()
       result = writer
-      if index > span_start then writer:write(string.sub(subject, span_start, index - 1)) end
+      if index > span_start then writer:write(strings.sub(subject, span_start, index - 1)) end
       writer:write(" ")
       index = index + 1
       span_start = index
@@ -158,7 +158,7 @@ function percent_decode(subject: string, plus_as_space: boolean?): string
   end
   if result == nil then return subject end
   local writer = result
-  if span_start <= length then writer:write(string.sub(subject, span_start, length)) end
+  if span_start <= length then writer:write(strings.sub(subject, span_start, length)) end
   return writer:drain()
 end
 
@@ -173,30 +173,30 @@ end
 -- keep_slash preserves raw "/" (wildcard values); keep_escapes preserves the
 -- already validated "%XX" escapes of route literal text.
 local function encode_path_text(subject: string, keep_slash: boolean, keep_escapes: boolean): string
-  local result: string.StringWriter? = nil
+  local result: strings.StringWriter? = nil
   local span_start = 1
   local index = 1
   local length = #subject
   while index <= length do
-    local byte: integer = string.byte(subject, index)
+    local byte: integer = strings.byte(subject, index)
     if is_pchar(byte) or (keep_slash and byte == 47) then
       index = index + 1
     elseif keep_escapes and byte == 37 then
       index = index + 3
     else
-      local writer = result or string.writer()
+      local writer = result or strings.writer()
       result = writer
-      if index > span_start then writer:write(string.sub(subject, span_start, index - 1)) end
+      if index > span_start then writer:write(strings.sub(subject, span_start, index - 1)) end
       writer:write("%")
-      writer:write(string.sub(hex_upper, byte // 16 + 1, byte // 16 + 1))
-      writer:write(string.sub(hex_upper, byte % 16 + 1, byte % 16 + 1))
+      writer:write(strings.sub(hex_upper, byte // 16 + 1, byte // 16 + 1))
+      writer:write(strings.sub(hex_upper, byte % 16 + 1, byte % 16 + 1))
       index = index + 1
       span_start = index
     end
   end
   if result == nil then return subject end
   local writer = result
-  if span_start <= length then writer:write(string.sub(subject, span_start, length)) end
+  if span_start <= length then writer:write(strings.sub(subject, span_start, length)) end
   return writer:drain()
 end
 
@@ -207,19 +207,19 @@ end
 -- Query maps expose the first value; query_values retains all occurrences in wire order.
 function parse_target(target: string, max_bytes: integer?, max_query_fields: integer?): Target
   if #target > (max_bytes or MAX_TARGET_BYTES) then raise "request target is too long" end
-  if string.sub(target, 1, 1) ~= "/" then raise "request target must begin with /" end
-  if string.find(target, "#") then raise "request target cannot contain a fragment" end
+  if strings.sub(target, 1, 1) ~= "/" then raise "request target must begin with /" end
+  if strings.find(target, "#") then raise "request target cannot contain a fragment" end
   local field_limit = max_query_fields or MAX_QUERY_FIELDS
-  local separator? = string.find(target, "?")
+  local separator? = strings.find(target, "?")
   local path = target
   local raw_query = ""
   if separator then
-    path = string.sub(target, 1, separator - 1)
-    raw_query = string.sub(target, separator + 1)
+    path = strings.sub(target, 1, separator - 1)
+    raw_query = strings.sub(target, separator + 1)
   end
   local segments: {string} = {}
   if path ~= "/" then
-    for segment in string.split(string.sub(path, 2), "/") do
+    for segment in strings.split(strings.sub(path, 2), "/") do
       segments[#segments + 1] = percent_decode(segment)
     end
   end
@@ -228,19 +228,17 @@ function parse_target(target: string, max_bytes: integer?, max_query_fields: int
   if raw_query ~= "" then
     local field_count = 1
     for index = 1, #raw_query do
-      if string.byte(raw_query, index) == 38 then
-        field_count = field_count + 1
-        if field_count > field_limit then raise "too many query parameters" end
-      end
+      if strings.byte(raw_query, index) == 38 then field_count = field_count + 1 end
     end
-    for field in string.split(raw_query, "&") do
+    if field_count > field_limit then raise "too many query parameters" end
+    for field in strings.split(raw_query, "&") do
       if field ~= "" then
-        local equals? = string.find(field, "=")
+        local equals? = strings.find(field, "=")
         local key = field
         local contents = ""
         if equals then
-          key = string.sub(field, 1, equals - 1)
-          contents = string.sub(field, equals + 1)
+          key = strings.sub(field, 1, equals - 1)
+          contents = strings.sub(field, equals + 1)
         end
         key = percent_decode(key, true)
         contents = percent_decode(contents, true)
@@ -340,9 +338,9 @@ function parse_pattern(pattern: string): (const {RouteSegment}?, RouteError?)
 end
 
 local function hex_nibble(nibble: integer): peg.Pattern
-  local upper = string.sub(hex_upper, nibble + 1, nibble + 1)
+  local upper = strings.sub(hex_upper, nibble + 1, nibble + 1)
   if nibble < 10 then return peg.literal(upper) end
-  return peg.set(upper .. string.lower(upper))
+  return peg.set(upper .. strings.lower(upper))
 end
 
 local function escaped_byte(byte: integer): peg.Pattern
@@ -357,9 +355,9 @@ local function literal_unit(byte: integer, case_sensitive: boolean): peg.Pattern
   if letter and not case_sensitive then
     local lower = byte | 32
     local upper = byte & 223
-    return peg.choice(peg.set(string.char(lower, upper)), escaped_byte(lower), escaped_byte(upper))
+    return peg.choice(peg.set(strings.char(lower, upper)), escaped_byte(lower), escaped_byte(upper))
   end
-  return peg.choice(peg.literal(string.char(byte)), escaped_byte(byte))
+  return peg.choice(peg.literal(strings.char(byte)), escaped_byte(byte))
 end
 
 -- Returns the matcher and the number of path atoms it always spans.
@@ -367,7 +365,7 @@ local function literal_matcher(text: string, case_sensitive: boolean): (peg.Patt
   local decoded = percent_decode(text)
   local result = peg.succeed()
   for index = 1, #decoded do
-    result = peg.sequence(result, literal_unit(string.byte(decoded, index), case_sensitive))
+    result = peg.sequence(result, literal_unit(strings.byte(decoded, index), case_sensitive))
   end
   return result, #decoded
 end
@@ -630,6 +628,13 @@ end
 local function CompiledPattern:accepts(scan: PathScan, a: integer): boolean
   local last = scan.atoms + 1
   if self.root then return a == 2 end
+  if a == 1 then
+    -- Only fully omitted optional segments end at the first atom: the pattern
+    -- reduced to the root "/", which still needs the path's leading slash.
+    if self.prefix_mode then return scan.atom_slash[1] end
+    return (last == 2 and scan.atom_slash[1]) or
+      (not self.strict and last == 3 and scan.atom_slash[1] and scan.atom_slash[2])
+  end
   if self.prefix_mode then
     return (a == last and not scan.truncated) or (a < last and scan.atom_slash[a])
   end
@@ -638,6 +643,7 @@ local function CompiledPattern:accepts(scan: PathScan, a: integer): boolean
 end
 
 local function CompiledPattern:match_general(path: string): MatchResult?
+  if strings.byte(path, 1) ~= 47 then return nil end
   local captured, stop_value = path_atoms:match(path)
   local starts = captured as {integer: value}
   local stop = stop_value as integer
@@ -651,7 +657,7 @@ local function CompiledPattern:match_general(path: string): MatchResult?
   for a = 1, atoms do
     local position = starts[a] as integer
     atom_pos[a] = position
-    atom_slash[a] = string.byte(path, position) == 47
+    atom_slash[a] = strings.byte(path, position) == 47
   end
   atom_pos[last] = stop
   atom_slash[last] = false
@@ -697,27 +703,32 @@ local function CompiledPattern:match_general(path: string): MatchResult?
     -- Required parameters always span atoms; an empty optional one is absent.
     case op
     when adj_param(key) then
-      if e > a then self:store(params, key, string.sub(path, atom_pos[a], atom_pos[e] - 1)) end
+      if e > a then self:store(params, key, strings.sub(path, atom_pos[a], atom_pos[e] - 1)) end
     when seg_param(key) then
-      if e > a then self:store(params, key, string.sub(path, atom_pos[a], atom_pos[e] - 1)) end
+      if e > a then self:store(params, key, strings.sub(path, atom_pos[a], atom_pos[e] - 1)) end
     when opt_slash_param(key) then
-      if e > a then self:store(params, key, string.sub(path, atom_pos[a + 1], atom_pos[e] - 1)) end
+      if e > a then self:store(params, key, strings.sub(path, atom_pos[a + 1], atom_pos[e] - 1)) end
     when wildcard(key) then
-      self:store(params, key, string.sub(path, atom_pos[a], atom_pos[e] - 1))
+      self:store(params, key, strings.sub(path, atom_pos[a], atom_pos[e] - 1))
     when opt_slash_wildcard(key) then
-      if e > a then self:store(params, key, string.sub(path, atom_pos[a + 1], atom_pos[e] - 1))
+      if e > a then self:store(params, key, strings.sub(path, atom_pos[a + 1], atom_pos[e] - 1))
       else self:store(params, key, "")
       end
     end
     a = e
   end
   local next_pos = #path + 1
-  if self.prefix_mode then next_pos = atom_pos[a] end
+  if self.prefix_mode then
+    next_pos = atom_pos[a]
+    -- A fully omitted prefix consumed only the root slash.
+    if a == 1 then next_pos = 2 end
+  end
   return MatchResult(params, next_pos)
 end
 
 function CompiledPattern:match(path: string): MatchResult?
   if self.fast_matcher == nil then return self:match_general(path) end
+  if strings.byte(path, 1) ~= 47 then return nil end
   local captured = self.fast_matcher:match(path)
   if captured == nil then return nil end
   local fields = captured as {value: value}
@@ -734,7 +745,7 @@ end
 function CompiledPattern:build(params: {string: string}?): string
   local values: {string: string} = {}
   if params then values = params end
-  local out = string.writer()
+  local out = strings.writer()
   for s = 1, #self.segments do
     local tokens = self.segments[s].tokens
     local whole_optional = false
@@ -766,7 +777,7 @@ function CompiledPattern:build(params: {string: string}?): string
           out:write(encode_path_text(text, false, true))
         when param{name, optional} then
           local item? = values[name]
-          if item == nil then
+          if item == nil or item == "" then
             if not optional then raise "route parameter '" .. name .. "' is required" end
           else
             out:write(percent_encode_segment(item))
@@ -794,16 +805,24 @@ function join_paths(prefix: string, child: string): string
     return prefix
   end
   local base = prefix
-  while string.sub(base, -1) == "/" do base = string.sub(base, 1, -2) end
-  if string.sub(child, 1, 1) == "/" then return base .. child end
+  while strings.sub(base, -1) == "/" do base = strings.sub(base, 1, -2) end
+  if strings.sub(child, 1, 1) == "/" then return base .. child end
   return base .. "/" .. child
 end
 
+-- Joins distinct, nonempty methods in first-occurrence order.
 function allow_header(methods: const? {string}): string
-  local result = string.writer()
+  local result = strings.writer()
+  local seen: {string: boolean} = {}
+  local first = true
   for index = 1, #methods do
-    if index > 1 then result:write(", ") end
-    result:write(methods[index])
+    local method? = methods[index]
+    if method ~= nil and method ~= "" and not seen[method] then
+      seen[method] = true
+      if not first then result:write(", ") end
+      result:write(method)
+      first = false
+    end
   end
   return result:drain()
 end

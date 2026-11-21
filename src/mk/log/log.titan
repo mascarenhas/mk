@@ -18,7 +18,7 @@ end
 
 record Logger
   local const minimum: integer
-  local const sink: function (string): ()
+  local const sink: function (string): (boolean) -- false: refused without blocking
   local const source: async.BufferedSubscription<|string, nil|>
   local const publish: function (string): (boolean)
   local const finish: function (): (boolean)
@@ -85,11 +85,14 @@ function format_line(level: string, event: string, fields: {string: value}?): st
   return json.encode(contents, encode_limit) .. "\n"
 end
 
+-- Reports the drops counted so far. A refused report keeps its count for the
+-- next attempt; drops counted while a yielding sink runs stay pending.
 local function Logger:report_dropped()
-  if self.dropped == 0 then return end
   local count = self.dropped
-  self.dropped = 0
-  self.sink(format_line("error", "log_dropped", {["count"] = count}))
+  if count == 0 then return end
+  if self.sink(format_line("error", "log_dropped", {["count"] = count})) then
+    self.dropped = self.dropped - count
+  end
 end
 
 local function Logger:write_loop(): nil
@@ -98,7 +101,8 @@ local function Logger:write_loop(): nil
     case self.source:next()
     when item(text) then
       self.queued = self.queued - 1
-      self.sink(text)
+      self:report_dropped()
+      if not self.sink(text) then self.dropped = self.dropped + 1 end
       self:report_dropped()
     else
       self:report_dropped()
@@ -111,13 +115,15 @@ catch
   -- never become an uncaught Task error or replace an application failure.
   self.failed = true
   self.queued = 0
+  if error is async.CancellationReason then raise end
   return nil
 end
 
-function Logger.new(level: string?, sink: (function (string): ())?, capacity: integer?): Logger
-  local selected = resolve_level(level)
-  local maximum = capacity or 1024
-  if maximum < 1 then raise "log queue capacity must be positive" end
+-- The sink returns false when it refuses a line without blocking; that line
+-- then counts as dropped.
+local function Logger.start(minimum: integer, sink: function (string): (boolean),
+                            capacity: integer): Logger
+  if capacity < 1 then raise "log queue capacity must be positive" end
   local publish: (function (string): (boolean))? = nil
   local finish: (function (): (boolean))? = nil
   local source = async.BufferedSubscription<|string, nil|>(function (p, _fail, f)
@@ -125,11 +131,20 @@ function Logger.new(level: string?, sink: (function (string): ())?, capacity: in
     finish = f
     return async.SubscriptionActions<|string|>(noop_stop, noop_close)
   end)
-  local result: Logger = {minimum = rank(selected), sink = sink or write_stderr,
-    source = source, publish = publish, finish = finish, capacity = maximum,
+  local result: Logger = {minimum = minimum, sink = sink, source = source,
+    publish = publish, finish = finish, capacity = capacity,
     queued = 0, dropped = 0, closed = false, failed = false, worker = nil}
   result.worker = async.run<|nil, value|>(result:write_loop)
   return result
+end
+
+function Logger.new(level: string?, sink: (function (string): ())?, capacity: integer?): Logger
+  local minimum: integer = rank(resolve_level(level))
+  local destination = sink or write_stderr
+  return Logger.start(minimum, function (text: string): boolean
+    destination(text)
+    return true
+  end, capacity or 1024)
 end
 
 function Logger:level(): string
@@ -184,10 +199,13 @@ function Logger:accept(encoded: string)
   end
 end
 
+-- Every caller, including a concurrent one, returns only after the writer
+-- has delivered or dropped every admitted line.
 function Logger:close()
-  if self.closed then return end
-  self.closed = true
-  self.finish()
+  if not self.closed then
+    self.closed = true
+    self.finish()
+  end
   if self.worker then await_terminal(self.worker) end
 end
 
@@ -196,20 +214,12 @@ function emit(logger: Logger?, level: string, event: string, fields: {string: va
 end
 
 -- The Sender is borrowed: closing it would end logging for every producer.
--- Lines lost to a full channel are reported before the next delivered line.
+-- A full channel refuses lines without blocking; they count as dropped and
+-- their total is reported once the channel accepts a log_dropped line.
 function forward(level: string, lines: thread.Sender<|string|>?): Logger?
   if not lines then return nil end
-  local lost = 0
-  return Logger(level, function (text: string)
-    if lost > 0 then
-      if not lines:try_send(format_line("error", "log_dropped", {["count"] = lost})) then
-        lost = lost + 1
-        return
-      end
-      lost = 0
-    end
-    if not lines:try_send(text) then lost = lost + 1 end
-  end)
+  local minimum: integer = rank(resolve_level(level))
+  return Logger.start(minimum, lines:try_send, 1024)
 end
 
 -- Startup may fail before a Logger exists. Callers supply fixed, safe
@@ -222,4 +232,5 @@ function fatal(event: string, reason: string, fields: {string: value}?)
   contents["reason"] = reason
   os.stderr:write(format_line("error", event, contents))
 catch
+  if error is async.CancellationReason then raise end
 end

@@ -1,13 +1,13 @@
 local iteration = import "iteration"
 local os = import "os"
 local router = import "mk.router.titan"
-local string = import "string"
+local strings = import "string"
 local test = import "test"
 
 type Params = {string: string}
 
 local function describe(params: Params): string
-  local out = string.writer()
+  local out = strings.writer()
   out:write("{")
   for key, item in iteration.pairs(params) do
     out:write(" ")
@@ -93,7 +93,7 @@ local function expect_raise(action: function (): (), expected: string)
     action()
   catch
     raised = true
-    test.assert(error == expected, "raised " .. string.tostring(error) .. ", expected " .. expected)
+    test.assert(error == expected, "raised " .. strings.tostring(error) .. ", expected " .. expected)
   end
   test.assert(raised, "operation did not raise " .. expected)
 end
@@ -191,11 +191,11 @@ function test_parse_pattern_errors(context: test.Context)
   error_case(context, "tab", "/a\tb", "control_character", 3)
   error_case(context, "delete", "/a\127", "control_character", 3)
   error_case(context, "duplicate", "/:a/:a", "duplicate_parameter", 5)
-  error_case(context, "too_many_wildcards", string.rep("/*", 17), "route_limit", 34)
-  error_case(context, "too_long", "/" .. string.rep("a", 1024), "route_limit", 1025)
-  error_case(context, "too_many_segments", string.rep("/a", 65), "route_limit", 130)
+  error_case(context, "too_many_wildcards", strings.rep("/*", 17), "route_limit", 34)
+  error_case(context, "too_long", "/" .. strings.rep("a", 1024), "route_limit", 1025)
+  error_case(context, "too_many_segments", strings.rep("/a", 65), "route_limit", 130)
   context:run("too_many_tokens", function(_child: test.Context)
-    local pattern = string.writer()
+    local pattern = strings.writer()
     pattern:write("/")
     local position = 2
     local last_param = 0
@@ -503,6 +503,45 @@ function test_prefix_mode(context: test.Context)
   end)
 end
 
+-- A path always starts with "/"; when every optional segment is omitted the
+-- pattern reduces to the root "/".
+function test_root_and_empty_paths(context: test.Context)
+  local strict = router.PatternOptions { strict_routing = true }
+  local prefix = router.PatternOptions { prefix = true }
+  context:run("empty_path_never_matches", function(_child: test.Context)
+    local patterns: {string} = {"/", "/*", "/:id?", "/*/*", "/:a?/*", "/:a?/:b?", "/x"}
+    for index = 1, #patterns do
+      expect_no_match(router.compile_pattern(patterns[index]), "")
+      expect_no_match(router.compile_pattern(patterns[index], strict), "")
+      expect_no_match(router.compile_pattern(patterns[index], prefix), "")
+      expect_no_match(router.compile_pattern(patterns[index]), "x/")
+    end
+  end)
+  context:run("optional_root_segment", function(_child: test.Context)
+    expect_match(router.compile_pattern("/:id?"), "/", {})
+    expect_match(router.compile_pattern("/:id?", strict), "/", {})
+    expect_match(router.compile_pattern("/:id?", strict), "/7", {["id"] = "7"})
+    expect_no_match(router.compile_pattern("/:id?", strict), "//")
+    expect_match(router.compile_pattern("/:id?", prefix), "/", {}, 2)
+    expect_match(router.compile_pattern("/:id?", prefix), "/7/x", {["id"] = "7"}, 3)
+  end)
+  context:run("all_optional_segments", function(_child: test.Context)
+    expect_match(router.compile_pattern("/:a?/:b?"), "/", {})
+    expect_match(router.compile_pattern("/:a?/:b?", strict), "/", {})
+    expect_no_match(router.compile_pattern("/:a?/:b?", strict), "//")
+    expect_match(router.compile_pattern("/:a?/:b?", strict), "/x/y", {["a"] = "x", ["b"] = "y"})
+    expect_match(router.compile_pattern("/:a?/:b?", prefix), "/", {}, 2)
+  end)
+  context:run("root_wildcards", function(_child: test.Context)
+    expect_match(router.compile_pattern("/*"), "/", {["*"] = "", ["*1"] = ""})
+    expect_match(router.compile_pattern("/*", strict), "/", {["*"] = "", ["*1"] = ""})
+    expect_match(router.compile_pattern("/*"), "/a/b", {["*"] = "a/b", ["*1"] = "a/b"})
+    expect_match(router.compile_pattern("/*/*"), "/", {["*"] = "", ["*1"] = "", ["*2"] = ""})
+    expect_match(router.compile_pattern("/:a?/*", strict), "/", {["*"] = "", ["*1"] = ""})
+    expect_match(router.compile_pattern("/*", prefix), "/", {["*"] = "", ["*1"] = ""}, 2)
+  end)
+end
+
 -- Best of three CPU-time measurements of one rejected match.
 local function rejection_seconds(compiled: router.CompiledPattern, path: string): float
   local best = -1.0
@@ -516,14 +555,14 @@ local function rejection_seconds(compiled: router.CompiledPattern, path: string)
 end
 
 local function dashes(bytes: integer): string
-  return "/" .. string.rep("-", bytes - 1)
+  return "/" .. strings.rep("-", bytes - 1)
 end
 
 -- Sixteen wildcards with literal separators keep every feasibility row dense
 -- across a 16 KiB path, while a leading literal rejects it only at the top row.
 -- Linear work grows 4x from 4 KiB to 16 KiB; quadratic work would grow 16x.
 function test_rejected_path_bounds(context: test.Context)
-  local pattern = string.writer()
+  local pattern = strings.writer()
   pattern:write("/x")
   for index = 1, router.MAX_WILDCARDS do
     if index > 1 then pattern:write("-") end
@@ -540,21 +579,21 @@ function test_rejected_path_bounds(context: test.Context)
       "rejection grew superlinearly: " .. small .. " s at 4 KiB, " .. large .. " s at 16 KiB")
   end)
   context:run("escaped_atoms", function(_child: test.Context)
-    local path = "/" .. string.rep("%2D", (router.MAX_TARGET_BYTES - 1) // 3)
+    local path = "/" .. strings.rep("%2D", (router.MAX_TARGET_BYTES - 1) // 3)
     local elapsed = rejection_seconds(compiled, path)
     test.assert(elapsed < 1.0, "16 KiB escaped rejection took " .. elapsed .. " s")
   end)
   context:run("optional_and_delimited", function(_child: test.Context)
     local mixed = router.compile_pattern("/:a?/*/x/:b.:c/+")
-    local path = "/" .. string.rep("ab/", (router.MAX_TARGET_BYTES - 1) // 3)
+    local path = "/" .. strings.rep("ab/", (router.MAX_TARGET_BYTES - 1) // 3)
     local elapsed = rejection_seconds(mixed, path)
     test.assert(elapsed < 1.0, "16 KiB mixed rejection took " .. elapsed .. " s")
   end)
   context:run("long_match_splits_greedily", function(_child: test.Context)
     local pair = router.compile_pattern("/*-*")
-    local path = "/" .. string.rep("a-", 8000) .. "b"
-    expect_match(pair, path, {["*"] = string.rep("a-", 7999) .. "a",
-      ["*1"] = string.rep("a-", 7999) .. "a", ["*2"] = "b"})
+    local path = "/" .. strings.rep("a-", 8000) .. "b"
+    expect_match(pair, path, {["*"] = strings.rep("a-", 7999) .. "a",
+      ["*1"] = strings.rep("a-", 7999) .. "a", ["*2"] = "b"})
   end)
 end
 
@@ -587,7 +626,9 @@ function test_parse_target(context: test.Context)
     expect_raise(function() router.parse_target("/%zz") end, "invalid percent escape")
     expect_raise(function() router.parse_target("/%00") end, "NUL is not allowed in a request target")
     expect_raise(function() router.parse_target("/?a&b&c", nil, 2) end, "too many query parameters")
-    expect_raise(function() router.parse_target("/" .. string.rep("a", router.MAX_TARGET_BYTES)) end,
+    expect_raise(function() router.parse_target("/?a=1", nil, 0) end, "too many query parameters")
+    test.assert(#router.parse_target("/x", nil, 0).segments == 1, "a query-free target hit the field limit")
+    expect_raise(function() router.parse_target("/" .. strings.rep("a", router.MAX_TARGET_BYTES)) end,
       "request target is too long")
   end)
 end
@@ -619,6 +660,8 @@ function test_build(context: test.Context)
     local compiled = router.compile_pattern("/users/:id")
     test.assert(compiled:build({["id"] = "a b/c"}) == "/users/a%20b%2Fc")
     expect_raise(function() compiled:build() end, "route parameter 'id' is required")
+    expect_raise(function() router.compile_pattern("/users/:id/edit"):build({["id"] = ""}) end,
+      "route parameter 'id' is required")
   end)
   context:run("optional_segments_vanish", function(_child: test.Context)
     local compiled = router.compile_pattern("/api/:id?")
@@ -641,6 +684,14 @@ function test_build(context: test.Context)
     test.assert(router.compile_pattern("/a\\:b/caf%C3%A9"):build() == "/a:b/caf%C3%A9")
     test.assert(router.compile_pattern("/a\\?b"):build() == "/a%3Fb")
   end)
+  context:run("built_paths_match_their_pattern", function(_child: test.Context)
+    local compiled = router.compile_pattern("/v1/:name/:mode?/files/*.:ext")
+    local params: Params = {["name"] = "a b/c", ["mode"] = "r%w", ["*1"] = "x/y z", ["ext"] = "t.gz"}
+    local built = compiled:build(params)
+    test.assert(built == "/v1/a%20b%2Fc/r%25w/files/x/y%20z.t.gz", "built " .. built)
+    expect_match(compiled, built, {["name"] = "a b/c", ["mode"] = "r%w", ["*"] = "x/y z.t",
+      ["*1"] = "x/y z.t", ["ext"] = "gz"})
+  end)
 end
 
 function test_join_paths(_context: test.Context)
@@ -657,4 +708,6 @@ end
 function test_allow_header(_context: test.Context)
   test.assert(router.allow_header({"GET", "HEAD", "POST"}) == "GET, HEAD, POST")
   test.assert(router.allow_header({}) == "")
+  test.assert(router.allow_header({"GET", "POST", "GET", "", "HEAD", "POST"}) == "GET, POST, HEAD",
+    "Allow must list distinct nonempty methods in first-occurrence order")
 end
