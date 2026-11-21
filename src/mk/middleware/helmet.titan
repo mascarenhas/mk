@@ -1,0 +1,89 @@
+--- Security response headers (GoFiber helmet).
+-- @module mk.middleware.helmet
+
+local mk = import "mk"
+
+--- Helmet options; every header defaults to the GoFiber helmet value and an
+-- empty string omits that header.
+-- @field next Skip the middleware when it returns true.
+-- @field hsts_max_age Strict-Transport-Security max-age in seconds (0 omits it; HTTPS only).
+record Config
+  const next: (function (mk.Context): boolean)?
+  const xss_protection: string?
+  const content_type_nosniff: string?
+  const x_frame_options: string?
+  const hsts_max_age: integer?
+  const hsts_exclude_subdomains: boolean?
+  const hsts_preload_enabled: boolean?
+  const content_security_policy: string?
+  const csp_report_only: boolean?
+  const referrer_policy: string?
+  const permission_policy: string?
+  const cross_origin_embedder_policy: string?
+  const cross_origin_opener_policy: string?
+  const cross_origin_resource_policy: string?
+  const origin_agent_cluster: string?
+  const x_dns_prefetch_control: string?
+  const x_download_options: string?
+  const x_permitted_cross_domain: string?
+end
+
+local function set_nonempty(ctx: mk.Context, name: string, contents: string)
+  if contents ~= "" then ctx:set(name, contents) end
+end
+
+--- Build the helmet middleware. Header values are validated snapshots
+-- captured individually, so the handler can run on worker threads.
+function new(config: Config?): mk.Handler
+  local cfg = config or Config {}
+  local max_age = cfg.hsts_max_age or 0
+  if max_age < 0 then raise "helmet: hsts_max_age must be non-negative" end
+  local exclude_subdomains = cfg.hsts_exclude_subdomains or false
+  local preload = cfg.hsts_preload_enabled or false
+  if preload and exclude_subdomains then
+    raise "helmet: hsts_preload_enabled requires subdomains to be included"
+  end
+  local hsts = ""
+  if max_age > 0 then
+    hsts = "max-age=" .. max_age
+    if not exclude_subdomains then hsts = hsts .. "; includeSubDomains" end
+    if preload then hsts = hsts .. "; preload" end
+  end
+  local skip? = cfg.next
+  local xss = cfg.xss_protection or "0"
+  local nosniff = cfg.content_type_nosniff or "nosniff"
+  local frame = cfg.x_frame_options or "SAMEORIGIN"
+  local csp = cfg.content_security_policy or ""
+  local csp_header = "Content-Security-Policy"
+  if cfg.csp_report_only then csp_header = "Content-Security-Policy-Report-Only" end
+  local referrer = cfg.referrer_policy or "no-referrer"
+  local permissions = cfg.permission_policy or ""
+  local embedder = cfg.cross_origin_embedder_policy or "require-corp"
+  local opener = cfg.cross_origin_opener_policy or "same-origin"
+  local resource = cfg.cross_origin_resource_policy or "same-origin"
+  local agent_cluster = cfg.origin_agent_cluster or "?1"
+  local dns_prefetch = cfg.x_dns_prefetch_control or "off"
+  local download = cfg.x_download_options or "noopen"
+  local cross_domain = cfg.x_permitted_cross_domain or "none"
+  return function (ctx: mk.Context)
+    if skip ~= nil and skip(ctx) then
+      ctx:next()
+      return
+    end
+    set_nonempty(ctx, "X-XSS-Protection", xss)
+    set_nonempty(ctx, "X-Content-Type-Options", nosniff)
+    set_nonempty(ctx, "X-Frame-Options", frame)
+    set_nonempty(ctx, "Referrer-Policy", referrer)
+    set_nonempty(ctx, "Cross-Origin-Embedder-Policy", embedder)
+    set_nonempty(ctx, "Cross-Origin-Opener-Policy", opener)
+    set_nonempty(ctx, "Cross-Origin-Resource-Policy", resource)
+    set_nonempty(ctx, "Origin-Agent-Cluster", agent_cluster)
+    set_nonempty(ctx, "X-DNS-Prefetch-Control", dns_prefetch)
+    set_nonempty(ctx, "X-Download-Options", download)
+    set_nonempty(ctx, "X-Permitted-Cross-Domain-Policies", cross_domain)
+    set_nonempty(ctx, csp_header, csp)
+    set_nonempty(ctx, "Permissions-Policy", permissions)
+    if ctx:secure() then set_nonempty(ctx, "Strict-Transport-Security", hsts) end
+    ctx:next()
+  end
+end

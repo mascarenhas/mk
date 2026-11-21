@@ -1,0 +1,485 @@
+--- Static files from a trusted root with strict path confinement.
+-- `titan.fs` is path based (no openat/O_NOFOLLOW): the root must not be
+-- mutated concurrently by untrusted local processes.
+--
+-- The served path is the raw wildcard of the matched route (register as
+-- `app:get("/assets/*", static.new(root))`), otherwise the request path below
+-- `ctx:mount_path()` (for example a sub app mounted with `App:mount`).
+-- @module mk.middleware.static
+
+local mk = import "mk"
+local fs = import "fs"
+local math = import "math"
+local os = import "os"
+local router = import "mk.router"
+local strings = import "string"
+local async = import "async"
+
+--- Static serving options.
+-- @field index_names Files tried for a directory (default {"index.html"}); single basenames.
+-- @field browse Render an HTML listing for directories without an index file.
+-- @field byte_range Honor a single `Range: bytes=` range (206/416).
+-- @field download Send files as attachments.
+-- @field max_age `Cache-Control: public, max-age=N` when positive.
+-- @field modify_response Runs before a file response commits.
+-- @field not_found_handler Handles missing or rejected paths (default: HttpError 404).
+record Config
+  const next: (function (mk.Context): boolean)?
+  const index_names: {string}?
+  const browse: boolean?
+  const byte_range: boolean?
+  const download: boolean?
+  const max_age: integer?
+  const modify_response: mk.Handler?
+  const not_found_handler: mk.Handler?
+end
+
+local const CHUNK_BYTES = 65536
+
+local const DEVICE_NAMES: {string: boolean} = {
+  ["CON"] = true, ["PRN"] = true, ["AUX"] = true, ["NUL"] = true,
+  ["COM1"] = true, ["COM2"] = true, ["COM3"] = true, ["COM4"] = true, ["COM5"] = true,
+  ["COM6"] = true, ["COM7"] = true, ["COM8"] = true, ["COM9"] = true,
+  ["LPT1"] = true, ["LPT2"] = true, ["LPT3"] = true, ["LPT4"] = true, ["LPT5"] = true,
+  ["LPT6"] = true, ["LPT7"] = true, ["LPT8"] = true, ["LPT9"] = true,
+}
+
+local const MONTHS: {string: integer} = {
+  ["Jan"] = 1, ["Feb"] = 2, ["Mar"] = 3, ["Apr"] = 4, ["May"] = 5, ["Jun"] = 6,
+  ["Jul"] = 7, ["Aug"] = 8, ["Sep"] = 9, ["Oct"] = 10, ["Nov"] = 11, ["Dec"] = 12,
+}
+
+-- Raw (undecoded) wildcard matchers per route pattern, per Lua state.
+local raw_matchers: {string: router.CompiledPattern} = {}
+
+local function ascii_upper(text: string): string
+  local upper = strings.gsub(text, "[a-z]", function (letter: string): string
+    return strings.char(strings.byte(letter, 1) - 32)
+  end, nil)
+  return upper
+end
+
+-- A single path component: not empty, `.` or `..`, and free of separators,
+-- drive/stream colons, and NUL.
+local function valid_basename(name: string): boolean
+  if name == "" or name == "." or name == ".." then return false end
+  return strings.match(name, "[/\\\\:\0]") == nil
+end
+
+-- Windows reserved device names, with or without an extension.
+local function device_name(segment: string): boolean
+  local stem = segment
+  local dot? = strings.find(segment, ".")
+  if dot ~= nil then stem = strings.sub(segment, 1, dot - 1) end
+  return DEVICE_NAMES[ascii_upper(stem)] == true
+end
+
+local function hex_value(byte: integer): integer
+  if byte >= 48 and byte <= 57 then return byte - 48 end
+  if byte >= 65 and byte <= 70 then return byte - 55 end
+  if byte >= 97 and byte <= 102 then return byte - 87 end
+  return -1
+end
+
+-- Decode `%XX` escapes exactly once; nil on a malformed escape.
+local function decode_segment(raw: string): string?
+  if not strings.find(raw, "%") then return raw end
+  local out = strings.writer()
+  local index = 1
+  while index <= #raw do
+    local byte = strings.byte(raw, index)
+    if byte == 37 then
+      if index + 2 > #raw then return nil end
+      local high = hex_value(strings.byte(raw, index + 1))
+      local low = hex_value(strings.byte(raw, index + 2))
+      if high < 0 or low < 0 then return nil end
+      out:write(strings.char(high * 16 + low))
+      index = index + 3
+    else
+      out:write(strings.char(byte))
+      index = index + 1
+    end
+  end
+  return out:drain()
+end
+
+local function raw_request_path(ctx: mk.Context): string
+  local target = ctx:original_url()
+  local question? = strings.find(target, "?")
+  if question ~= nil then return strings.sub(target, 1, question - 1) end
+  return target
+end
+
+-- The still-encoded path to serve: the raw wildcard of the matched route,
+-- else the request path below the mount prefix.
+local function relative_raw_path(ctx: mk.Context): string
+  local raw = raw_request_path(ctx)
+  local pattern = ctx:matched_route()
+  if pattern ~= "" and (strings.find(pattern, "*") ~= nil or strings.find(pattern, "+") ~= nil) then
+    local matcher? = raw_matchers[pattern]
+    if matcher == nil then
+      local compiled = router.compile_pattern(pattern, router.PatternOptions(false, false, false, false))
+      raw_matchers[pattern] = compiled
+      matcher = compiled
+    end
+    local found? = matcher:match(raw)
+    if found ~= nil then
+      local rest? = found.params["*"] or found.params["+"]
+      if rest ~= nil then return rest end
+    end
+  end
+  local mount = ctx:mount_path()
+  if mount ~= "" and mount ~= "/" and #raw >= #mount and
+      ascii_upper(strings.sub(raw, 1, #mount)) == ascii_upper(mount) then
+    return strings.sub(raw, #mount + 1)
+  end
+  return raw
+end
+
+-- Strict component-boundary containment of a resolved path.
+local function within_root(root: string, candidate: string): boolean
+  if candidate == root then return true end
+  if #candidate <= #root or strings.sub(candidate, 1, #root) ~= root then return false end
+  local last = strings.byte(root, #root)
+  if last == 47 or last == 92 then return true end
+  local boundary = strings.byte(candidate, #root + 1)
+  return boundary == 47 or boundary == 92
+end
+
+local function resolved(path: string): string?
+  do
+    return fs.realpath(path)
+  catch
+    if error is async.OperationError then return nil end
+    raise
+  end
+end
+
+local function http_date(unix: integer): string
+  local formatted: string = os.date("!%a, %d %b %Y %H:%M:%S GMT", unix)
+  return formatted
+end
+
+-- Days since 1970-01-01 of a proleptic Gregorian civil date.
+local function days_from_civil(year: integer, month: integer, day: integer): integer
+  local y = year
+  if month <= 2 then y = y - 1 end
+  local era = y // 400
+  local year_of_era = y - era * 400
+  local shifted_month = (month + 9) % 12
+  local day_of_year = (153 * shifted_month + 2) // 5 + day - 1
+  local day_of_era = year_of_era * 365 + year_of_era // 4 - year_of_era // 100 + day_of_year
+  return era * 146097 + day_of_era - 719468
+end
+
+-- IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) to Unix seconds, or nil.
+local function parse_http_date(text: string): integer?
+  if #text ~= 29 or strings.sub(text, 4, 5) ~= ", " or strings.sub(text, 26, 29) ~= " GMT" then
+    return nil
+  end
+  local day? = math.tointeger(strings.sub(text, 6, 7))
+  local month? = MONTHS[strings.sub(text, 9, 11)]
+  local year? = math.tointeger(strings.sub(text, 13, 16))
+  local hour? = math.tointeger(strings.sub(text, 18, 19))
+  local minute? = math.tointeger(strings.sub(text, 21, 22))
+  local second? = math.tointeger(strings.sub(text, 24, 25))
+  if day == nil or month == nil or year == nil or hour == nil or minute == nil or second == nil then
+    return nil
+  end
+  return days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second
+end
+
+local function trim(text: string): string
+  local first = 1
+  local last = #text
+  while first <= last and (strings.byte(text, first) == 32 or strings.byte(text, first) == 9) do
+    first = first + 1
+  end
+  while last >= first and (strings.byte(text, last) == 32 or strings.byte(text, last) == 9) do
+    last = last - 1
+  end
+  return strings.sub(text, first, last)
+end
+
+local function weak_core(tag: string): string
+  if strings.sub(tag, 1, 2) == "W/" then return strings.sub(tag, 3) end
+  return tag
+end
+
+-- Weak comparison against an If-None-Match list (or `*`).
+local function etag_matches(header: string, etag: string): boolean
+  if trim(header) == "*" then return true end
+  local wanted = weak_core(etag)
+  for item in strings.split(header, ",") do
+    if weak_core(trim(item)) == wanted then return true end
+  end
+  return false
+end
+
+local const RANGE_IGNORE = 0
+local const RANGE_SATISFIABLE = 1
+local const RANGE_UNSATISFIABLE = 2
+
+-- One `bytes=` range: (kind, first, last). Multiple or malformed ranges are
+-- ignored (the full representation is served).
+local function parse_range(header: string, size: integer): (integer, integer, integer)
+  local spec = trim(header)
+  if #spec < 6 or ascii_upper(strings.sub(spec, 1, 6)) ~= "BYTES=" then return RANGE_IGNORE, 0, 0 end
+  spec = trim(strings.sub(spec, 7))
+  if strings.find(spec, ",") then return RANGE_IGNORE, 0, 0 end
+  local dash? = strings.find(spec, "-")
+  if dash == nil then return RANGE_IGNORE, 0, 0 end
+  local first_text = trim(strings.sub(spec, 1, dash - 1))
+  local last_text = trim(strings.sub(spec, dash + 1))
+  if first_text == "" then
+    local suffix? = math.tointeger(last_text)
+    if suffix == nil or suffix < 0 then return RANGE_IGNORE, 0, 0 end
+    if suffix == 0 or size == 0 then return RANGE_UNSATISFIABLE, 0, 0 end
+    local start = size - suffix
+    if start < 0 then start = 0 end
+    return RANGE_SATISFIABLE, start, size - 1
+  end
+  local first? = math.tointeger(first_text)
+  if first == nil or first < 0 then return RANGE_IGNORE, 0, 0 end
+  local last = size - 1
+  if last_text ~= "" then
+    local parsed? = math.tointeger(last_text)
+    if parsed == nil or parsed < first then return RANGE_IGNORE, 0, 0 end
+    if parsed < last then last = parsed end
+  end
+  if first >= size then return RANGE_UNSATISFIABLE, 0, 0 end
+  return RANGE_SATISFIABLE, first, last
+end
+
+local function html_escape(text: string): string
+  local escaped = strings.gsub(text, "[&<>\"']", function (piece: string): string
+    if piece == "&" then return "&amp;" end
+    if piece == "<" then return "&lt;" end
+    if piece == ">" then return "&gt;" end
+    if piece == "\"" then return "&quot;" end
+    return "&#39;"
+  end, nil)
+  return escaped
+end
+
+local function sort_strings(items: {string})
+  for index = 2, #items do
+    local current = items[index]
+    local position = index - 1
+    while position >= 1 and items[position] > current do
+      items[position + 1] = items[position]
+      position = position - 1
+    end
+    items[position + 1] = current
+  end
+end
+
+local function extension_of(path: string): string
+  for index = #path, 1, -1 do
+    local byte = strings.byte(path, index)
+    if byte == 46 then return strings.sub(path, index + 1) end
+    if byte == 47 or byte == 92 then return "" end
+  end
+  return ""
+end
+
+local function not_found(ctx: mk.Context, handler: mk.Handler?)
+  if handler ~= nil then
+    handler(ctx)
+    return
+  end
+  raise mk.HttpError(404)
+end
+
+-- Render a directory listing (symlinks omitted, names escaped and encoded).
+local function serve_listing(ctx: mk.Context, directory: string)
+  local base = raw_request_path(ctx)
+  if strings.sub(base, -1) ~= "/" then base = base .. "/" end
+  local names = fs.list(directory)
+  sort_strings(names)
+  local out = strings.writer()
+  local title = html_escape(base)
+  out:write("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>Index of " .. title ..
+    "</title></head><body><h1>Index of " .. title .. "</h1><ul>\n")
+  for index = 1, #names do
+    local name = names[index]
+    local info? = fs.lstat(directory .. "/" .. name)
+    if info ~= nil and info.kind ~= "symlink" then
+      local suffix = ""
+      if info.kind == "directory" then suffix = "/" end
+      out:write("<li><a href=\"" .. html_escape(base .. router.percent_encode_segment(name)) ..
+        suffix .. "\">" .. html_escape(name) .. suffix .. "</a></li>\n")
+    end
+  end
+  out:write("</ul></body></html>\n")
+  ctx:html(out:drain())
+end
+
+-- Serve one confined regular file with validators, ranges, and streaming.
+local function serve_file(ctx: mk.Context, path: string, info: fs.Stat, byte_range: boolean,
+                          download: boolean, max_age: integer, modify_response: mk.Handler?)
+  local size = info.size
+  local etag = "W/\"" .. strings.format("%x-%x", size, info.modified_seconds) .. "\""
+  ctx:set("ETag", etag)
+  ctx:set("Last-Modified", http_date(info.modified_seconds))
+  if max_age > 0 then ctx:set("Cache-Control", "public, max-age=" .. max_age) end
+  if download then
+    ctx:attachment(path)
+  else
+    ctx:type(extension_of(path))
+  end
+  if byte_range then ctx:set("Accept-Ranges", "bytes") end
+  local unmodified = false
+  local if_none_match? = ctx:header_opt("If-None-Match")
+  if if_none_match ~= nil then
+    unmodified = etag_matches(if_none_match, etag)
+  else
+    local if_modified_since? = ctx:header_opt("If-Modified-Since")
+    if if_modified_since ~= nil then
+      local since? = parse_http_date(trim(if_modified_since))
+      unmodified = since ~= nil and info.modified_seconds <= since
+    end
+  end
+  if unmodified then
+    ctx:status(304)
+    if modify_response ~= nil then modify_response(ctx) end
+    return
+  end
+  local first = 0
+  local length = size
+  if byte_range and ctx:method() == "GET" then
+    local range? = ctx:header_opt("Range")
+    if range ~= nil then
+      local kind, range_first, range_last = parse_range(range, size)
+      if kind == RANGE_UNSATISFIABLE then
+        ctx:set("Content-Range", "bytes */" .. size)
+        raise mk.HttpError(416)
+      elseif kind == RANGE_SATISFIABLE then
+        first = range_first
+        length = range_last - range_first + 1
+        ctx:status(206)
+        ctx:set("Content-Range", "bytes " .. range_first .. "-" .. range_last .. "/" .. size)
+      end
+    end
+  end
+  ctx:set("Content-Length", "" .. length)
+  if modify_response ~= nil then modify_response(ctx) end
+  -- HEAD keeps the declared length and never reads the file.
+  if ctx:method() == "HEAD" then return end
+  local file = fs.open(path, "rb")
+  defer file:close()
+  local skipped = 0
+  while skipped < first do
+    local wanted = first - skipped
+    if wanted > CHUNK_BYTES then wanted = CHUNK_BYTES end
+    local chunk? = file:read(wanted)
+    if chunk == nil then break end
+    skipped = skipped + #chunk
+  end
+  ctx:flush_headers()
+  local remaining = length
+  while remaining > 0 do
+    local wanted = remaining
+    if wanted > CHUNK_BYTES then wanted = CHUNK_BYTES end
+    local chunk? = file:read(wanted)
+    if chunk == nil then break end
+    ctx:write_chunk(chunk)
+    remaining = remaining - #chunk
+  end
+end
+
+--- Serve files below `root`. Non-GET/HEAD requests continue the chain;
+-- invalid escapes are 400; rejected or missing paths are 404 (or
+-- `not_found_handler`). Configuration is captured as transferable
+-- snapshots; the canonical root resolves lazily in each worker state.
+function new(root: string, config: Config?): mk.Handler
+  if root == "" then raise "static: root must not be empty" end
+  local cfg = config or Config {}
+  local index_list = "index.html"
+  local supplied? = cfg.index_names
+  if supplied ~= nil then
+    local names = strings.writer()
+    for index = 1, #supplied do
+      local name = supplied[index]
+      if not valid_basename(name) then raise "static: index name must be a single basename" end
+      if index > 1 then names:write("/") end
+      names:write(name)
+    end
+    index_list = names:drain()
+  end
+  local skip? = cfg.next
+  local browse = cfg.browse or false
+  local byte_range = cfg.byte_range or false
+  local download = cfg.download or false
+  local max_age = cfg.max_age or 0
+  if max_age < 0 then raise "static: max_age must be non-negative" end
+  local modify_response? = cfg.modify_response
+  local not_found_handler? = cfg.not_found_handler
+  local canonical_root: string? = nil
+  return function (ctx: mk.Context)
+    if skip ~= nil and skip(ctx) then
+      ctx:next()
+      return
+    end
+    local method = ctx:method()
+    if method ~= "GET" and method ~= "HEAD" then
+      ctx:next()
+      return
+    end
+    if canonical_root == nil then
+      local root_info? = fs.stat(root)
+      if root_info ~= nil and root_info.kind == "directory" then canonical_root = resolved(root) end
+    end
+    local base? = canonical_root
+    if base == nil then
+      not_found(ctx, not_found_handler)
+      return
+    end
+    local path = base
+    for raw_segment in strings.split(relative_raw_path(ctx), "/") do
+      if raw_segment ~= "" then
+        local segment? = decode_segment(raw_segment)
+        if segment == nil then raise mk.HttpError(400, "invalid percent escape in path", "invalid_path") end
+        if not valid_basename(segment) or device_name(segment) then
+          not_found(ctx, not_found_handler)
+          return
+        end
+        path = path .. "/" .. segment
+      end
+    end
+    local info? = fs.lstat(path)
+    if info == nil or info.kind == "symlink" then
+      not_found(ctx, not_found_handler)
+      return
+    end
+    local real? = resolved(path)
+    if real == nil or not within_root(base, real) then
+      not_found(ctx, not_found_handler)
+      return
+    end
+    if info.kind == "file" then
+      serve_file(ctx, path, info, byte_range, download, max_age, modify_response)
+      return
+    end
+    if info.kind ~= "directory" then
+      not_found(ctx, not_found_handler)
+      return
+    end
+    for name in strings.split(index_list, "/") do
+      local candidate = path .. "/" .. name
+      local index_info? = fs.lstat(candidate)
+      if index_info ~= nil and index_info.kind == "file" then
+        local index_real? = resolved(candidate)
+        if index_real ~= nil and within_root(base, index_real) then
+          serve_file(ctx, candidate, index_info, byte_range, download, max_age, modify_response)
+          return
+        end
+      end
+    end
+    if browse then
+      serve_listing(ctx, path)
+      return
+    end
+    not_found(ctx, not_found_handler)
+  end
+end

@@ -1,0 +1,276 @@
+-- mk.middleware.static: confinement (traversal, encoded separators,
+-- symlinks, prefix boundaries, Windows devices), files, indexes, MIME,
+-- HEAD, validators, ranges, listings, and worker use.
+local test = import "test"
+local async = import "async"
+local fs = import "fs"
+local http = import "http"
+local net = import "net"
+local os = import "os"
+local strings = import "string"
+local timer = import "timer"
+local mk = import "mk"
+local static = import "mk.middleware.static"
+
+local function within(ms: integer, what: string, action: function (): ())
+  local worker = async.run<|nil, value|>(function (): nil
+    action()
+    return nil
+  end)
+  local deadline = async.run<|nil, value|>(function (): nil
+    timer.sleep(ms)
+    return nil
+  end)
+  defer do
+    if not deadline:status():has_finished() then deadline:cancel() end
+    if not worker:status():has_finished() then worker:cancel() end
+  end
+  case async.race_two(worker, deadline)
+  when first(status) then
+    local failed, failure? = status:has_failed()
+    if failed then failure:raise() end
+  when second() then
+    test.assert(false, what .. " did not finish within " .. ms .. " ms")
+  end
+end
+
+local function expect(check: boolean, what: string)
+  test.assert(check, what)
+end
+
+local function call(app: mk.App, method: string, target: string, pairs: {string}?): mk.TestResponse
+  local headers = http.headers(nil)
+  if pairs ~= nil then
+    for index = 1, #pairs, 2 do headers:add(pairs[index], pairs[index + 1]) end
+  end
+  return app:test(mk.TestRequest(method, target, headers))
+end
+
+local function raises(action: function (): ()): string
+  do
+    action()
+  catch
+    return strings.tostring(error)
+  end
+  return ""
+end
+
+local function symlink(target: string, link: string)
+  local process = os.spawn("ln", {"-s", target, link})
+  local status = process:wait()
+  if status.code ~= 0 then raise "ln -s failed" end
+end
+
+-- A fixture tree:
+--   <base>/public/{index.html,app.js,style.css,data.json,a b.txt,<b>&.txt,con.txt}
+--   <base>/public/sub/page.txt, <base>/public/empty/ (no index)
+--   <base>/public/link.txt -> ../secret.txt, <base>/public/escape -> ../public2
+--   <base>/public2/file.txt, <base>/secret.txt
+local record Fixture
+  base: string
+  root: string
+end
+
+local function remove_tree(path: string)
+  local info? = fs.lstat(path)
+  if info == nil then return end
+  if info.kind == "directory" then
+    local names = fs.list(path)
+    for index = 1, #names do remove_tree(path .. "/" .. names[index]) end
+    fs.rmdir(path)
+  else
+    fs.unlink(path)
+  end
+end
+
+local function make_fixture(context: test.Context): Fixture
+  local base = fs.tmpdir() .. "/mk-static-" .. os.pid()
+  remove_tree(base)
+  fs.mkdir(base)
+  context:cleanup(function () remove_tree(base) end)
+  local root = base .. "/public"
+  fs.mkdir(root)
+  fs.mkdir(root .. "/sub")
+  fs.mkdir(root .. "/empty")
+  fs.mkdir(base .. "/public2")
+  fs.write_file(root .. "/index.html", "<h1>home</h1>")
+  fs.write_file(root .. "/app.js", "console.log(1)")
+  fs.write_file(root .. "/style.css", "a{}")
+  fs.write_file(root .. "/data.json", "{\"a\":1}")
+  fs.write_file(root .. "/a b.txt", "spaced")
+  fs.write_file(root .. "/<b>&.txt", "markup")
+  fs.write_file(root .. "/con.txt", "device")
+  fs.write_file(root .. "/sub/page.txt", "0123456789")
+  fs.write_file(base .. "/public2/file.txt", "outside sibling")
+  fs.write_file(base .. "/secret.txt", "top secret")
+  symlink("../secret.txt", root .. "/link.txt")
+  symlink("../public2", root .. "/escape")
+  return Fixture(base, root)
+end
+
+function test_files_and_indexes(context: test.Context)
+  local fixture = make_fixture(context)
+  local app = mk.App()
+  app:get("/assets/*", static.new(fixture.root))
+  app:get("/after", function (ctx: mk.Context) ctx:send_string("after") end)
+  context:run("files_with_mime_types", function (_: test.Context)
+    local js = call(app, "GET", "/assets/app.js")
+    expect(js.status == 200 and js.body == "console.log(1)", "js body")
+    expect(js:header("Content-Type") == "text/javascript; charset=utf-8", "js type: " .. (js:header("Content-Type") or ""))
+    expect(call(app, "GET", "/assets/style.css"):header("Content-Type") == "text/css; charset=utf-8", "css")
+    expect(call(app, "GET", "/assets/data.json"):header("Content-Type") == "application/json; charset=utf-8", "json")
+    expect(call(app, "GET", "/assets/a%20b.txt").body == "spaced", "escaped name")
+    expect(call(app, "GET", "/assets/sub/page.txt").body == "0123456789", "nested file")
+  end)
+  context:run("index_files", function (_: test.Context)
+    expect(call(app, "GET", "/assets/").body == "<h1>home</h1>", "root index")
+    expect(call(app, "GET", "/assets").body == "<h1>home</h1>", "root index without slash")
+  end)
+  context:run("head_keeps_length_without_body", function (_: test.Context)
+    local head = call(app, "HEAD", "/assets/app.js")
+    expect(head.status == 200 and head.body == "" and head:header("Content-Length") == "14", "HEAD")
+  end)
+  context:run("missing_and_empty_directory", function (_: test.Context)
+    expect(call(app, "GET", "/assets/nope.txt").status == 404, "missing file")
+    expect(call(app, "GET", "/assets/empty/").status == 404, "directory without index or browse")
+  end)
+  context:run("other_methods_continue", function (_: test.Context)
+    expect(call(app, "POST", "/assets/app.js").status == 405, "POST is not served")
+  end)
+end
+
+function test_confinement(context: test.Context)
+  local fixture = make_fixture(context)
+  local app = mk.App()
+  app:get("/assets/*", static.new(fixture.root))
+  local rejected = function (target: string, what: string)
+    context:run(what, function (_: test.Context)
+      local response = call(app, "GET", target)
+      expect(response.status == 404, what .. " -> " .. response.status .. " " .. response.body)
+      expect(strings.find(response.body, "secret") == nil and
+        strings.find(response.body, "outside") == nil, what .. " leaked content")
+    end)
+  end
+  rejected("/assets/../secret.txt", "dot_dot")
+  rejected("/assets/%2e%2e/secret.txt", "encoded_dot_dot")
+  rejected("/assets/sub%2f..%2f..%2fsecret.txt", "encoded_slash")
+  rejected("/assets/..%5csecret.txt", "encoded_backslash")
+  rejected("/assets/app.js:stream", "colon")
+  rejected("/assets/con.txt", "windows_device_with_extension")
+  rejected("/assets/LPT9", "windows_device")
+  rejected("/assets/link.txt", "symlink_leaf")
+  rejected("/assets/escape/file.txt", "intermediate_symlink_to_prefix_sibling")
+  rejected("/assets/./app.js", "single_dot")
+end
+
+function test_invalid_escape_and_mounting(context: test.Context)
+  local fixture = make_fixture(context)
+  local files = mk.App()
+  files:use(static.new(fixture.root, static.Config {
+    not_found_handler = function (ctx: mk.Context) ctx:status(404):send_string("custom missing") end,
+  }))
+  local app = mk.App()
+  app:mount("/files", files)
+  context:run("mounted_sub_app", function (_: test.Context)
+    expect(call(app, "GET", "/files/app.js").body == "console.log(1)", "served below the mount prefix")
+  end)
+  context:run("invalid_escape_is_400", function (_: test.Context)
+    expect(call(app, "GET", "/files/%zz").status == 400, "malformed escape")
+  end)
+  context:run("not_found_handler", function (_: test.Context)
+    local response = call(app, "GET", "/files/nope")
+    expect(response.status == 404 and response.body == "custom missing", "custom 404")
+  end)
+end
+
+function test_validators_ranges_and_options(context: test.Context)
+  local fixture = make_fixture(context)
+  local app = mk.App()
+  app:get("/r/*", static.new(fixture.root, static.Config {
+    byte_range = true, max_age = 60,
+    modify_response = function (ctx: mk.Context) ctx:set("X-Modified", "yes") end,
+  }))
+  app:get("/d/*", static.new(fixture.root, static.Config { download = true }))
+  local first = call(app, "GET", "/r/sub/page.txt")
+  local etag = first:header("ETag") or ""
+  local modified = first:header("Last-Modified") or ""
+  context:run("validators_and_options", function (_: test.Context)
+    expect(strings.sub(etag, 1, 3) == "W/\"", "weak ETag: " .. etag)
+    expect(#modified == 29 and strings.sub(modified, -4) == " GMT", "Last-Modified: " .. modified)
+    expect(first:header("Cache-Control") == "public, max-age=60", "max-age")
+    expect(first:header("Accept-Ranges") == "bytes", "ranges advertised")
+    expect(first:header("X-Modified") == "yes", "modify_response ran")
+  end)
+  context:run("conditional_requests", function (_: test.Context)
+    local by_etag = call(app, "GET", "/r/sub/page.txt", {"If-None-Match", "\"other\", " .. etag})
+    expect(by_etag.status == 304 and by_etag.body == "", "If-None-Match")
+    local by_date = call(app, "GET", "/r/sub/page.txt", {"If-Modified-Since", modified})
+    expect(by_date.status == 304, "If-Modified-Since")
+    local stale = call(app, "GET", "/r/sub/page.txt", {"If-Modified-Since", "Thu, 01 Jan 1970 00:00:00 GMT"})
+    expect(stale.status == 200, "older If-Modified-Since serves the file")
+  end)
+  context:run("ranges", function (_: test.Context)
+    local part = call(app, "GET", "/r/sub/page.txt", {"Range", "bytes=2-5"})
+    expect(part.status == 206 and part.body == "2345", "byte range: " .. part.body)
+    expect(part:header("Content-Range") == "bytes 2-5/10", "Content-Range")
+    expect(call(app, "GET", "/r/sub/page.txt", {"Range", "bytes=-3"}).body == "789", "suffix range")
+    expect(call(app, "GET", "/r/sub/page.txt", {"Range", "bytes=7-"}).body == "789", "open range")
+    local unsatisfiable = call(app, "GET", "/r/sub/page.txt", {"Range", "bytes=50-"})
+    expect(unsatisfiable.status == 416 and unsatisfiable:header("Content-Range") == "bytes */10", "416")
+    local multiple = call(app, "GET", "/r/sub/page.txt", {"Range", "bytes=0-1,4-5"})
+    expect(multiple.status == 200 and multiple.body == "0123456789", "multiple ranges serve the file")
+  end)
+  context:run("download", function (_: test.Context)
+    expect(call(app, "GET", "/d/sub/page.txt"):header("Content-Disposition") ==
+      "attachment; filename=\"page.txt\"", "attachment")
+  end)
+end
+
+function test_browse_listing(context: test.Context)
+  local root = fs.tmpdir() .. "/mk-static-browse-" .. os.pid()
+  remove_tree(root)
+  fs.mkdir(root)
+  context:cleanup(function () remove_tree(root) end)
+  fs.write_file(root .. "/a b.txt", "x")
+  fs.write_file(root .. "/<b>&.txt", "y")
+  fs.mkdir(root .. "/dir")
+  fs.write_file(root .. "/outside.txt", "z")
+  symlink("outside.txt", root .. "/alias.txt")
+  local app = mk.App()
+  app:get("/b/*", static.new(root, static.Config { browse = true }))
+  local listing = call(app, "GET", "/b/").body
+  expect(strings.find(listing, "href=\"/b/a%20b.txt\">a b.txt</a>") ~= nil, "encoded href: " .. listing)
+  expect(strings.find(listing, "&lt;b&gt;&amp;.txt</a>") ~= nil, "escaped name")
+  expect(strings.find(listing, "href=\"/b/dir/\">dir/</a>") ~= nil, "directory entry")
+  expect(strings.find(listing, "alias.txt") == nil, "symlinks are omitted")
+end
+
+function test_configuration_validation(_: test.Context)
+  expect(raises(function () static.new("") end) == "static: root must not be empty", "empty root")
+  expect(raises(function () static.new("/tmp", static.Config { index_names = {"../x"} }) end) ==
+    "static: index name must be a single basename", "traversing index name")
+  expect(raises(function () static.new("/tmp", static.Config { index_names = {"a/b"} }) end) ==
+    "static: index name must be a single basename", "nested index name")
+  local app = mk.App()
+  app:get("/m/*", static.new("/nonexistent/mk-static-root"))
+  expect(call(app, "GET", "/m/x").status == 404, "missing root")
+end
+
+function test_static_on_pool_worker(context: test.Context)
+  local fixture = make_fixture(context)
+  local app = mk.App()
+  app:get("/w/*", static.new(fixture.root, static.Config { index_names = {"index.html"} }))
+    :workers(mk.WorkerMode.pool())
+  local server = app:listen_test()
+  context:cleanup(function () server:close() end)
+  within(5000, "worker static request", function ()
+    local connection = net.connect(server.host, server.port)
+    defer connection:close()
+    connection:write("GET /w/sub/page.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+    local out = strings.writer()
+    for chunk in connection:read do out:write(chunk) end
+    local text = out:drain()
+    expect(strings.sub(text, 1, 12) == "HTTP/1.1 200" and strings.sub(text, -10) == "0123456789",
+      "served by a pool worker: " .. text)
+  end)
+end
