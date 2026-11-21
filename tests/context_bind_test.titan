@@ -4,7 +4,7 @@ local test = import "test"
 local http = import "http"
 local json = import "json"
 local reflect = import "reflect"
-local string = import "string"
+local strings = import "string"
 local timer = import "timer"
 local mk = import "mk"
 
@@ -37,7 +37,7 @@ local function tostring_bool(flag: boolean): string
 end
 
 local function string_ends(subject: string, suffix: string): boolean
-  return #subject >= #suffix and string.sub(subject, #subject - #suffix + 1) == suffix
+  return #subject >= #suffix and strings.sub(subject, #subject - #suffix + 1) == suffix
 end
 
 function test_typed_params_and_queries(context: test.Context)
@@ -212,7 +212,7 @@ function test_streaming_and_commit(context: test.Context)
     test.assert(rejected, "mutating a committed response must raise")
   end)
   app:get("/reader", function (ctx: mk.Context)
-    ctx:send_stream(string.reader("from reader"), 11)
+    ctx:send_stream(strings.reader("from reader"), 11)
   end)
   context:run("chunks", function (_: test.Context)
     local response = call(app, "GET", "/stream")
@@ -289,7 +289,7 @@ function test_bind_classification(context: test.Context)
     expect_status(call(app, "POST", "/any", nil, "{}"), 415, "missing content type")
   end)
   context:run("too_large_413", function (_: test.Context)
-    local big = "[" .. string.rep("1,", 40) .. "1]"
+    local big = "[" .. strings.rep("1,", 40) .. "1]"
     expect_status(call(app, "POST", "/any", json_type, big), 413, "oversized JSON")
   end)
   context:run("empty_and_malformed_400", function (_: test.Context)

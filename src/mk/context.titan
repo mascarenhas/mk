@@ -113,22 +113,22 @@ local function trim_ows(text: string): string
   local first = 1
   local last = #text
   while first <= last do
-    local byte = string.byte(text, first)
+    local byte = strings.byte(text, first)
     if byte ~= 32 and byte ~= 9 then break end
     first = first + 1
   end
   while last >= first do
-    local byte = string.byte(text, last)
+    local byte = strings.byte(text, last)
     if byte ~= 32 and byte ~= 9 then break end
     last = last - 1
   end
-  return string.sub(text, first, last)
+  return strings.sub(text, first, last)
 end
 
 local function headers_have_token(headers: http.Headers, name: string, token: string): boolean
   local found = headers:values(name)
   for index = 1, #found do
-    for item in string.split(found[index], ",") do
+    for item in strings.split(found[index], ",") do
       if ascii_lower(trim_ows(item)) == token then return true end
     end
   end
@@ -139,15 +139,15 @@ local function parse_cookie_header(headers: http.Headers): {string: string}
   local result: {string: string} = {}
   local lines = headers:values("Cookie")
   for index = 1, #lines do
-    for pair in string.split(lines[index], ";") do
+    for pair in strings.split(lines[index], ";") do
       local item = trim_ows(pair)
-      local eq? = string.find(item, "=")
+      local eq? = strings.find(item, "=")
       if eq and eq > 1 then
-        local name = string.sub(item, 1, eq - 1)
-        local contents = string.sub(item, eq + 1)
-        if #contents >= 2 and string.sub(contents, 1, 1) == "\"" and
-            string.sub(contents, -1) == "\"" then
-          contents = string.sub(contents, 2, #contents - 1)
+        local name = strings.sub(item, 1, eq - 1)
+        local contents = strings.sub(item, eq + 1)
+        if #contents >= 2 and strings.sub(contents, 1, 1) == "\"" and
+            strings.sub(contents, -1) == "\"" then
+          contents = strings.sub(contents, 2, #contents - 1)
         end
         if result[name] == nil then result[name] = contents end
       end
@@ -249,13 +249,13 @@ local function http_date(unix: integer): string
 end
 
 local function Cookie:render(): string
-  if not string.match(self.name, COOKIE_NAME_PATTERN) then
+  if not strings.match(self.name, COOKIE_NAME_PATTERN) then
     raise "mk: invalid cookie name"
   end
-  if string.match(self.value, COOKIE_VALUE_FORBIDDEN) then
+  if strings.match(self.value, COOKIE_VALUE_FORBIDDEN) then
     raise "mk: invalid cookie value"
   end
-  local out = string.writer()
+  local out = strings.writer()
   out:write(self.name .. "=" .. self.value)
   out:write("; Path=" .. (self.path or "/"))
   if self.domain then out:write("; Domain=" .. self.domain) end
@@ -285,7 +285,7 @@ end
 local record TestCapture
   status: integer
   headers: http.Headers
-  body: string.StringWriter
+  body: strings.StringWriter
   committed: boolean
   closed: boolean
 end
@@ -349,9 +349,9 @@ local function Core:meta(method: string, target: string, headers: http.Headers,
     end
   end
   if parsed == nil then
-    local question? = string.find(target, "?")
+    local question? = strings.find(target, "?")
     local bare = target
-    if question then bare = string.sub(target, 1, question - 1) end
+    if question then bare = strings.sub(target, 1, question - 1) end
     local segments: const {string} = {}
     parsed = router.Target(bare, "", segments, {}, {})
   end
@@ -367,15 +367,15 @@ local function Core:meta(method: string, target: string, headers: http.Headers,
     local proto? = headers:get("X-Forwarded-Proto")
     if proto ~= nil then
       local first = ascii_lower(trim_ows(proto))
-      local comma? = string.find(first, ",")
-      if comma then first = trim_ows(string.sub(first, 1, comma - 1)) end
+      local comma? = strings.find(first, ",")
+      if comma then first = trim_ows(strings.sub(first, 1, comma - 1)) end
       if first == "http" or first == "https" then actual_scheme = first end
     end
     local forwarded_host? = headers:get("X-Forwarded-Host")
     if forwarded_host ~= nil then
       local first = trim_ows(forwarded_host)
-      local comma? = string.find(first, ",")
-      if comma then first = trim_ows(string.sub(first, 1, comma - 1)) end
+      local comma? = strings.find(first, ",")
+      if comma then first = trim_ows(strings.sub(first, 1, comma - 1)) end
       if first ~= "" then host = first end
     end
   end
@@ -503,13 +503,13 @@ end
 --- Host without its port (IPv6 literals keep their brackets).
 function Context:hostname(): string
   local host = self.meta.host
-  if string.sub(host, 1, 1) == "[" then
-    local close? = string.find(host, "]")
-    if close then return string.sub(host, 1, close) end
+  if strings.sub(host, 1, 1) == "[" then
+    local close? = strings.find(host, "]")
+    if close then return strings.sub(host, 1, close) end
     return host
   end
-  local colon? = string.find(host, ":")
-  if colon then return string.sub(host, 1, colon - 1) end
+  local colon? = strings.find(host, ":")
+  if colon then return strings.sub(host, 1, colon - 1) end
   return host
 end
 
@@ -517,13 +517,13 @@ end
 function Context:port(): integer
   local host = self.meta.host
   local start = 1
-  if string.sub(host, 1, 1) == "[" then
-    local close? = string.find(host, "]")
+  if strings.sub(host, 1, 1) == "[" then
+    local close? = strings.find(host, "]")
     if close then start = close + 1 end
   end
-  local colon? = string.find(host, ":", start)
+  local colon? = strings.find(host, ":", start)
   if colon then
-    local parsed? = math.tointeger(string.sub(host, colon + 1))
+    local parsed? = math.tointeger(strings.sub(host, colon + 1))
     if parsed ~= nil then return parsed end
   end
   if self.meta.scheme == "https" then return 443 end
@@ -825,8 +825,8 @@ end
 --- Lowercased media type of Content-Type without parameters, or "".
 function Context:media_type(): string
   local raw = self:content_type()
-  local semicolon? = string.find(raw, ";")
-  if semicolon then raw = string.sub(raw, 1, semicolon - 1) end
+  local semicolon? = strings.find(raw, ";")
+  if semicolon then raw = strings.sub(raw, 1, semicolon - 1) end
   return ascii_lower(trim_ows(raw))
 end
 
@@ -834,13 +834,13 @@ end
 function Context:is_json(): boolean
   local media = self:media_type()
   return media == "application/json" or
-    (#media > 5 and string.sub(media, -5) == "+json")
+    (#media > 5 and strings.sub(media, -5) == "+json")
 end
 
 local function offer_media(offer: string): string
-  if string.find(offer, "/") then return ascii_lower(offer) end
+  if strings.find(offer, "/") then return ascii_lower(offer) end
   local extension = ascii_lower(offer)
-  if string.sub(extension, 1, 1) == "." then extension = string.sub(extension, 2) end
+  if strings.sub(extension, 1, 1) == "." then extension = strings.sub(extension, 2) end
   return MIME_TYPES[extension] or extension
 end
 
@@ -852,17 +852,17 @@ function Context:accepts(offers: {string}): string?
   local best: string? = nil
   local best_q = 0.0
   local best_specificity = -1
-  for item in string.split(accept, ",") do
+  for item in strings.split(accept, ",") do
     local spec = trim_ows(item)
     local quality = 1.0
-    local semicolon? = string.find(spec, ";")
+    local semicolon? = strings.find(spec, ";")
     if semicolon then
-      local params = string.sub(spec, semicolon + 1)
-      spec = trim_ows(string.sub(spec, 1, semicolon - 1))
-      for param in string.split(params, ";") do
+      local params = strings.sub(spec, semicolon + 1)
+      spec = trim_ows(strings.sub(spec, 1, semicolon - 1))
+      for param in strings.split(params, ";") do
         local pair = trim_ows(param)
-        if string.sub(pair, 1, 2) == "q=" then
-          local parsed? = math.tonumber(string.sub(pair, 3))
+        if strings.sub(pair, 1, 2) == "q=" then
+          local parsed? = math.tonumber(strings.sub(pair, 3))
           if parsed ~= nil then quality = parsed as float end
         end
       end
@@ -871,11 +871,11 @@ function Context:accepts(offers: {string}): string?
     if spec ~= "" and quality > 0.0 then
       local specificity = 2
       if spec == "*/*" or spec == "*" then specificity = 0
-      elseif string.sub(spec, -2) == "/*" then specificity = 1 end
+      elseif strings.sub(spec, -2) == "/*" then specificity = 1 end
       for index = 1, #offers do
         local media = offer_media(offers[index])
         local matches = specificity == 0 or media == spec or
-          (specificity == 1 and string.sub(media, 1, #spec - 1) == string.sub(spec, 1, #spec - 1))
+          (specificity == 1 and strings.sub(media, 1, #spec - 1) == strings.sub(spec, 1, #spec - 1))
         if matches and (quality > best_q or
             (quality == best_q and specificity > best_specificity)) then
           best = offers[index]
@@ -893,8 +893,8 @@ end
 function Context:bearer(): string?
   local authorization? = self.meta.headers:get("Authorization")
   if authorization == nil or #authorization < 7 then return nil end
-  if ascii_lower(string.sub(authorization, 1, 7)) ~= "bearer " then return nil end
-  local token = trim_ows(string.sub(authorization, 8))
+  if ascii_lower(strings.sub(authorization, 1, 7)) ~= "bearer " then return nil end
+  local token = trim_ows(strings.sub(authorization, 8))
   if token == "" then return nil end
   return token
 end
@@ -1003,7 +1003,7 @@ function Context:body(): string
   local cached? = self.body_cache
   if cached ~= nil then return cached end
   if self.upgrade_offer then return "" end
-  local out = string.writer()
+  local out = strings.writer()
   for chunk in self:read_body_chunk do out:write(chunk) end
   local result = out:drain()
   self.body_cache = result
@@ -1103,7 +1103,7 @@ function Context:vary(field: string, ...: string): Context
   local fields: {string} = {field, ...}
   local existing = self.response_headers:get("Vary") or ""
   local present: {string: boolean} = {}
-  for item in string.split(existing, ",") do
+  for item in strings.split(existing, ",") do
     local name = ascii_lower(trim_ows(item))
     if name ~= "" then present[name] = true end
   end
@@ -1144,13 +1144,13 @@ function Context:attachment(filename: string?): Context
   end
   local base = filename
   for index = #filename, 1, -1 do
-    local byte = string.byte(filename, index)
+    local byte = strings.byte(filename, index)
     if byte == 47 or byte == 92 then
-      base = string.sub(filename, index + 1)
+      base = strings.sub(filename, index + 1)
       break
     end
   end
-  local escaped = string.gsub(base, "[\"\\\\]", function (piece: string): string
+  local escaped = strings.gsub(base, "[\"\\\\]", function (piece: string): string
     return "\\" .. piece
   end, nil)
   self.response_headers:set("Content-Disposition", "attachment; filename=\"" .. escaped .. "\"")
@@ -1539,7 +1539,7 @@ local function Context:run_complete_hooks()
     catch
       if error is async.CancellationReason then raise end
       log.emit(self.core.logger, "error", "on_complete_failed",
-        {["error"] = string.tostring(error)})
+        {["error"] = strings.tostring(error)})
     end
   end
 end
@@ -1616,7 +1616,7 @@ local function Core:run_live(ctx: Context)
       ["reason"] = "unhandled_exception",
       ["method"] = ctx.meta.method,
       ["path"] = ctx.meta.path,
-      ["error"] = string.tostring(failure),
+      ["error"] = strings.tostring(failure),
       ["worker_id"] = self.worker_id,
     })
     return

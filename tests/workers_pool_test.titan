@@ -7,7 +7,7 @@ local http = import "http"
 local math = import "math"
 local net = import "net"
 local os = import "os"
-local string = import "string"
+local strings = import "string"
 local thread = import "thread"
 local timer = import "timer"
 local log = import "mk.log"
@@ -44,7 +44,7 @@ local function fetch_once(host: string, port: integer, target: string): string
   local connection = net.connect(host, port)
   defer connection:close()
   connection:write("GET " .. target .. " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
-  local out = string.writer()
+  local out = strings.writer()
   do
     for chunk in connection:read do out:write(chunk) end
   catch
@@ -53,9 +53,9 @@ local function fetch_once(host: string, port: integer, target: string): string
 end
 
 local function body_of(response_text: string): string
-  local split? = string.find(response_text, "\r\n\r\n")
+  local split? = strings.find(response_text, "\r\n\r\n")
   if split == nil then return "" end
-  return string.sub(response_text, split + 4)
+  return strings.sub(response_text, split + 4)
 end
 
 local function spawn_fetch(host: string, port: integer, target: string): async.Task<|string, value|>
@@ -182,7 +182,7 @@ function test_worker_logs_are_forwarded(_: test.Context)
   logger:close()
   local found = false
   for index = 1, #lines do
-    if string.find(lines[index], "\"event\":\"worker_event\"") then found = true end
+    if strings.find(lines[index], "\"event\":\"worker_event\"") then found = true end
   end
   test.assert(found, "the worker log line reached the parent logger")
 end
@@ -192,10 +192,10 @@ local function read_owner(connection: net.Connection): (integer, string)
   local head? = connection:read_until("\r\n\r\n", true)
   if head == nil then raise "connection closed before a response" end
   local owner = ""
-  for line in string.split(head, "\r\n") do
-    if string.sub(string.lower(line), 1, 8) == "x-owner:" then owner = string.sub(line, 10) end
+  for line in strings.split(head, "\r\n") do
+    if strings.sub(strings.lower(line), 1, 8) == "x-owner:" then owner = strings.sub(line, 10) end
   end
-  return math.tointeger(string.sub(head, 10, 12)) or 0, owner
+  return math.tointeger(strings.sub(head, 10, 12)) or 0, owner
 end
 
 function test_sustained_keep_alive_returns(_: test.Context)
@@ -335,7 +335,7 @@ local function start_serving(app: mk.App): (integer, async.Task<|string, value|>
         return ""
       catch
         if error is async.CancellationReason then raise end
-        return string.tostring(error)
+        return strings.tostring(error)
       end)
     end
     port = port + 1
@@ -348,7 +348,7 @@ function test_pool_worker_exit_fails_the_app(_: test.Context)
   local post_failure = "none"
   local app = mk.App(mk.Config { workers = mk.WorkerMode.pool(mk.PoolOptions { size = 2 }) })
   app:hooks():on_post_shutdown(function (failure: async.Error?)
-    if failure ~= nil then post_failure = string.tostring(failure.error) end
+    if failure ~= nil then post_failure = strings.tostring(failure.error) end
   end)
   app:get("/block", function (ctx: mk.Context)
     gate_rx:receive()
@@ -411,8 +411,8 @@ function test_app_test_rejects_worker_routes(_: test.Context)
     app:test(mk.TestRequest("GET", "/pooled"))
   catch
     rejected = true
-    test.assert(string.find(string.tostring(error), "App:listen_test") ~= nil,
-      "the error points to App:listen_test: " .. string.tostring(error))
+    test.assert(strings.find(strings.tostring(error), "App:listen_test") ~= nil,
+      "the error points to App:listen_test: " .. strings.tostring(error))
   end
   test.assert(rejected, "pool routes must not run on the calling state")
 end
@@ -446,8 +446,8 @@ function test_start_fails_when_pool_init_fails(_: test.Context)
       app:listen_test()
     catch
       raised = true
-      test.assert(string.find(string.tostring(error), "init exploded") ~= nil,
-        "start reports the worker failure: " .. string.tostring(error))
+      test.assert(strings.find(strings.tostring(error), "init exploded") ~= nil,
+        "start reports the worker failure: " .. strings.tostring(error))
     end
   end)
   test.assert(raised, "start must fail when a pool worker cannot initialize")

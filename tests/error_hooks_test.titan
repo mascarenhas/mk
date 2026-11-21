@@ -4,7 +4,7 @@ local test = import "test"
 local async = import "async"
 local http = import "http"
 local net = import "net"
-local string = import "string"
+local strings = import "string"
 local timer = import "timer"
 local log = import "mk.log"
 local mk = import "mk"
@@ -41,13 +41,13 @@ local function raw(server: mk.TestServer, request_text: string): string
   local connection = net.connect(server.host, server.port)
   defer connection:close()
   connection:write(request_text)
-  local out = string.writer()
+  local out = strings.writer()
   for chunk in connection:read do out:write(chunk) end
   return out:drain()
 end
 
 local function joined(items: {string}): string
-  local out = string.writer()
+  local out = strings.writer()
   for index = 1, #items do
     if index > 1 then out:write(",") end
     out:write(items[index])
@@ -61,7 +61,7 @@ local function bool_text(flag: boolean): string
 end
 
 local function contains(subject: string, needle: string): boolean
-  return string.find(subject, needle) ~= nil
+  return strings.find(subject, needle) ~= nil
 end
 
 function test_http_error_defaults(context: test.Context)
@@ -174,7 +174,7 @@ function test_commit_and_complete_observers(context: test.Context)
       get(app, "/stream")
     catch
       raised = true
-      test.assert(error == "mk: connection aborted", "in-memory abort surfaced: " .. string.tostring(error))
+      test.assert(error == "mk: connection aborted", "in-memory abort surfaced: " .. strings.tostring(error))
     end
     test.assert(raised, "a committed stream must be aborted, not re-rendered")
     test.assert(events[#events] == "complete1:200:500:true:true", "abort observed: " .. joined(events))
@@ -206,22 +206,22 @@ function test_live_bodyless_framing(context: test.Context)
   context:run("head", function (_: test.Context)
     local text = fetch("HEAD", "200")
     test.assert(contains(text, "Content-Length: 18\r\n"), "HEAD keeps Content-Length")
-    test.assert(string.sub(text, -4) == "\r\n\r\n", "HEAD sends no body bytes")
+    test.assert(strings.sub(text, -4) == "\r\n\r\n", "HEAD sends no body bytes")
   end)
   context:run("status_204", function (_: test.Context)
     local text = fetch("GET", "204")
-    test.assert(string.sub(text, 1, 12) == "HTTP/1.1 204", "204 status line")
+    test.assert(strings.sub(text, 1, 12) == "HTTP/1.1 204", "204 status line")
     test.assert(not contains(text, "Content-Length") and not contains(text, "Transfer-Encoding"),
       "204 has no framing headers")
-    test.assert(string.sub(text, -4) == "\r\n\r\n", "204 has no body")
+    test.assert(strings.sub(text, -4) == "\r\n\r\n", "204 has no body")
   end)
   context:run("status_205", function (_: test.Context)
     local text = fetch("GET", "205")
-    test.assert(contains(text, "Content-Length: 0\r\n") and string.sub(text, -4) == "\r\n\r\n", "205 framing")
+    test.assert(contains(text, "Content-Length: 0\r\n") and strings.sub(text, -4) == "\r\n\r\n", "205 framing")
   end)
   context:run("status_304", function (_: test.Context)
     local text = fetch("GET", "304")
-    test.assert(not contains(text, "Content-Length") and string.sub(text, -4) == "\r\n\r\n", "304 framing")
+    test.assert(not contains(text, "Content-Length") and strings.sub(text, -4) == "\r\n\r\n", "304 framing")
   end)
 end
 
@@ -236,16 +236,16 @@ function test_live_body_limits(context: test.Context)
     within(3000, "413 response", function ()
       -- The declared body is never sent; any drain attempt would block.
       local text = raw(server, "POST /read HTTP/1.1\r\nHost: t\r\nContent-Length: 100000000\r\n\r\npartial")
-      test.assert(string.sub(text, 1, 12) == "HTTP/1.1 413", "413 status: " .. string.sub(text, 1, 40))
+      test.assert(strings.sub(text, 1, 12) == "HTTP/1.1 413", "413 status: " .. strings.sub(text, 1, 40))
       test.assert(contains(text, "Connection: close"), "413 announces close")
     end)
   end)
   context:run("streamed_oversize_413", function (_: test.Context)
     within(3000, "chunked 413", function ()
-      local chunk = string.rep("x", 600)
+      local chunk = strings.rep("x", 600)
       local body = "258\r\n" .. chunk .. "\r\n258\r\n" .. chunk .. "\r\n0\r\n\r\n"
       local text = raw(server, "POST /read HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" .. body)
-      test.assert(string.sub(text, 1, 12) == "HTTP/1.1 413", "streamed 413")
+      test.assert(strings.sub(text, 1, 12) == "HTTP/1.1 413", "streamed 413")
     end)
   end)
   context:run("unread_small_body_is_drained_for_keep_alive", function (_: test.Context)
@@ -258,7 +258,7 @@ function test_live_body_limits(context: test.Context)
   context:run("unread_oversized_body_aborts_after_response", function (_: test.Context)
     within(3000, "oversized unread body", function ()
       local text = raw(server, "POST /ignore HTTP/1.1\r\nHost: t\r\nContent-Length: 5000000\r\n\r\nabc")
-      test.assert(string.sub(text, 1, 12) == "HTTP/1.1 200" and contains(text, "ignored"),
+      test.assert(strings.sub(text, 1, 12) == "HTTP/1.1 200" and contains(text, "ignored"),
         "response delivered before the transport closes")
     end)
   end)

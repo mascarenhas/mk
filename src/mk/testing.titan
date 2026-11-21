@@ -49,7 +49,7 @@ end
 function TestServer:request(method: string, target: string, options: http.RequestOptions?): TestResponse
   local response = self.client:request(method, self.base_url .. target, options)
   defer response:close()
-  local body = string.writer()
+  local body = strings.writer()
   for chunk in response:read do body:write(chunk) end
   return TestResponse(response.status, response.headers, body:drain())
 end
@@ -137,7 +137,7 @@ function App:test(req: TestRequest, config: TestConfig?): TestResponse
       "pool and session worker routes need App:listen_test"
   end
   local ctx = Context.create(core, meta, raw_path, target_error, chain_id, head_fallback)
-  local capture = TestCapture(200, http.headers(nil), string.writer(), false, false)
+  local capture = TestCapture(200, http.headers(nil), strings.writer(), false, false)
   ctx.capture = capture
   ctx.test_body = body
   ctx.terminal_error = terminal
@@ -189,7 +189,7 @@ end
 function App:listen_test(host: string?, listen_config: ListenConfig?): TestServer
   local bind_host = host or "127.0.0.1"
   local url_host = bind_host
-  if string.find(bind_host, ":") then url_host = "[" .. bind_host .. "]" end
+  if strings.find(bind_host, ":") then url_host = "[" .. bind_host .. "]" end
   local scheme = "http"
   if listen_config ~= nil and listen_config.cert_file ~= nil then scheme = "https" end
   local base = 49152 + (os.pid() % 200) * 64

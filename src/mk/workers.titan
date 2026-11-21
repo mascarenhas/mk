@@ -594,7 +594,7 @@ local function WorkerState:close_down()
     catch
       if not (error is async.CancellationReason) then
         log.emit(self.core.logger, "error", "worker_cleanup_failed",
-          {["worker_id"] = self.boot.worker_id, ["error"] = string.tostring(error)})
+          {["worker_id"] = self.boot.worker_id, ["error"] = strings.tostring(error)})
       end
     end
   end

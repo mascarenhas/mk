@@ -240,8 +240,8 @@ local function App:pattern_options(prefix: boolean): router.PatternOptions
 end
 
 local function upper_method(method: string): string
-  local upper = string.gsub(method, "[a-z]", function (letter: string): string
-    return string.char(string.byte(letter, 1) - 32)
+  local upper = strings.gsub(method, "[a-z]", function (letter: string): string
+    return strings.char(strings.byte(letter, 1) - 32)
   end, nil)
   return upper
 end
@@ -452,9 +452,9 @@ end
 -- Literal byte prefix of a route pattern, up to its first dynamic token.
 local function literal_prefix(pattern: string): string
   for index = 1, #pattern do
-    local byte = string.byte(pattern, index)
+    local byte = strings.byte(pattern, index)
     if byte == 58 or byte == 42 or byte == 43 or byte == 92 then
-      return string.sub(pattern, 1, index - 1)
+      return strings.sub(pattern, 1, index - 1)
     end
   end
   return pattern
@@ -468,8 +468,8 @@ local function App:prefix_overlaps(middleware: string, route_pattern: string): b
     left = ascii_lower(left)
     right = ascii_lower(right)
   end
-  if string.sub(right, 1, #left) == left then return true end
-  return string.sub(left, 1, #right) == right
+  if strings.sub(right, 1, #left) == left then return true end
+  return strings.sub(left, 1, #right) == right
 end
 
 -- Middleware reachable from dispatcher `dispatcher`: every middleware for the
@@ -569,7 +569,7 @@ local function App:monitor_slot(slot: WorkerSlot)
   case status
   when failed(failure) then
     failed = true
-    slot.failure = string.tostring(failure.error)
+    slot.failure = strings.tostring(failure.error)
     log.emit(self.core.logger, "error", "worker_failed", {
       ["worker_id"] = slot.id, ["error"] = slot.failure, ["traceback"] = failure.traceback,
     })
@@ -585,7 +585,7 @@ local function App:monitor_slot(slot: WorkerSlot)
       catch
         if error is async.CancellationReason then raise end
         log.emit(self.core.logger, "error", "session_on_exit_failed", {
-          ["worker_id"] = slot.id, ["error"] = string.tostring(error),
+          ["worker_id"] = slot.id, ["error"] = strings.tostring(error),
         })
       end
     end
@@ -598,7 +598,7 @@ local function App:monitor_slot(slot: WorkerSlot)
   if slot.dispatcher.kind == DISPATCH_POOL and not self.closing then
     local reason = "exited"
     case status
-    when failed(failure) then reason = "failed: " .. string.tostring(failure.error)
+    when failed(failure) then reason = "failed: " .. strings.tostring(failure.error)
     when cancelled() then reason = "was cancelled"
     else
     end
@@ -843,24 +843,24 @@ end
 local function parse_listen_address(addr: string): (string, integer)
   local host = ""
   local port_text = ""
-  if string.sub(addr, 1, 1) == "[" then
-    local close? = string.find(addr, "]")
-    if close == nil or string.sub(addr, close + 1, close + 1) ~= ":" then
+  if strings.sub(addr, 1, 1) == "[" then
+    local close? = strings.find(addr, "]")
+    if close == nil or strings.sub(addr, close + 1, close + 1) ~= ":" then
       raise "mk: invalid listen address " .. addr
     end
-    host = string.sub(addr, 2, close - 1)
-    port_text = string.sub(addr, close + 2)
+    host = strings.sub(addr, 2, close - 1)
+    port_text = strings.sub(addr, close + 2)
   else
     local colon = 0
     for index = #addr, 1, -1 do
-      if string.byte(addr, index) == 58 then
+      if strings.byte(addr, index) == 58 then
         colon = index
         break
       end
     end
     if colon == 0 then raise "mk: listen address must be host:port" end
-    host = string.sub(addr, 1, colon - 1)
-    port_text = string.sub(addr, colon + 1)
+    host = strings.sub(addr, 1, colon - 1)
+    port_text = strings.sub(addr, colon + 1)
   end
   if host == "" then host = "0.0.0.0" end
   local port? = math.tointeger(port_text)

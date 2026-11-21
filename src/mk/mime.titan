@@ -21,15 +21,15 @@ local const MIME_TYPES: {string: string} = {
 }
 
 local function ascii_lower(text: string): string
-  local lowered = string.gsub(text, "[A-Z]", function (letter: string): string
-    return string.char(string.byte(letter, 1) + 32)
+  local lowered = strings.gsub(text, "[A-Z]", function (letter: string): string
+    return strings.char(strings.byte(letter, 1) + 32)
   end, nil)
   return lowered
 end
 
 -- Text-like media types receive a default UTF-8 charset parameter.
 local function text_like(media: string): boolean
-  return string.sub(media, 1, 5) == "text/" or media == "application/json" or
+  return strings.sub(media, 1, 5) == "text/" or media == "application/json" or
     media == "application/javascript" or media == "application/xml" or
     media == "image/svg+xml" or media == "application/yaml"
 end
@@ -38,12 +38,12 @@ end
 -- or a bare extension. Unknown extensions map to application/octet-stream.
 local function content_type_for(extension_or_mime: string, charset: string?): string
   local media = extension_or_mime
-  if not string.find(media, "/") then
+  if not strings.find(media, "/") then
     local extension = ascii_lower(media)
-    if string.sub(extension, 1, 1) == "." then extension = string.sub(extension, 2) end
+    if strings.sub(extension, 1, 1) == "." then extension = strings.sub(extension, 2) end
     media = MIME_TYPES[extension] or "application/octet-stream"
   end
-  if string.find(media, ";") then return media end
+  if strings.find(media, ";") then return media end
   if charset then return media .. "; charset=" .. charset end
   if text_like(media) then return media .. "; charset=utf-8" end
   return media
@@ -53,9 +53,9 @@ end
 local function path_extension(file_path: string): string
   local found = ""
   for index = #file_path, 1, -1 do
-    local byte = string.byte(file_path, index)
+    local byte = strings.byte(file_path, index)
     if byte == 46 then
-      found = string.sub(file_path, index + 1)
+      found = strings.sub(file_path, index + 1)
       break
     end
     if byte == 47 or byte == 92 then break end

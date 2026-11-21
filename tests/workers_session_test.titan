@@ -5,7 +5,7 @@ local test = import "test"
 local async = import "async"
 local iteration = import "iteration"
 local net = import "net"
-local string = import "string"
+local strings = import "string"
 local thread = import "thread"
 local timer = import "timer"
 local websocket = import "websocket"
@@ -37,7 +37,7 @@ local function fetch_once(host: string, port: integer, target: string): string
   local connection = net.connect(host, port)
   defer connection:close()
   connection:write("GET " .. target .. " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
-  local out = string.writer()
+  local out = strings.writer()
   do
     for chunk in connection:read do out:write(chunk) end
   catch
@@ -46,21 +46,21 @@ local function fetch_once(host: string, port: integer, target: string): string
 end
 
 local function status_of(text: string): string
-  return string.sub(text, 10, 12)
+  return strings.sub(text, 10, 12)
 end
 
 local function body_of(text: string): string
-  local split? = string.find(text, "\r\n\r\n")
+  local split? = strings.find(text, "\r\n\r\n")
   if split == nil then return "" end
-  return string.sub(text, split + 4)
+  return strings.sub(text, split + 4)
 end
 
 local function header_of(text: string, name: string): string?
-  local lowered = string.lower(name) .. ": "
-  for line in string.split(text, "\r\n") do
+  local lowered = strings.lower(name) .. ": "
+  for line in strings.split(text, "\r\n") do
     if line == "" then break end
-    if string.sub(string.lower(line), 1, #lowered) == lowered then
-      return string.sub(line, #lowered + 1)
+    if strings.sub(strings.lower(line), 1, #lowered) == lowered then
+      return strings.sub(line, #lowered + 1)
     end
   end
   return nil
@@ -107,7 +107,7 @@ function test_session_affinity_and_fallback(context: test.Context)
       local b1 = body_of(fetch_once(server.host, server.port, "/s?sid=b"))
       local a2 = body_of(fetch_once(server.host, server.port, "/s?sid=a"))
       test.assert(a1 == a2 and a1 ~= b1, "affinity: " .. a1 .. " " .. b1 .. " " .. a2)
-      test.assert(string.sub(a1, -2) == ":a" and string.sub(b1, -2) == ":b", "session ids visible")
+      test.assert(strings.sub(a1, -2) == ":a" and strings.sub(b1, -2) == ":b", "session ids visible")
       local info = sessions:session_worker("a") as mk.WorkerInfo
       test.assert(a1 == info.id .. ":a" and info.alive, "session_worker reports the live worker")
       test.assert(app:session_worker("b") ~= nil, "App:session_worker searches session dispatchers")
@@ -187,7 +187,7 @@ function test_retire_worker_is_causal_and_reports_exit(_: test.Context)
   within(5000, "retirement", function ()
     local first = body_of(fetch_once(server.host, server.port, "/who?sid=r"))
     local retired = body_of(fetch_once(server.host, server.port, "/retire?sid=r"))
-    local first_id = string.sub(first, 1, (string.find(first, ":") or 1) - 1)
+    local first_id = strings.sub(first, 1, (strings.find(first, ":") or 1) - 1)
     test.assert(retired == "retired " .. first_id, "retire ran on the session worker")
     test.assert(app:session_worker("r") == nil, "the session is detached before the response")
     local next_one = body_of(fetch_once(server.host, server.port, "/who?sid=r"))
