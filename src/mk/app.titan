@@ -1,0 +1,1200 @@
+-- App, Config, ListenConfig: registration, dispatch freeze, direct parent
+-- dispatch, parent-side worker supervision, and lifecycle.
+
+--- Application configuration; every field is optional.
+record Config
+  const app_name: string?
+  const server_header: string?
+  const case_sensitive: boolean?
+  const strict_routing: boolean?
+  const unescape_path: boolean?
+  const auto_head: boolean?
+  const body_limit: integer?
+  const header_limit: integer?
+  const idle_timeout_ms: integer?
+  const shutdown_timeout_ms: integer?
+  const json_max_depth: integer?
+  const trust_forwarded_headers: boolean?
+  const error_handler: ErrorHandler?
+  const logger: log.Logger?
+  const workers: WorkerMode?
+end
+
+--- Listener options for `App:start` / `App:listen`.
+record ListenConfig
+  const backlog: integer?
+  const reuse_port: boolean?
+  const cert_file: string?
+  const key_file: string?
+end
+
+local const DISPATCH_PARENT = 1
+local const DISPATCH_POOL = 2
+local const DISPATCH_SESSION = 3
+
+-- Parent-side supervision state of one pool or session worker thread.
+local record WorkerSlot
+  id: integer
+  dispatcher: Dispatcher
+  session_id: string?
+  pipe: ExchangePipe
+  worker: thread.Thread<|nil|>?
+  monitor: async.Task<|nil, value|>?
+  alive: boolean
+  retiring: boolean
+  ready: boolean
+  delivered: boolean
+  in_flight_sends: integer
+  drained: Signal
+  pool_index: integer
+  failure: string?
+end
+
+-- One execution owner: the parent state, a worker pool, or a session family.
+local record Dispatcher
+  id: integer
+  kind: integer
+  mode: WorkerMode
+  pool_size: integer
+  queue_capacity: integer
+  on_start: WorkerInit?
+  session: SessionOptions?
+  slots: {WorkerSlot}
+  next_index: integer
+  sessions: {string: WorkerSlot}
+  specs: {EntrySpec}?
+end
+
+local function Dispatcher:pool_infos(): const {WorkerInfo}
+  local result: {WorkerInfo} = {}
+  if self.kind == DISPATCH_POOL then
+    for index = 1, #self.slots do
+      local slot = self.slots[index]
+      result[index] = WorkerInfo(slot.id, nil, slot.alive)
+    end
+  end
+  return result as const {WorkerInfo}
+end
+
+local function Dispatcher:session_info(session_id: string): WorkerInfo?
+  local slot? = self.sessions[session_id]
+  if slot == nil then return nil end
+  return WorkerInfo(slot.id, session_id, slot.alive)
+end
+
+local function Dispatcher:session_ids(): const {string}
+  local result: {string} = {}
+  for session_id, _ in iteration.pairs(self.sessions) do result[#result + 1] = session_id end
+  return result as const {string}
+end
+
+local function Dispatcher:session_count(): integer
+  local count = 0
+  for _, _ in iteration.pairs(self.sessions) do count = count + 1 end
+  return count
+end
+
+--- The application: routing table, configuration, hooks, and lifecycle.
+record App
+  local config_value: Config
+  local core: Core
+  local hooks_value: Hooks
+  local header_limit: integer
+  local shutdown_timeout_ms: integer
+  local frozen: boolean
+  local dispatchers: {Dispatcher}
+  local root_dispatcher: Dispatcher
+  local server: http.Server?
+  local listen_host: string
+  local listen_port: integer
+  local closing: boolean
+  local retirement: async.Task<|nil, value|>?
+  local retirement_view: async.Task<|value, value|>?
+  local active_parent: {async.Task<|value, value|>: Context}
+  local parent_changed: Signal
+  local adopted: {ActiveExchange: boolean}
+  local hook_tasks: {async.Task<|value, value|>: integer}
+  local return_pipe: ExchangePipe?
+  local return_task: async.Task<|nil, value|>?
+  local retire_tx: thread.Sender<|RetireNotice|>?
+  local retire_task: async.Task<|nil, value|>?
+  local log_tx: thread.Sender<|string|>?
+  local log_task: async.Task<|nil, value|>?
+  local next_worker_id: integer
+  local slots: {integer: WorkerSlot}
+  local workers_changed: Signal
+  local first_failure: async.Error?
+end
+
+local function positive_or(supplied: integer?, fallback: integer, subject: string): integer
+  local result = supplied or fallback
+  if result < 1 then raise "mk: " .. subject .. " must be positive" end
+  return result
+end
+
+local function non_negative_or(supplied: integer?, fallback: integer, subject: string): integer
+  local result = supplied or fallback
+  if result < 0 then raise "mk: " .. subject .. " must be non-negative" end
+  return result
+end
+
+--- Create an application; `config` defaults every field.
+function App.new(config: Config?): App
+  local cfg = config or Config {}
+  local core = Core {
+    app_name = cfg.app_name or "", server_header = cfg.server_header,
+    case_sensitive = cfg.case_sensitive or false,
+    strict_routing = cfg.strict_routing or false,
+    unescape_path = cfg.unescape_path ~= false,
+    auto_head = cfg.auto_head ~= false,
+    trust_forwarded = cfg.trust_forwarded_headers or false,
+    body_limit = positive_or(cfg.body_limit, 4 * 1024 * 1024, "body_limit"),
+    json_max_depth = positive_or(cfg.json_max_depth, 64, "json_max_depth"),
+    idle_timeout_ms = non_negative_or(cfg.idle_timeout_ms, 10000, "idle_timeout_ms"),
+    error_handler = cfg.error_handler or default_error_handler,
+    logger = cfg.logger, entries = {}, routes = {}, closing = false,
+    worker_id = 0, session_id = nil, worker = nil, root_dispatcher_id = 1,
+  }
+  local parent = Dispatcher {
+    id = 1, kind = DISPATCH_PARENT, mode = WorkerMode.parent(), pool_size = 0,
+    queue_capacity = 0, on_start = nil, session = nil, slots = {}, next_index = 1,
+    sessions = {}, specs = nil,
+  }
+  local app: App = {
+    config_value = cfg, core = core, hooks_value = Hooks.new(),
+    header_limit = positive_or(cfg.header_limit, 65536, "header_limit"),
+    shutdown_timeout_ms = non_negative_or(cfg.shutdown_timeout_ms, 10000, "shutdown_timeout_ms"),
+    frozen = false, dispatchers = {parent}, root_dispatcher = parent,
+    server = nil, listen_host = "", listen_port = 0, closing = false,
+    retirement = nil, retirement_view = nil, active_parent = {},
+    parent_changed = Signal.create("mk.parent"), adopted = {}, hook_tasks = {},
+    return_pipe = nil, return_task = nil, retire_tx = nil, retire_task = nil,
+    log_tx = nil, log_task = nil, next_worker_id = 1, slots = {},
+    workers_changed = Signal.create("mk.workers"), first_failure = nil,
+  }
+  local workers? = cfg.workers
+  if workers ~= nil then
+    app.root_dispatcher = app:find_or_create(workers)
+    core.root_dispatcher_id = app.root_dispatcher.id
+  end
+  return app
+end
+
+local function App:find_or_create(mode: WorkerMode): Dispatcher
+  local kind = DISPATCH_PARENT
+  local pool_options: PoolOptions? = nil
+  local session_options: SessionOptions? = nil
+  case mode
+  when parent() then return self.dispatchers[1] as Dispatcher
+  when pool(options) then
+    kind = DISPATCH_POOL
+    pool_options = options
+  when session(options) then
+    kind = DISPATCH_SESSION
+    session_options = options
+  end
+  for index = 1, #self.dispatchers do
+    local candidate = self.dispatchers[index]
+    if candidate.mode == mode then return candidate end
+  end
+  local dispatcher = Dispatcher {
+    id = #self.dispatchers + 1, kind = kind, mode = mode, pool_size = 0,
+    queue_capacity = 0, on_start = nil, session = session_options, slots = {},
+    next_index = 1, sessions = {}, specs = nil,
+  }
+  if kind == DISPATCH_POOL then
+    local options = pool_options or PoolOptions {}
+    dispatcher.pool_size = positive_or(options.size, 1, "PoolOptions.size")
+    dispatcher.queue_capacity = positive_or(options.queue_capacity, 128, "PoolOptions.queue_capacity")
+    dispatcher.on_start = options.on_start
+  else
+    local options = session_options as SessionOptions
+    dispatcher.queue_capacity = positive_or(options.queue_capacity, 64, "SessionOptions.queue_capacity")
+    dispatcher.on_start = options.on_start
+    local cap? = options.max_sessions
+    if cap ~= nil and cap < 1 then raise "mk: SessionOptions.max_sessions must be positive" end
+  end
+  self.dispatchers[dispatcher.id] = dispatcher
+  return dispatcher
+end
+
+local function App:dispatcher_for(mode: WorkerMode?): Dispatcher
+  if mode == nil then return self.root_dispatcher end
+  return self:find_or_create(mode)
+end
+
+------------------------------------------------------------------------------
+-- Registration
+
+local function App:check_open()
+  if self.frozen then
+    raise "mk: routes cannot be registered after App:start or App:test"
+  end
+end
+
+local function App:pattern_options(prefix: boolean): router.PatternOptions
+  return router.PatternOptions(self.core.case_sensitive, self.core.strict_routing,
+                               self.core.unescape_path, prefix)
+end
+
+local function upper_method(method: string): string
+  local upper = string.gsub(method, "[a-z]", function (letter: string): string
+    return string.char(string.byte(letter, 1) - 32)
+  end, nil)
+  return upper
+end
+
+local function App:add_entry(entry: Entry)
+  self.core.entries[#self.core.entries + 1] = entry
+  if entry.is_route then
+    self.core.routes[entry.route_id] = entry
+    local info = entry:info()
+    local hooks = self.hooks_value.route_hooks
+    for index = 1, #hooks do
+      local hook = hooks[index]
+      hook(info)
+    end
+  end
+end
+
+local function App:register(methods: {string}, path: string, group: Group?,
+                            handler: Handler, ...: Handler): RouteHandle
+  self:check_open()
+  local handlers: {Handler} = {handler, ...}
+  local normalized: {string} = {}
+  for index = 1, #methods do normalized[index] = upper_method(methods[index]) end
+  local name_prefix = ""
+  local group_prefix = ""
+  local mode: WorkerMode? = nil
+  if group ~= nil then
+    name_prefix = group.name_prefix
+    group_prefix = group.prefix
+    mode = group.mode
+  end
+  local entry = Entry {
+    is_route = true, methods = normalized, pattern = path,
+    matcher = router.compile_pattern(path, self:pattern_options(false)),
+    handlers = handlers, name = "", group_prefix = group_prefix, mount_path = "",
+    mode = mode, dispatcher_id = 0, route_id = #self.core.routes + 1,
+  }
+  self:add_entry(entry)
+  return RouteHandle(self, entry, name_prefix)
+end
+
+local function App:add_middleware(prefix: string, handlers: {Handler})
+  self:check_open()
+  local pattern = router.join_paths("/", prefix)
+  self:add_entry(Entry {
+    is_route = false, methods = {}, pattern = pattern,
+    matcher = router.compile_pattern(pattern, self:pattern_options(true)),
+    handlers = handlers, name = "", group_prefix = "", mount_path = "",
+    mode = nil, dispatcher_id = 0, route_id = 0,
+  })
+end
+
+local function App:register_middleware(prefix: string, handler: Handler, ...: Handler)
+  self:add_middleware(prefix, {handler, ...})
+end
+
+local function App:make_group(prefix: string, options: GroupOptions?, parent: Group?,
+                              ...: Handler): Group
+  self:check_open()
+  local base = "/"
+  local name_prefix = ""
+  local mode: WorkerMode? = nil
+  if parent ~= nil then
+    base = parent.prefix
+    name_prefix = parent.name_prefix
+    mode = parent.mode
+  end
+  if options ~= nil then
+    name_prefix = name_prefix .. (options.name or "")
+    local workers? = options.workers
+    if workers ~= nil then mode = workers end
+  end
+  local full = router.join_paths(base, prefix)
+  local group = Group(self, full, name_prefix, mode)
+  local handlers: {Handler} = {...}
+  if #handlers > 0 then self:add_middleware(full, handlers) end
+  local info = GroupInfo(full, name_prefix)
+  local hooks = self.hooks_value.group_hooks
+  for index = 1, #hooks do
+    local hook = hooks[index]
+    hook(info)
+  end
+  return group
+end
+
+function App:config(): Config return self.config_value end
+function App:hooks(): Hooks return self.hooks_value end
+function App:logger(): log.Logger? return self.core.logger end
+
+--- Info for every endpoint route in registration order.
+function App:routes(): const {RouteInfo}
+  local result: {RouteInfo} = {}
+  local routes = self.core.routes
+  for index = 1, #routes do result[index] = routes[index]:info() end
+  return result as const {RouteInfo}
+end
+
+--- Build the URL of the route named `name`.
+function App:route_url(name: string, params: {string: string}?): string
+  local routes = self.core.routes
+  for index = 1, #routes do
+    local route = routes[index]
+    if route.name == name then return route.matcher:build(params) end
+  end
+  raise "mk: no route named " .. name
+end
+
+--- Global middleware for every request.
+function App:use(handler: Handler, ...: Handler): App
+  self:register_middleware("/", handler, ...)
+  return self
+end
+
+--- Middleware for requests below `prefix`.
+function App:use_path(prefix: string, handler: Handler, ...: Handler): App
+  self:register_middleware(prefix, handler, ...)
+  return self
+end
+
+--- Copy `sub_app`'s middleware and routes below `prefix`.
+function App:mount(prefix: string, sub_app: App): App
+  self:check_open()
+  local base = router.join_paths("/", prefix)
+  local entries = sub_app.core.entries
+  for index = 1, #entries do
+    local source = entries[index]
+    local pattern = router.join_paths(base, source.pattern)
+    local route_id = 0
+    if source.is_route then route_id = #self.core.routes + 1 end
+    self:add_entry(Entry {
+      is_route = source.is_route, methods = source.methods, pattern = pattern,
+      matcher = router.compile_pattern(pattern, self:pattern_options(not source.is_route)),
+      handlers = source.handlers, name = source.name,
+      group_prefix = router.join_paths(base, source.group_prefix),
+      mount_path = router.join_paths(base, source.mount_path),
+      mode = source.mode, dispatcher_id = 0, route_id = route_id,
+    })
+  end
+  return self
+end
+
+function App:group(prefix: string, ...: Handler): Group
+  return self:make_group(prefix, nil, nil, ...)
+end
+
+function App:group_with(prefix: string, options: GroupOptions, ...: Handler): Group
+  return self:make_group(prefix, options, nil, ...)
+end
+
+function App:route_chain(path: string): RouteChain
+  return RouteChain(self, router.join_paths("/", path), nil)
+end
+
+function App:get(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self:register({"GET"}, path, nil, handler, ...)
+end
+function App:head(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self:register({"HEAD"}, path, nil, handler, ...)
+end
+function App:post(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self:register({"POST"}, path, nil, handler, ...)
+end
+function App:put(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self:register({"PUT"}, path, nil, handler, ...)
+end
+function App:delete(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self:register({"DELETE"}, path, nil, handler, ...)
+end
+function App:connect(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self:register({"CONNECT"}, path, nil, handler, ...)
+end
+function App:options(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self:register({"OPTIONS"}, path, nil, handler, ...)
+end
+function App:trace(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self:register({"TRACE"}, path, nil, handler, ...)
+end
+function App:patch(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self:register({"PATCH"}, path, nil, handler, ...)
+end
+function App:all(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self:register({"*"}, path, nil, handler, ...)
+end
+
+--- Register `handler` once per method; returns one handle per method.
+function App:add(methods: {string}, path: string, handler: Handler, ...: Handler): {RouteHandle}
+  local handles: {RouteHandle} = {}
+  for index = 1, #methods do
+    handles[index] = self:register({methods[index]}, path, nil, handler, ...)
+  end
+  return handles
+end
+
+-- Registration freezes on first start/test; routes bind to dispatchers.
+local function App:freeze()
+  if self.frozen then return end
+  self.frozen = true
+  local routes = self.core.routes
+  for index = 1, #routes do
+    local route = routes[index]
+    route.dispatcher_id = self:dispatcher_for(route.mode).id
+  end
+end
+
+------------------------------------------------------------------------------
+-- Worker bootstrap scoping
+
+-- Literal byte prefix of a route pattern, up to its first dynamic token.
+local function literal_prefix(pattern: string): string
+  for index = 1, #pattern do
+    local byte = string.byte(pattern, index)
+    if byte == 58 or byte == 42 or byte == 43 or byte == 92 then
+      return string.sub(pattern, 1, index - 1)
+    end
+  end
+  return pattern
+end
+
+local function App:prefix_overlaps(middleware: string, route_pattern: string): boolean
+  local left = middleware
+  if left == "/" then return true end
+  local right = literal_prefix(route_pattern)
+  if not self.core.case_sensitive then
+    left = ascii_lower(left)
+    right = ascii_lower(right)
+  end
+  if string.sub(right, 1, #left) == left then return true end
+  return string.sub(left, 1, #right) == right
+end
+
+-- Middleware reachable from dispatcher `dispatcher`: every middleware for the
+-- root dispatcher (it serves 404/405 for any path), else prefixes that can
+-- overlap one of the dispatcher's own routes.
+local function App:middleware_reaches(entry: Entry, dispatcher: Dispatcher): boolean
+  if dispatcher.id == self.root_dispatcher.id then return true end
+  local routes = self.core.routes
+  for index = 1, #routes do
+    local route = routes[index]
+    if route.dispatcher_id == dispatcher.id and
+        self:prefix_overlaps(entry.pattern, route.pattern) then
+      return true
+    end
+  end
+  return false
+end
+
+local function wrap_handlers(handlers: {Handler}): {TransferableHandler}
+  local result: {TransferableHandler} = {}
+  for index = 1, #handlers do result[index] = TransferableHandler(handlers[index]) end
+  return result
+end
+
+-- Scoped routing table for a dispatcher: reachable middleware, its own
+-- routes (plus every session route on the root, for nil-session fallback)
+-- with handlers; every other route without handlers, for classification.
+local function App:entry_specs(dispatcher: Dispatcher): {EntrySpec}
+  local cached? = dispatcher.specs
+  if cached ~= nil then return cached end
+  local specs: {EntrySpec} = {}
+  local is_root = dispatcher.id == self.root_dispatcher.id
+  local entries = self.core.entries
+  for index = 1, #entries do
+    local entry = entries[index]
+    local handlers: {TransferableHandler} = {}
+    if entry.is_route then
+      local owner = self.dispatchers[entry.dispatcher_id] as Dispatcher
+      if entry.dispatcher_id == dispatcher.id or (is_root and owner.kind == DISPATCH_SESSION) then
+        handlers = wrap_handlers(entry.handlers)
+      end
+      specs[#specs + 1] = EntrySpec(true, entry.methods, entry.pattern, entry.name,
+        entry.group_prefix, entry.mount_path, entry.dispatcher_id, handlers)
+    elseif self:middleware_reaches(entry, dispatcher) then
+      specs[#specs + 1] = EntrySpec(false, entry.methods, entry.pattern, entry.name,
+        entry.group_prefix, entry.mount_path, 0, wrap_handlers(entry.handlers))
+    end
+  end
+  dispatcher.specs = specs
+  return specs
+end
+
+local function App:worker_settings(): WorkerSettings
+  local core = self.core
+  local level = "info"
+  local logger? = core.logger
+  if logger ~= nil then level = logger:level() end
+  return WorkerSettings {
+    app_name = core.app_name, server_header = core.server_header or "",
+    case_sensitive = core.case_sensitive, strict_routing = core.strict_routing,
+    unescape_path = core.unescape_path, auto_head = core.auto_head,
+    trust_forwarded = core.trust_forwarded, body_limit = core.body_limit,
+    json_max_depth = core.json_max_depth, idle_timeout_ms = core.idle_timeout_ms,
+    log_level = level,
+  }
+end
+
+------------------------------------------------------------------------------
+-- Parent-side worker supervision
+
+local function App:run_hook(hook: function (): ())
+  local current = async.running()
+  self.hook_tasks[current] = (self.hook_tasks[current] or 0) + 1
+  defer do
+    local depth = (self.hook_tasks[current] or 1) - 1
+    if depth == 0 then self.hook_tasks[current] = nil else self.hook_tasks[current] = depth end
+  end
+  hook()
+end
+
+-- Close a slot's pipe to new exchanges and detach its session (idempotent).
+local function App:retire_slot(slot: WorkerSlot)
+  if slot.retiring then return end
+  slot.retiring = true
+  local session_id? = slot.session_id
+  if session_id ~= nil and slot.dispatcher.sessions[session_id] == slot then
+    slot.dispatcher.sessions[session_id] = nil
+  end
+  slot.pipe:close_senders()
+end
+
+local function App:monitor_slot(slot: WorkerSlot)
+  local status = (slot.worker as thread.Thread<|nil|>):join()
+  slot.alive = false
+  self:retire_slot(slot)
+  local failed = false
+  case status
+  when failed(failure) then
+    failed = true
+    slot.failure = string.tostring(failure.error)
+    log.emit(self.core.logger, "error", "worker_failed", {
+      ["worker_id"] = slot.id, ["error"] = slot.failure, ["traceback"] = failure.traceback,
+    })
+  else
+  end
+  local session_id? = slot.session_id
+  local options? = slot.dispatcher.session
+  if session_id ~= nil and options ~= nil then
+    local on_exit? = options.on_exit
+    if on_exit ~= nil then
+      do
+        self:run_hook(function () on_exit(session_id, slot.id, failed) end)
+      catch
+        if error is async.CancellationReason then raise end
+        log.emit(self.core.logger, "error", "session_on_exit_failed", {
+          ["worker_id"] = slot.id, ["error"] = string.tostring(error),
+        })
+      end
+    end
+  end
+  while slot.in_flight_sends > 0 do slot.drained:wait() end
+  slot.pipe:discard_queued()
+  do slot.pipe.data_rx:close() catch end
+  local dispatcher = slot.dispatcher
+  if dispatcher.kind == DISPATCH_POOL and slot.ready and not self.closing and
+      dispatcher.slots[slot.pool_index] == slot then
+    do
+      local replacement = self:spawn_worker(dispatcher, nil)
+      replacement.pool_index = slot.pool_index
+      dispatcher.slots[slot.pool_index] = replacement
+    catch
+      log.emit(self.core.logger, "error", "worker_respawn_failed", {
+        ["worker_id"] = slot.id, ["error"] = string.tostring(error),
+      })
+    end
+  end
+  self.workers_changed:notify()
+end
+
+local function App:spawn_worker(dispatcher: Dispatcher, session_id: string?): WorkerSlot
+  local id = self.next_worker_id
+  self.next_worker_id = id + 1
+  local pipe = ExchangePipe.create(dispatcher.queue_capacity)
+  local slot = WorkerSlot {
+    id = id, dispatcher = dispatcher, session_id = session_id, pipe = pipe,
+    worker = nil, monitor = nil, alive = true, retiring = false, ready = false,
+    delivered = false, in_flight_sends = 0, drained = Signal.create("mk.slot"),
+    pool_index = 0, failure = nil,
+  }
+  local init: TransferableWorkerInit? = nil
+  local on_start? = dispatcher.on_start
+  if on_start ~= nil then init = TransferableWorkerInit(on_start) end
+  local ephemeral = false
+  local options? = dispatcher.session
+  if options ~= nil then ephemeral = options.ephemeral or false end
+  local boot = WorkerBootstrap {
+    worker_id = id, dispatcher_id = dispatcher.id,
+    root_dispatcher_id = self.root_dispatcher.id, session_id = session_id or "",
+    ephemeral = ephemeral, settings = self:worker_settings(),
+    entries = self:entry_specs(dispatcher),
+    error_handler = TransferableErrorHandler(self.core.error_handler),
+    on_start = init, pipe = pipe, return_pipe = self.return_pipe as ExchangePipe,
+    retire_tx = self.retire_tx as thread.Sender<|RetireNotice|>, log_tx = self.log_tx,
+  }
+  slot.worker = thread.spawn_one<|WorkerBootstrap, nil|>(worker_entry, boot)
+  self.slots[id] = slot
+  slot.monitor = async.run<|nil, value|>(function (): nil
+    self:monitor_slot(slot)
+    return nil
+  end)
+  return slot
+end
+
+-- Pick (or spawn) the worker for a handoff; raises HttpError(503) when none.
+local function App:select_slot(dispatcher: Dispatcher, session_id: string?): WorkerSlot
+  if dispatcher.kind == DISPATCH_POOL then
+    local count = #dispatcher.slots
+    for _ = 1, count do
+      local index = dispatcher.next_index
+      dispatcher.next_index = index % count + 1
+      local slot? = dispatcher.slots[index]
+      if slot ~= nil and slot.alive and not slot.retiring then return slot end
+    end
+    raise HttpError(503, "Service Unavailable", "no_workers", nil)
+  end
+  local key = session_id as string
+  local existing? = dispatcher.sessions[key]
+  if existing ~= nil and existing.alive and not existing.retiring then return existing end
+  local options = dispatcher.session as SessionOptions
+  local cap? = options.max_sessions
+  if cap ~= nil and dispatcher:session_count() >= cap then
+    raise HttpError(503, "Service Unavailable", "max_sessions", nil)
+  end
+  local slot = self:spawn_worker(dispatcher, key)
+  dispatcher.sessions[key] = slot
+  return slot
+end
+
+-- Deliver a detached exchange, retrying a closed pipe on a fresh worker
+-- while the app is running; otherwise the leftover is disposed exactly once.
+local function App:deliver(dispatcher: Dispatcher, slot: WorkerSlot, env: ExchangeEnvelope)
+  local target = slot
+  local current = env
+  while true do
+    local accepted = false
+    local leftover: string? = nil
+    do
+      target.in_flight_sends = target.in_flight_sends + 1
+      defer do
+        target.in_flight_sends = target.in_flight_sends - 1
+        target.drained:notify()
+        if not accepted and not target.delivered and target.session_id ~= nil then
+          local options? = target.dispatcher.session
+          if options ~= nil and options.ephemeral then self:retire_slot(target) end
+        end
+      end
+      accepted, leftover = target.pipe:send_exchange(current)
+      if accepted then target.delivered = true end
+    end
+    if accepted or leftover == nil then return end
+    local payload = leftover as string
+    local next_slot: WorkerSlot? = nil
+    if not self.closing then
+      do
+        local session_id: string? = nil
+        if current.session_id ~= "" then session_id = current.session_id end
+        next_slot = self:select_slot(dispatcher, session_id)
+      catch
+        if not (error is HttpError) then
+          do http.Exchange.discard_transfer_payload(payload) catch end
+          raise
+        end
+      end
+    end
+    if next_slot == nil then
+      do http.Exchange.discard_transfer_payload(payload) catch end
+      return
+    end
+    target = next_slot
+    current = ExchangeEnvelope(payload, current.method, current.target, current.route_id,
+                               current.session_id, current.reroute_preserving_session)
+  end
+end
+
+------------------------------------------------------------------------------
+-- Request entry on the parent
+
+local function App:run_in_place(meta: RequestMeta, raw_path: string, target_error: string?,
+                                chain_id: integer, head_fallback: boolean,
+                                request: http.Request, response: http.Response,
+                                terminal: HttpError?)
+  local ctx = Context.create(self.core, meta, raw_path, target_error, chain_id, head_fallback)
+  ctx.raw_request = request
+  ctx.raw_response = response
+  ctx.terminal_error = terminal
+  local current = async.running()
+  ctx.owner_task = current
+  self.active_parent[current] = ctx
+  defer do
+    self.active_parent[current] = nil
+    self.parent_changed:notify()
+  end
+  self.core:run_live(ctx)
+end
+
+-- http.Handler body for the listener and for exchanges returned by workers.
+local function App:handle_http(request: http.Request, response: http.Response,
+                               reroute: ExchangeEnvelope?)
+  local core = self.core
+  local meta, raw_path, target_error? = core:meta(request.method, request.target,
+                                                 request.headers, request.url.scheme)
+  local route?, found?, head_fallback = core:classify(request.method, raw_path)
+  if found ~= nil then meta.params_map = found.params end
+  if self.closing then
+    self:run_in_place(meta, raw_path, target_error, -1, head_fallback, request, response,
+      HttpError(503, "Service Unavailable", "shutting_down", nil))
+    return
+  end
+  local chain_id = self.root_dispatcher.id
+  local route_id = 0
+  if route ~= nil then
+    chain_id = route.dispatcher_id
+    route_id = route.route_id
+  end
+  local dispatcher = self.dispatchers[chain_id] as Dispatcher
+  local session_id: string? = nil
+  if dispatcher.kind == DISPATCH_SESSION then
+    if reroute ~= nil and reroute.reroute_preserving_session and reroute.session_id ~= "" then
+      session_id = reroute.session_id
+    else
+      local failure: HttpError? = nil
+      do
+        local options = dispatcher.session as SessionOptions
+        session_id = options.session_id(meta)
+      catch
+        if not (error is HttpError) then raise end
+        failure = error as HttpError
+      end
+      if failure ~= nil then
+        self:run_in_place(meta, raw_path, target_error, -1, head_fallback, request, response, failure)
+        return
+      end
+    end
+    if session_id == nil then
+      if self.root_dispatcher.kind == DISPATCH_SESSION then
+        self:run_in_place(meta, raw_path, target_error, -1, head_fallback, request, response,
+          HttpError(500, "session selector returned no session for the root dispatcher",
+                    "no_session", nil))
+        return
+      end
+      dispatcher = self.root_dispatcher
+    end
+  end
+  if dispatcher.kind == DISPATCH_PARENT then
+    self:run_in_place(meta, raw_path, target_error, chain_id, head_fallback, request, response, nil)
+    return
+  end
+  local slot: WorkerSlot? = nil
+  local failure: HttpError? = nil
+  do
+    slot = self:select_slot(dispatcher, session_id)
+  catch
+    if not (error is HttpError) then raise end
+    failure = error as HttpError
+  end
+  if failure ~= nil then
+    self:run_in_place(meta, raw_path, target_error, -1, head_fallback, request, response, failure)
+    return
+  end
+  -- Let the transport's read callback retire before detaching the exchange.
+  async.yield()
+  local payload = http.Exchange(request, response):to_transfer_payload()
+  self:deliver(dispatcher, slot as WorkerSlot, ExchangeEnvelope(payload, request.method,
+    request.target, route_id, session_id or "", false))
+end
+
+-- Serve an exchange returned by a worker on the parent (tracked for shutdown).
+local function App:serve_returned(env: ExchangeEnvelope, exchange: http.Exchange)
+  if self.closing then
+    exchange.response:abort()
+    return
+  end
+  local active = ActiveExchange(exchange, nil, PHASE_STARTING, nil)
+  self.adopted[active] = true
+  local first = true
+  serve_adopted(active, function (request: http.Request, response: http.Response)
+    local initial: ExchangeEnvelope? = nil
+    if first then initial = env end
+    first = false
+    active.phase = PHASE_HANDLING
+    self:handle_http(request, response, initial)
+    active.phase = PHASE_IDLE
+    if self.closing then
+      async.running():cancel(async.CancellationReason.simple("app shutting down"))
+    end
+  end, self.core.idle_timeout_ms, function ()
+    self.adopted[active] = nil
+    self.parent_changed:notify()
+  end)
+end
+
+------------------------------------------------------------------------------
+-- Lifecycle
+
+local function parse_listen_address(addr: string): (string, integer)
+  local host = ""
+  local port_text = ""
+  if string.sub(addr, 1, 1) == "[" then
+    local close? = string.find(addr, "]")
+    if close == nil or string.sub(addr, close + 1, close + 1) ~= ":" then
+      raise "mk: invalid listen address " .. addr
+    end
+    host = string.sub(addr, 2, close - 1)
+    port_text = string.sub(addr, close + 2)
+  else
+    local colon = 0
+    for index = #addr, 1, -1 do
+      if string.byte(addr, index) == 58 then
+        colon = index
+        break
+      end
+    end
+    if colon == 0 then raise "mk: listen address must be host:port" end
+    host = string.sub(addr, 1, colon - 1)
+    port_text = string.sub(addr, colon + 1)
+  end
+  if host == "" then host = "0.0.0.0" end
+  local port? = math.tointeger(port_text)
+  if port == nil or port < 0 or port > 65535 then raise "mk: invalid listen port in " .. addr end
+  return host, port
+end
+
+local function App:handler_count(): integer
+  local total = 0
+  local entries = self.core.entries
+  for index = 1, #entries do total = total + #entries[index].handlers end
+  return total
+end
+
+local function App:start_supervision()
+  local retire_tx, retire_rx = thread.channel<|RetireNotice|>(256)
+  self.retire_tx = retire_tx
+  self.retire_task = async.run<|nil, value|>(function (): nil
+    for _, notice in retire_rx:incoming() do
+      local slot? = self.slots[notice.worker_id]
+      if notice.ready then
+        if slot ~= nil then slot.ready = true end
+        self.workers_changed:notify()
+      else
+        if slot ~= nil then self:retire_slot(slot) end
+        local ack? = notice.ack_tx
+        if ack ~= nil then
+          do ack:try_send(true) catch end
+          do ack:close() catch end
+        end
+      end
+    end
+    return nil
+  end)
+  local logger? = self.core.logger
+  if logger ~= nil then
+    local log_tx, log_rx = thread.channel<|string|>(1024)
+    self.log_tx = log_tx
+    self.log_task = async.run<|nil, value|>(function (): nil
+      for _, line in log_rx:incoming() do logger:accept(line) end
+      return nil
+    end)
+  end
+  local return_pipe = ExchangePipe.create(256)
+  self.return_pipe = return_pipe
+  self.return_task = async.run<|nil, value|>(function (): nil
+    while true do
+      local env?, exchange? = return_pipe:pop_and_adopt()
+      if env == nil then return nil end
+      self:serve_returned(env, exchange as http.Exchange)
+    end
+    return nil
+  catch
+    local pipe = self.return_pipe as ExchangePipe
+    do pipe.data_tx:close() catch end
+    do pipe.space_sig_tx:close() catch end
+    if not (error is async.CancellationReason) then
+      self:begin_shutdown(async.Error(error, traceback))
+    end
+    raise
+  end)
+  for index = 1, #self.dispatchers do
+    local dispatcher = self.dispatchers[index]
+    if dispatcher.kind == DISPATCH_POOL then
+      for position = 1, dispatcher.pool_size do
+        local slot = self:spawn_worker(dispatcher, nil)
+        slot.pool_index = position
+        dispatcher.slots[position] = slot
+      end
+    end
+  end
+  while true do
+    local pending = false
+    for index = 1, #self.dispatchers do
+      local dispatcher = self.dispatchers[index]
+      for position = 1, #dispatcher.slots do
+        local slot = dispatcher.slots[position]
+        if not slot.alive then
+          raise "mk: pool worker " .. slot.id .. " failed to start: " ..
+            (slot.failure or "exited before ready")
+        end
+        if not slot.ready then pending = true end
+      end
+    end
+    if not pending then return end
+    self.workers_changed:wait()
+  end
+end
+
+--- Bind the listener, start workers, and run `on_listen` hooks.
+function App:start(addr: string, listen_config: ListenConfig?)
+  if self.server ~= nil or self.retirement ~= nil then raise "mk: App has already been started" end
+  self:freeze()
+  local host, port = parse_listen_address(addr)
+  local options = listen_config or ListenConfig {}
+  local handler = function (request: http.Request, response: http.Response)
+    self:handle_http(request, response, nil)
+  end
+  local tls = false
+  local server: http.Server? = nil
+  local cert_file? = options.cert_file
+  if cert_file ~= nil then
+    tls = true
+    server = http.listen_tls(host, cert_file, handler, options.key_file, port,
+      options.backlog, self.core.idle_timeout_ms, options.reuse_port)
+  else
+    server = http.listen(host, handler, port, options.backlog, self.core.idle_timeout_ms,
+      options.reuse_port)
+  end
+  local listener = server as http.Server
+  self.server = listener
+  self.listen_host = host
+  self.listen_port = port
+  local started = false
+  defer if not started then
+    self:begin_shutdown(nil)
+    await_terminal(self.retirement as async.Task<|nil, value|>)
+  end
+  listener:read_ahead(false)
+  listener:header_limit(self.header_limit)
+  self:start_supervision()
+  local data = ListenData(host, port, tls, self.core.app_name, self:handler_count(), os.pid())
+  local hooks = self.hooks_value.listen_hooks
+  for index = 1, #hooks do
+    local hook = hooks[index]
+    self:run_hook(function () hook(data) end)
+  end
+  started = true
+end
+
+--- Run the accept loop until the listener closes.
+function App:serve()
+  local server? = self.server
+  if server == nil then raise "mk: App:serve() requires App:start()" end
+  server:serve()
+end
+
+--- `start` then `serve`.
+function App:listen(addr: string, listen_config: ListenConfig?)
+  self:start(addr, listen_config)
+  self:serve()
+end
+
+local function App:guard(step: function (): ())
+  do
+    step()
+  catch
+    if error is async.CancellationReason then raise end
+    if self.first_failure == nil then self.first_failure = async.Error(error, traceback) end
+  end
+end
+
+local function next_parent(active: {async.Task<|value, value|>: Context}): boolean
+  local key?, _value? = iteration.next(active, nil)
+  return key ~= nil
+end
+
+-- Shutdown step 3: bounded wait for in-handler parent requests, then abort
+-- their transports first and cancel and join them. Idle adopted connections
+-- are cancelled immediately.
+local function App:drain_parent()
+  for active, _ in iteration.pairs(self.adopted) do
+    if active.phase ~= PHASE_HANDLING then active:stop("app shutting down") end
+  end
+  if self.shutdown_timeout_ms > 0 and next_parent(self.active_parent) then
+    local expired = false
+    local timeout = self.shutdown_timeout_ms
+    local deadline = async.run<|nil, value|>(function (): nil
+      timer.sleep(timeout)
+      expired = true
+      self.parent_changed:notify()
+      return nil
+    end)
+    defer if not deadline:status():has_finished() then
+      deadline:cancel(async.CancellationReason.simple("parent requests drained"))
+    end
+    while next_parent(self.active_parent) and not expired do self.parent_changed:wait() end
+  end
+  local tasks: {async.Task<|value, value|>} = {}
+  for task, ctx in iteration.pairs(self.active_parent) do
+    ctx:force_abort()
+    task:cancel(async.CancellationReason.simple("app shutdown"))
+    tasks[#tasks + 1] = task
+  end
+  for active, _ in iteration.pairs(self.adopted) do
+    active:stop("app shutdown")
+    local task? = active.task
+    if task ~= nil then tasks[#tasks + 1] = task end
+  end
+  for index = 1, #tasks do await_terminal(tasks[index]) end
+end
+
+-- Shutdown step 4: close every worker pipe, cancel and join every worker and
+-- monitor (return_task and retire_listener keep running), then stop the
+-- retire listener.
+local function App:stop_workers()
+  local monitors: {async.Task<|nil, value|>} = {}
+  for _, slot in iteration.pairs(self.slots) do
+    if slot.alive then
+      self:retire_slot(slot)
+      local worker? = slot.worker
+      if worker ~= nil then worker:cancel(async.CancellationReason.simple("app shutdown")) end
+    end
+    local monitor? = slot.monitor
+    if monitor ~= nil then monitors[#monitors + 1] = monitor end
+  end
+  for index = 1, #monitors do await_terminal(monitors[index]) end
+  local retire_tx? = self.retire_tx
+  if retire_tx ~= nil then retire_tx:close() end
+  local retire_task? = self.retire_task
+  if retire_task ~= nil then await_terminal(retire_task) end
+end
+
+-- Shutdown step 5: stop the return pipe and dispose of anything still queued.
+local function App:stop_return_pipe()
+  local pipe? = self.return_pipe
+  if pipe == nil then return end
+  do pipe.data_tx:close() catch end
+  do pipe.item_sig_tx:close() catch end
+  local task? = self.return_task
+  if task ~= nil then await_terminal(task) end
+  pipe:discard_queued()
+  do pipe.data_rx:close() catch end
+  local tasks: {async.Task<|nil, value|>} = {}
+  for active, _ in iteration.pairs(self.adopted) do
+    active:stop("app shutdown")
+    local adopted_task? = active.task
+    if adopted_task ~= nil then tasks[#tasks + 1] = adopted_task end
+  end
+  for index = 1, #tasks do await_terminal(tasks[index]) end
+end
+
+local function App:run_shutdown()
+  local server? = self.server
+  if server ~= nil then self:guard(function () server:close() end) end
+  local pre_hooks = self.hooks_value.pre_shutdown_hooks
+  for index = 1, #pre_hooks do
+    local hook = pre_hooks[index]
+    self:guard(function () self:run_hook(hook) end)
+  end
+  self:guard(function () self:drain_parent() end)
+  self:guard(function () self:stop_workers() end)
+  self:guard(function () self:stop_return_pipe() end)
+  self:guard(function ()
+    local log_tx? = self.log_tx
+    if log_tx ~= nil then log_tx:close() end
+    local log_task? = self.log_task
+    if log_task ~= nil then await_terminal(log_task) end
+  end)
+  local failure? = self.first_failure
+  local post_hooks = self.hooks_value.post_shutdown_hooks
+  for index = 1, #post_hooks do
+    local hook = post_hooks[index]
+    self:guard(function () self:run_hook(function () hook(failure) end) end)
+  end
+end
+
+local function App:begin_shutdown(cause: async.Error?)
+  if self.retirement ~= nil then return end
+  if cause ~= nil and self.first_failure == nil then self.first_failure = cause end
+  self.closing = true
+  self.core.closing = true
+  local retirement = async.run<|nil, value|>(function (): nil
+    self:run_hook(function () self:run_shutdown() end)
+    return nil
+  end)
+  self.retirement = retirement
+  self.retirement_view = retirement as async.Task<|value, value|>
+end
+
+--- Begin shutdown without waiting (safe from handlers, hooks, and monitors).
+function App:initiate_shutdown()
+  self:begin_shutdown(nil)
+end
+
+--- Begin shutdown and wait for complete retirement. Raises when called from
+-- an active request handler or a lifecycle hook (use `initiate_shutdown`).
+function App:shutdown()
+  local current = async.running()
+  if self.active_parent[current] ~= nil then
+    raise "mk: App:shutdown() cannot wait inside an active request handler; use App:initiate_shutdown()"
+  end
+  for _, ctx in iteration.pairs(self.active_parent) do
+    if ctx.owner_task == current then
+      raise "mk: App:shutdown() cannot wait inside an active request handler; use App:initiate_shutdown()"
+    end
+  end
+  if self.hook_tasks[current] ~= nil or self.retirement_view == current then
+    raise "mk: App:shutdown() cannot wait inside a lifecycle hook; use App:initiate_shutdown()"
+  end
+  self:begin_shutdown(nil)
+  await_terminal(self.retirement as async.Task<|nil, value|>)
+end
+
+--- True after `start` until shutdown begins.
+function App:is_running(): boolean
+  return self.server ~= nil and not self.closing
+end
+
+function App:pool_workers(): const {WorkerInfo}
+  return self.root_dispatcher:pool_infos()
+end
+
+function App:pool_next_index(): integer
+  return self.root_dispatcher.next_index
+end
+
+--- The live worker of `session_id` in any session dispatcher, or nil.
+function App:session_worker(session_id: string): WorkerInfo?
+  local root_info? = self.root_dispatcher:session_info(session_id)
+  if root_info ~= nil then return root_info end
+  for index = 1, #self.dispatchers do
+    local dispatcher = self.dispatchers[index]
+    if dispatcher.kind == DISPATCH_SESSION then
+      local info? = dispatcher:session_info(session_id)
+      if info ~= nil then return info end
+    end
+  end
+  return nil
+end
+
+--- Active session ids across every session dispatcher.
+function App:active_session_ids(): const {string}
+  local result: {string} = {}
+  for index = 1, #self.dispatchers do
+    local dispatcher = self.dispatchers[index]
+    for session_id, _ in iteration.pairs(dispatcher.sessions) do result[#result + 1] = session_id end
+  end
+  return result as const {string}
+end
+
+function App:is_worker_alive(worker_id: integer): boolean
+  local slot? = self.slots[worker_id]
+  return slot ~= nil and slot.alive
+end
+
+--- Cancel a worker thread; pool workers are replaced. False when not alive.
+function App:stop_worker(worker_id: integer): boolean
+  local slot? = self.slots[worker_id]
+  if slot == nil or not slot.alive then return false end
+  local worker? = slot.worker
+  if worker == nil then return false end
+  worker:cancel(async.CancellationReason.simple("worker stopped"))
+  return true
+end

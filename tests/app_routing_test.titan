@@ -1,0 +1,301 @@
+-- App registration, dispatch order, 404/405, auto_head, groups, mounts,
+-- naming hooks, and freeze rules (strictly in-memory through App:test).
+local test = import "test"
+local http = import "http"
+local mk = import "mk"
+
+local function get(app: mk.App, target: string): mk.TestResponse
+  return app:test(mk.TestRequest("GET", target))
+end
+
+local function request(app: mk.App, method: string, target: string): mk.TestResponse
+  return app:test(mk.TestRequest(method, target))
+end
+
+local function expect(response: mk.TestResponse, status: integer, body: string, what: string)
+  test.assert(response.status == status,
+    what .. ": expected status " .. status .. ", got " .. response.status .. " (" .. response.body .. ")")
+  test.assert(response.body == body, what .. ": expected body '" .. body .. "', got '" .. response.body .. "'")
+end
+
+local function echo_param(name: string): mk.Handler
+  return function (ctx: mk.Context) ctx:send_string(ctx:param(name)) end
+end
+
+function test_verbs_params_and_query(context: test.Context)
+  local app = mk.App()
+  app:get("/users/:id", function (ctx: mk.Context)
+    ctx:send_string("get " .. ctx:param("id") .. " q=" .. ctx:query("q", "none"))
+  end)
+  app:post("/users", function (ctx: mk.Context) ctx:status(201):send_string("created") end)
+  app:put("/users/:id", echo_param("id"))
+  app:delete("/users/:id", function (ctx: mk.Context) ctx:no_content() end)
+  app:patch("/users/:id", function (ctx: mk.Context) ctx:send_string("patched") end)
+  app:options("/users", function (ctx: mk.Context) ctx:send_string("opts") end)
+  app:trace("/users", function (ctx: mk.Context) ctx:send_string("traced") end)
+  app:connect("/users", function (ctx: mk.Context) ctx:send_string("connected") end)
+  context:run("get_with_param_and_query", function (_: test.Context)
+    expect(get(app, "/users/42?q=x%20y"), 200, "get 42 q=x y", "GET")
+    expect(get(app, "/users/7"), 200, "get 7 q=none", "GET without query")
+  end)
+  context:run("other_verbs", function (_: test.Context)
+    expect(request(app, "POST", "/users"), 201, "created", "POST")
+    expect(request(app, "PUT", "/users/9"), 200, "9", "PUT")
+    expect(request(app, "DELETE", "/users/9"), 204, "", "DELETE")
+    expect(request(app, "PATCH", "/users/9"), 200, "patched", "PATCH")
+    expect(request(app, "OPTIONS", "/users"), 200, "opts", "OPTIONS")
+    expect(request(app, "TRACE", "/users"), 200, "traced", "TRACE")
+    expect(request(app, "CONNECT", "/users"), 200, "connected", "CONNECT")
+  end)
+  context:run("lowercase_method_is_normalized", function (_: test.Context)
+    expect(request(app, "post", "/users"), 201, "created", "lowercase post")
+  end)
+  context:run("percent_decoded_param", function (_: test.Context)
+    expect(get(app, "/users/a%20b"), 200, "get a b q=none", "decoded param")
+  end)
+end
+
+function test_not_found_and_method_not_allowed(context: test.Context)
+  local app = mk.App()
+  app:post("/items", function (ctx: mk.Context) ctx:send_string("post") end)
+  app:get("/items", function (ctx: mk.Context) ctx:send_string("get") end)
+  app:put("/items", function (ctx: mk.Context) ctx:send_string("put") end)
+  app:post("/items", function (ctx: mk.Context) ctx:send_string("duplicate") end)
+  context:run("unknown_path_is_404", function (_: test.Context)
+    local response = get(app, "/missing")
+    expect(response, 404, "Cannot GET /missing", "404")
+    test.assert(response:header("Allow") == nil, "404 must not carry Allow")
+  end)
+  context:run("allow_is_first_occurrence_with_head_after_get", function (_: test.Context)
+    local response = request(app, "DELETE", "/items")
+    test.assert(response.status == 405, "expected 405, got " .. response.status)
+    test.assert(response:header("Allow") == "POST, GET, HEAD, PUT",
+      "unexpected Allow: " .. (response:header("Allow") or "<nil>"))
+    test.assert(response.body == "Method Not Allowed", "unexpected 405 body " .. response.body)
+  end)
+  context:run("allow_without_auto_head", function (_: test.Context)
+    local strict = mk.App(mk.Config { auto_head = false })
+    strict:get("/only", function (ctx: mk.Context) ctx:send_string("get") end)
+    local response = request(strict, "HEAD", "/only")
+    test.assert(response.status == 405, "HEAD must not match GET without auto_head")
+    test.assert(response:header("Allow") == "GET", "Allow must list only GET")
+  end)
+end
+
+function test_auto_head(context: test.Context)
+  local app = mk.App()
+  app:get("/doc", function (ctx: mk.Context) ctx:send_string("document body") end)
+  app:get("/both", function (ctx: mk.Context) ctx:send_string("from get") end)
+  app:head("/both", function (ctx: mk.Context) ctx:set("X-Head", "explicit"):send_string("from head") end)
+  context:run("head_falls_back_to_get_without_body", function (_: test.Context)
+    local response = request(app, "HEAD", "/doc")
+    expect(response, 200, "", "HEAD fallback")
+    test.assert(response:header("Content-Length") == "13", "HEAD keeps the GET Content-Length")
+  end)
+  context:run("explicit_head_wins", function (_: test.Context)
+    local response = request(app, "HEAD", "/both")
+    test.assert(response:header("X-Head") == "explicit", "explicit HEAD route must run")
+    test.assert(response.body == "", "HEAD never carries a body")
+  end)
+  context:run("all_route_counts_as_explicit_head", function (_: test.Context)
+    local other = mk.App()
+    other:get("/x", function (ctx: mk.Context) ctx:send_string("get") end)
+    other:all("/x", function (ctx: mk.Context) ctx:set("X-All", ctx:method()):send_string("all") end)
+    local response = request(other, "HEAD", "/x")
+    test.assert(response:header("X-All") == "HEAD", "ALL route must answer HEAD before GET fallback")
+  end)
+end
+
+function test_middleware_order_and_next(context: test.Context)
+  local app = mk.App()
+  app:use(function (ctx: mk.Context)
+    ctx:set_local("trail", "a")
+    ctx:next()
+    ctx:set("X-After", "global")
+  end)
+  app:use_path("/api", function (ctx: mk.Context)
+    ctx:set_local("trail", (ctx:get_local("trail") as string) .. "b")
+    ctx:next()
+  end)
+  app:get("/api/v1", function (ctx: mk.Context)
+    ctx:set_local("trail", (ctx:get_local("trail") as string) .. "c")
+    ctx:next()
+  end, function (ctx: mk.Context)
+    ctx:send_string((ctx:get_local("trail") as string) .. "d")
+  end)
+  app:get("/apix", function (ctx: mk.Context)
+    ctx:send_string(ctx:get_local("trail") as string)
+  end)
+  context:run("declaration_order_across_middleware_and_handlers", function (_: test.Context)
+    local response = get(app, "/api/v1")
+    expect(response, 200, "abcd", "chain")
+    test.assert(response:header("X-After") == "global", "code after next() must run")
+  end)
+  context:run("use_path_matches_whole_segments_only", function (_: test.Context)
+    expect(get(app, "/apix"), 200, "a", "prefix boundary")
+  end)
+  context:run("next_after_last_route_is_404", function (_: test.Context)
+    local tail = mk.App()
+    tail:get("/x", function (ctx: mk.Context) ctx:next() end)
+    expect(get(tail, "/x"), 404, "Cannot GET /x", "exhausted chain")
+  end)
+end
+
+function test_overlapping_routes_run_in_order(_: test.Context)
+  local app = mk.App()
+  app:get("/files/:name", function (ctx: mk.Context)
+    if ctx:param("name") == "special" then ctx:next() return end
+    ctx:send_string("generic " .. ctx:param("name"))
+  end)
+  app:get("/files/special", function (ctx: mk.Context) ctx:send_string("special route") end)
+  expect(get(app, "/files/readme"), 200, "generic readme", "first route")
+  expect(get(app, "/files/special"), 200, "special route", "next() reaches the later route")
+end
+
+function test_groups_names_and_route_url(context: test.Context)
+  local app = mk.App()
+  local seen_groups: {string} = {}
+  local seen_names: {string} = {}
+  local seen_routes: {string} = {}
+  app:hooks():on_group(function (info: mk.GroupInfo) seen_groups[#seen_groups + 1] = info.prefix .. "|" .. info.name end)
+  app:hooks():on_name(function (info: mk.RouteInfo) seen_names[#seen_names + 1] = info.name end)
+  app:hooks():on_route(function (info: mk.RouteInfo) seen_routes[#seen_routes + 1] = info.method .. " " .. info.path end)
+  local api = app:group_with("/api", mk.GroupOptions { name = "api." }, function (ctx: mk.Context)
+    ctx:set("X-Group", "api")
+    ctx:next()
+  end)
+  local v1 = api:group_with("/v1", mk.GroupOptions { name = "v1." })
+  v1:get("/users/:id", echo_param("id")):name("user")
+  v1:post("/users", function (ctx: mk.Context) ctx:send_string("new") end)
+  context:run("group_prefix_and_middleware", function (_: test.Context)
+    local response = get(app, "/api/v1/users/5")
+    expect(response, 200, "5", "grouped route")
+    test.assert(response:header("X-Group") == "api", "group middleware must run")
+  end)
+  context:run("route_url_uses_prefixed_name", function (_: test.Context)
+    test.assert(app:route_url("api.v1.user", {["id"] = "77"}) == "/api/v1/users/77",
+      "route_url built " .. app:route_url("api.v1.user", {["id"] = "77"}))
+  end)
+  context:run("hooks_observed_registration", function (_: test.Context)
+    test.assert(#seen_groups == 2 and seen_groups[1] == "/api|api." and seen_groups[2] == "/api/v1|api.v1.",
+      "on_group order")
+    test.assert(#seen_names == 1 and seen_names[1] == "api.v1.user", "on_name observed the prefixed name")
+    test.assert(#seen_routes == 2 and seen_routes[1] == "GET /api/v1/users/:id" and
+      seen_routes[2] == "POST /api/v1/users", "on_route order")
+  end)
+  context:run("routes_inventory", function (_: test.Context)
+    local routes = app:routes()
+    test.assert(#routes == 2, "two endpoint routes")
+    local first = routes[1] as mk.RouteInfo
+    test.assert(first.name == "api.v1.user" and first.group_prefix == "/api/v1", "RouteInfo fields")
+    test.assert(#first.params == 1 and first.params[1] == "id", "RouteInfo params")
+  end)
+end
+
+function test_route_chain_and_add(_: test.Context)
+  local app = mk.App()
+  app:route_chain("/thing")
+    :get(function (ctx: mk.Context) ctx:send_string("get thing") end)
+    :post(function (ctx: mk.Context) ctx:send_string("post thing") end)
+    :route_chain("/sub"):get(function (ctx: mk.Context) ctx:send_string("sub") end)
+  local handles = app:add({"PUT", "PATCH"}, "/multi", function (ctx: mk.Context) ctx:send_string(ctx:method()) end)
+  test.assert(#handles == 2, "add returns one handle per method")
+  expect(get(app, "/thing"), 200, "get thing", "chain GET")
+  expect(request(app, "POST", "/thing"), 200, "post thing", "chain POST")
+  expect(get(app, "/thing/sub"), 200, "sub", "nested chain")
+  expect(request(app, "PUT", "/multi"), 200, "PUT", "add PUT")
+  expect(request(app, "PATCH", "/multi"), 200, "PATCH", "add PATCH")
+end
+
+function test_mount_sub_app(_: test.Context)
+  local sub = mk.App()
+  sub:use(function (ctx: mk.Context)
+    ctx:set("X-Mount", ctx:mount_path())
+    ctx:next()
+  end)
+  sub:get("/status", function (ctx: mk.Context) ctx:send_string("sub status") end)
+  local app = mk.App()
+  app:mount("/admin", sub)
+  app:get("/status", function (ctx: mk.Context) ctx:send_string("root status") end)
+  local mounted = get(app, "/admin/status")
+  expect(mounted, 200, "sub status", "mounted route")
+  test.assert(mounted:header("X-Mount") == "/admin", "mount_path inside the sub app")
+  local root = get(app, "/status")
+  expect(root, 200, "root status", "root route")
+  test.assert(root:header("X-Mount") == nil, "sub middleware stays below its mount prefix")
+end
+
+function test_registration_freezes_after_test(_: test.Context)
+  local app = mk.App()
+  app:get("/a", function (ctx: mk.Context) ctx:send_string("a") end)
+  get(app, "/a")
+  local rejected = false
+  do
+    app:get("/b", function (ctx: mk.Context) ctx:send_string("b") end)
+  catch
+    rejected = true
+    test.assert(error == "mk: routes cannot be registered after App:start or App:test",
+      "unexpected freeze error")
+  end
+  test.assert(rejected, "registration after App:test must raise")
+end
+
+function test_routing_constraints_rejected(_: test.Context)
+  local app = mk.App()
+  local rejected = false
+  do
+    app:get("/users/:id<int>", function (ctx: mk.Context) ctx:send_string("x") end)
+  catch
+    rejected = true
+  end
+  test.assert(rejected, "routing constraints must be rejected at registration")
+end
+
+function test_endpoint_metadata(_: test.Context)
+  local app = mk.App()
+  app:use(function (ctx: mk.Context)
+    ctx:next()
+    ctx:set("X-Matched", ctx:matched_route())
+    ctx:set("X-Name", ctx:route_name())
+  end)
+  app:get("/orders/:id", function (ctx: mk.Context)
+    local info = ctx:endpoint() as mk.RouteInfo
+    ctx:send_string(info.method .. " " .. info.path)
+  end):name("order")
+  local response = get(app, "/orders/1")
+  expect(response, 200, "GET /orders/:id", "endpoint()")
+  test.assert(response:header("X-Matched") == "/orders/:id", "matched_route")
+  test.assert(response:header("X-Name") == "order", "route_name")
+  local unmatched = get(app, "/none")
+  test.assert(unmatched:header("X-Matched") == nil, "headers set after a raised 404 are dropped")
+end
+
+function test_restart_routing(_: test.Context)
+  local app = mk.App()
+  local passes = 0
+  app:use(function (ctx: mk.Context)
+    passes = passes + 1
+    if passes == 1 then ctx:restart_routing() return end
+    ctx:next()
+  end)
+  app:get("/r", function (ctx: mk.Context) ctx:send_string("passes " .. passes) end)
+  expect(get(app, "/r"), 200, "passes 2", "restart_routing reruns the chain from the start")
+end
+
+function test_request_metadata(_: test.Context)
+  local app = mk.App(mk.Config { trust_forwarded_headers = true })
+  app:get("/meta", function (ctx: mk.Context)
+    ctx:send_string(ctx:scheme() .. "|" .. ctx:host() .. "|" .. ctx:hostname() .. "|" ..
+      ctx:port() .. "|" .. ctx:base_url() .. "|" .. ctx:full_url() .. "|" .. ctx:original_url())
+  end)
+  local headers = http.headers({http.Header("Host", "internal:8080"),
+    http.Header("X-Forwarded-Proto", "https"), http.Header("X-Forwarded-Host", "example.org")})
+  local response = app:test(mk.TestRequest("GET", "/meta?x=1", headers))
+  expect(response, 200,
+    "https|example.org|example.org|443|https://example.org|https://example.org/meta?x=1|/meta?x=1",
+    "trusted forwarded metadata")
+  local untrusted = mk.App()
+  untrusted:get("/meta", function (ctx: mk.Context) ctx:send_string(ctx:scheme() .. "|" .. ctx:host()) end)
+  expect(untrusted:test(mk.TestRequest("GET", "/meta", headers)), 200, "http|internal:8080",
+    "forwarded headers ignored by default")
+end

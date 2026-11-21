@@ -1,0 +1,384 @@
+-- Pool workers: round-robin handoff, worker-local state and cleanup, log
+-- forwarding, ExchangePipe ownership under cancellation, pre-start serving
+-- cancellation, sustained keep-alive returns, termination, and shutdown.
+local test = import "test"
+local async = import "async"
+local http = import "http"
+local math = import "math"
+local net = import "net"
+local os = import "os"
+local string = import "string"
+local thread = import "thread"
+local timer = import "timer"
+local log = import "mk.log"
+local mk = import "mk.titan"
+
+-- Worker-local module state written by on_start inside each worker state.
+local worker_label: string?
+
+local function within(ms: integer, what: string, action: function (): ())
+  local worker = async.run<|nil, value|>(function (): nil
+    action()
+    return nil
+  end)
+  local deadline = async.run<|nil, value|>(function (): nil
+    timer.sleep(ms)
+    return nil
+  end)
+  defer do
+    if not deadline:status():has_finished() then deadline:cancel() end
+    if not worker:status():has_finished() then worker:cancel() end
+  end
+  case async.race_two(worker, deadline)
+  when first(status) then
+    local failed, failure? = status:has_failed()
+    if failed then failure:raise() end
+  when second() then
+    test.assert(false, what .. " did not finish within " .. ms .. " ms")
+  end
+end
+
+-- One request on a fresh connection ("Connection: close"); "" when the
+-- server closed without answering.
+local function fetch_once(host: string, port: integer, target: string): string
+  local connection = net.connect(host, port)
+  defer connection:close()
+  connection:write("GET " .. target .. " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+  local out = string.writer()
+  do
+    for chunk in connection:read do out:write(chunk) end
+  catch
+  end
+  return out:drain()
+end
+
+local function body_of(response_text: string): string
+  local split? = string.find(response_text, "\r\n\r\n")
+  if split == nil then return "" end
+  return string.sub(response_text, split + 4)
+end
+
+local function spawn_fetch(host: string, port: integer, target: string): async.Task<|string, value|>
+  return async.run<|string, value|>(function (): string
+    return fetch_once(host, port, target)
+  end)
+end
+
+local function finished_text(task: async.Task<|string, value|>): string
+  case async.join(task)
+  when succeeded(text) then return text
+  else return "<task did not succeed>"
+  end
+end
+
+-- A raw http.Server that detaches every exchange into `payloads`.
+local record Detacher
+  payloads: {string}
+  server: http.Server
+  port: integer
+  task: async.Task<|nil, value|>?
+end
+
+local function start_detacher(): Detacher
+  local payloads: {string} = {}
+  local handler = function (request: http.Request, response: http.Response)
+    async.yield()
+    payloads[#payloads + 1] = http.Exchange(request, response):to_transfer_payload()
+  end
+  local port = 40000 + (os.pid() % 100) * 64
+  for _ = 1, 64 do
+    local server: http.Server? = nil
+    do
+      server = http.listen("127.0.0.1", handler, port)
+    catch
+      if not (error is async.OperationError) then raise end
+      local failure = error as async.OperationError
+      if failure.name ~= "EADDRINUSE" then raise end
+    end
+    if server ~= nil then
+      server:read_ahead(false)
+      local detacher = Detacher(payloads, server, port, nil)
+      detacher.task = async.run<|nil, value|>(function (): nil
+        server:serve()
+        return nil
+      end)
+      return detacher
+    end
+    port = port + 1
+  end
+  raise "no free port for the detacher"
+end
+
+local function Detacher:close()
+  self.server:close()
+  local task? = self.task
+  if task ~= nil then async.join(task) end
+end
+
+local function Detacher:wait_for(count: integer)
+  while #self.payloads < count do timer.yield() end
+end
+
+local function envelope(payload: string): mk.ExchangeEnvelope
+  return mk.ExchangeEnvelope(payload, "GET", "/", 0, "", false)
+end
+
+local function answer(exchange: http.Exchange, text: string)
+  exchange.response:set_header("Content-Length", "" .. #text)
+  exchange.response:write(text)
+  exchange:close()
+end
+
+function test_round_robin_worker_state_and_cleanup(_: test.Context)
+  local cleanup_tx, cleanup_rx = thread.channel<|integer|>(8)
+  local app = mk.App(mk.Config { workers = mk.WorkerMode.pool(mk.PoolOptions {
+    size = 2,
+    on_start = function (wctx: mk.WorkerContext)
+      worker_label = "label-" .. wctx.id
+      wctx:defer_cleanup(function () cleanup_tx:try_send(wctx.id) end)
+    end,
+  }) })
+  app:get("/who", function (ctx: mk.Context)
+    ctx:send_string(ctx:worker_id() .. ":" .. (worker_label or "unset"))
+  end)
+  local server = app:listen_test()
+  local infos = app:pool_workers()
+  test.assert(#infos == 2, "two pool workers")
+  local first = infos[1] as mk.WorkerInfo
+  local second = infos[2] as mk.WorkerInfo
+  test.assert(first.alive and second.alive and first.id ~= second.id, "distinct live workers")
+  local bodies: {string} = {}
+  within(5000, "round robin", function ()
+    for index = 1, 4 do bodies[index] = body_of(fetch_once(server.host, server.port, "/who")) end
+  end)
+  local expect_a = first.id .. ":label-" .. first.id
+  local expect_b = second.id .. ":label-" .. second.id
+  test.assert(bodies[1] == expect_a and bodies[2] == expect_b and bodies[3] == expect_a and
+    bodies[4] == expect_b, "round robin order: " .. bodies[1] .. "," .. bodies[2] .. "," ..
+    bodies[3] .. "," .. bodies[4])
+  test.assert(worker_label == nil, "worker module state never leaks into the parent state")
+  within(5000, "shutdown", function () server:close() end)
+  local cleaned = 0
+  for _ = 1, 2 do
+    local ok, _id? = cleanup_rx:try_receive()
+    if ok then cleaned = cleaned + 1 end
+  end
+  test.assert(cleaned == 2, "every worker ran its deferred cleanup")
+end
+
+function test_worker_logs_are_forwarded(_: test.Context)
+  local lines: {string} = {}
+  local logger = log.Logger.new("debug", function (text: string) lines[#lines + 1] = text end)
+  local app = mk.App(mk.Config { logger = logger, workers = mk.WorkerMode.pool() })
+  app:get("/log", function (ctx: mk.Context)
+    ctx:log("info", "worker_event", {["worker"] = ctx:worker_id()})
+    ctx:send_string("logged")
+  end)
+  local server = app:listen_test()
+  within(5000, "logging request", function ()
+    test.assert(body_of(fetch_once(server.host, server.port, "/log")) == "logged", "response")
+  end)
+  within(5000, "shutdown", function () server:close() end)
+  logger:close()
+  local found = false
+  for index = 1, #lines do
+    if string.find(lines[index], "\"event\":\"worker_event\"") then found = true end
+  end
+  test.assert(found, "the worker log line reached the parent logger")
+end
+
+-- Read one bodyless keep-alive response and return its status and X-Owner.
+local function read_owner(connection: net.Connection): (integer, string)
+  local head? = connection:read_until("\r\n\r\n", true)
+  if head == nil then raise "connection closed before a response" end
+  local owner = ""
+  for line in string.split(head, "\r\n") do
+    if string.sub(string.lower(line), 1, 8) == "x-owner:" then owner = string.sub(line, 10) end
+  end
+  return math.tointeger(string.sub(head, 10, 12)) or 0, owner
+end
+
+function test_sustained_keep_alive_returns(_: test.Context)
+  -- Bodyless 204 responses are one write each, so the round trips are not
+  -- throttled by Nagle/delayed-ACK on the header-then-body write pair.
+  local app = mk.App()
+  app:get("/parent", function (ctx: mk.Context)
+    ctx:set("X-Owner", "parent " .. ctx:worker_id()):no_content()
+  end)
+  local pooled = app:group_with("/pool", mk.GroupOptions {
+    workers = mk.WorkerMode.pool(mk.PoolOptions { size = 1 }),
+  })
+  pooled:get("/", function (ctx: mk.Context)
+    ctx:set("X-Owner", "pool " .. ctx:worker_id()):no_content()
+  end)
+  local server = app:listen_test()
+  defer server:close()
+  test.assert(#app:pool_workers() == 0, "the parent root dispatcher has no pool workers")
+  local worker = (pooled:pool_workers()[1] as mk.WorkerInfo).id
+  -- Every /parent request after a /pool request arrives at the worker on the
+  -- same keep-alive connection and is returned to the parent through the
+  -- 256-slot return pipe; 300 rounds prove the pipe slots are reused.
+  within(60000, "300 keep-alive round trips", function ()
+    local connection = net.connect(server.host, server.port)
+    defer connection:close()
+    for round = 1, 300 do
+      connection:write("GET /pool HTTP/1.1\r\nHost: t\r\n\r\n")
+      local pool_status, pool_owner = read_owner(connection)
+      test.assert(pool_status == 204 and pool_owner == "pool " .. worker,
+        "round " .. round .. " pool: " .. pool_status .. " " .. pool_owner)
+      connection:write("GET /parent HTTP/1.1\r\nHost: t\r\n\r\n")
+      local parent_status, parent_owner = read_owner(connection)
+      test.assert(parent_status == 204 and parent_owner == "parent 0",
+        "round " .. round .. " parent: " .. parent_status .. " " .. parent_owner)
+    end
+  end)
+end
+
+function test_pipe_sender_cancellation_while_full(_: test.Context)
+  local detacher = start_detacher()
+  defer detacher:close()
+  local clients: {async.Task<|string, value|>} = {}
+  for index = 1, 3 do
+    clients[index] = spawn_fetch("127.0.0.1", detacher.port, "/" .. index)
+    detacher:wait_for(index)
+  end
+  local pipe = mk.ExchangePipe.create(1)
+  local senders: {async.Task<|boolean, value|>} = {}
+  for index = 1, 3 do
+    local payload = detacher.payloads[index] as string
+    senders[index] = async.run<|boolean, value|>(function (): boolean
+      local accepted, _leftover? = pipe:send_exchange(envelope(payload))
+      return accepted
+    end)
+  end
+  local first_sender = senders[1] as async.Task<|boolean, value|>
+  local blocked = senders[2] as async.Task<|boolean, value|>
+  local waiting = senders[3] as async.Task<|boolean, value|>
+  within(3000, "senders settle", function ()
+    while not first_sender:status():has_finished() or blocked:status():as_string() ~= "waiting" or
+        waiting:status():as_string() ~= "waiting" do
+      timer.yield()
+    end
+  end)
+  -- Cancel a producer blocked on the full ring: its payload is disposed once.
+  blocked:cancel(async.CancellationReason.simple("client gave up"))
+  local cancelled_status = async.join(blocked)
+  test.assert(cancelled_status:as_string() == "cancelled", "blocked sender cancelled")
+  test.assert(finished_text(clients[2] as async.Task<|string, value|>) == "",
+    "the cancelled exchange's connection closed without a response")
+  -- Consuming one slot must still wake the remaining producer.
+  within(3000, "consume and relay", function ()
+    local _env1?, exchange1? = pipe:pop_and_adopt()
+    answer(exchange1 as http.Exchange, "one")
+    local _accepted? = async.join(waiting):has_succeeded()
+    local _env3?, exchange3? = pipe:pop_and_adopt()
+    answer(exchange3 as http.Exchange, "three")
+  end)
+  test.assert(body_of(finished_text(clients[1] as async.Task<|string, value|>)) == "one", "first exchange served")
+  test.assert(body_of(finished_text(clients[3] as async.Task<|string, value|>)) == "three",
+    "the producer behind the cancelled one was not stranded")
+end
+
+function test_closed_pipe_returns_leftover(_: test.Context)
+  local detacher = start_detacher()
+  defer detacher:close()
+  local client = spawn_fetch("127.0.0.1", detacher.port, "/x")
+  detacher:wait_for(1)
+  local pipe = mk.ExchangePipe.create(4)
+  pipe:close_senders()
+  local accepted, leftover? = pipe:send_exchange(envelope(detacher.payloads[1] as string))
+  test.assert(not accepted and leftover ~= nil, "a closed pipe hands the payload back")
+  http.Exchange.discard_transfer_payload(leftover as string)
+  test.assert(finished_text(client) == "", "the discarded exchange closed its connection")
+  local env?, _exchange? = pipe:pop_and_adopt()
+  test.assert(env == nil, "a closed, drained pipe reports EOF")
+end
+
+function test_serving_task_cancelled_before_handler_entry(_: test.Context)
+  local detacher = start_detacher()
+  defer detacher:close()
+  local client = spawn_fetch("127.0.0.1", detacher.port, "/never")
+  detacher:wait_for(1)
+  local exchange = http.Exchange.from_transfer_payload(detacher.payloads[1] as string)
+  local active = mk.ActiveExchange(exchange, nil, 0, nil)
+  local handled = false
+  local done = false
+  local task = mk.serve_adopted(active, function (_: http.Request, _response: http.Response)
+    handled = true
+  end, 0, function () done = true end)
+  test.assert(task:status():as_string() == "ready", "the serving Task has not started")
+  task:cancel(async.CancellationReason.simple("cancel before entry"))
+  local status = async.join(task)
+  test.assert(status:as_string() == "cancelled", "serving Task cancelled")
+  test.assert(not handled, "the handler never ran")
+  test.assert(done, "the completion callback still ran")
+  test.assert(finished_text(client) == "", "the never-served exchange was aborted")
+end
+
+function test_stop_worker_aborts_and_respawns(_: test.Context)
+  local gate_tx, gate_rx = thread.channel<|boolean|>(1)
+  local app = mk.App(mk.Config { workers = mk.WorkerMode.pool() })
+  app:get("/block", function (ctx: mk.Context)
+    gate_rx:receive()
+    ctx:send_string("released")
+  end)
+  app:get("/who", function (ctx: mk.Context) ctx:send_string("" .. ctx:worker_id()) end)
+  local server = app:listen_test()
+  defer server:close()
+  local original = (app:pool_workers()[1] as mk.WorkerInfo).id
+  local blocked = spawn_fetch(server.host, server.port, "/block")
+  timer.sleep(50)
+  test.assert(app:stop_worker(original), "stop_worker accepted a live worker")
+  within(5000, "worker stop", function ()
+    test.assert(finished_text(blocked) == "", "the active exchange was aborted")
+    while app:is_worker_alive(original) do timer.yield() end
+    while true do
+      local info? = app:pool_workers()[1]
+      if info ~= nil and info.id ~= original and info.alive then break end
+      timer.yield()
+    end
+  end)
+  test.assert(not app:stop_worker(original), "a stopped worker cannot be stopped again")
+  local replacement = (app:pool_workers()[1] as mk.WorkerInfo).id
+  within(5000, "replacement serves", function ()
+    test.assert(body_of(fetch_once(server.host, server.port, "/who")) == "" .. replacement,
+      "the replacement worker serves new requests")
+  end)
+  gate_tx:close()
+end
+
+function test_shutdown_with_blocked_pool_handler(_: test.Context)
+  local _gate_tx, gate_rx = thread.channel<|boolean|>(1)
+  local app = mk.App(mk.Config { workers = mk.WorkerMode.pool(mk.PoolOptions { size = 2 }),
+                                 shutdown_timeout_ms = 50 })
+  app:get("/block", function (ctx: mk.Context)
+    gate_rx:receive()
+    ctx:send_string("never")
+  end)
+  local server = app:listen_test()
+  local blocked = spawn_fetch(server.host, server.port, "/block")
+  timer.sleep(50)
+  within(5000, "shutdown with a blocked worker", function () server:close() end)
+  within(3000, "client released", function ()
+    test.assert(finished_text(blocked) == "", "the blocked exchange was aborted")
+  end)
+  test.assert(not app:is_running(), "app stopped")
+end
+
+function test_start_fails_when_pool_init_fails(_: test.Context)
+  local app = mk.App(mk.Config { workers = mk.WorkerMode.pool(mk.PoolOptions {
+    on_start = function (_: mk.WorkerContext) raise "init exploded" end,
+  }) })
+  app:get("/x", function (ctx: mk.Context) ctx:send_string("x") end)
+  local raised = false
+  within(5000, "failed start", function ()
+    do
+      app:listen_test()
+    catch
+      raised = true
+      test.assert(string.find(string.tostring(error), "init exploded") ~= nil,
+        "start reports the worker failure: " .. string.tostring(error))
+    end
+  end)
+  test.assert(raised, "start must fail when a pool worker cannot initialize")
+end

@@ -1,0 +1,343 @@
+-- Session workers: affinity, nil fallback, parent pre-dispatch errors,
+-- max_sessions, causal retire_worker with on_exit, ephemeral rerouting of
+-- unread queued exchanges, crashes, WebSocket takeover, and shutdown guards.
+local test = import "test"
+local async = import "async"
+local iteration = import "iteration"
+local net = import "net"
+local string = import "string"
+local thread = import "thread"
+local timer = import "timer"
+local websocket = import "websocket"
+local mk = import "mk"
+
+local function within(ms: integer, what: string, action: function (): ())
+  local worker = async.run<|nil, value|>(function (): nil
+    action()
+    return nil
+  end)
+  local deadline = async.run<|nil, value|>(function (): nil
+    timer.sleep(ms)
+    return nil
+  end)
+  defer do
+    if not deadline:status():has_finished() then deadline:cancel() end
+    if not worker:status():has_finished() then worker:cancel() end
+  end
+  case async.race_two(worker, deadline)
+  when first(status) then
+    local failed, failure? = status:has_failed()
+    if failed then failure:raise() end
+  when second() then
+    test.assert(false, what .. " did not finish within " .. ms .. " ms")
+  end
+end
+
+local function fetch_once(host: string, port: integer, target: string): string
+  local connection = net.connect(host, port)
+  defer connection:close()
+  connection:write("GET " .. target .. " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+  local out = string.writer()
+  do
+    for chunk in connection:read do out:write(chunk) end
+  catch
+  end
+  return out:drain()
+end
+
+local function status_of(text: string): string
+  return string.sub(text, 10, 12)
+end
+
+local function body_of(text: string): string
+  local split? = string.find(text, "\r\n\r\n")
+  if split == nil then return "" end
+  return string.sub(text, split + 4)
+end
+
+local function header_of(text: string, name: string): string?
+  local lowered = string.lower(name) .. ": "
+  for line in string.split(text, "\r\n") do
+    if line == "" then break end
+    if string.sub(string.lower(line), 1, #lowered) == lowered then
+      return string.sub(line, #lowered + 1)
+    end
+  end
+  return nil
+end
+
+local function spawn_fetch(host: string, port: integer, target: string): async.Task<|string, value|>
+  return async.run<|string, value|>(function (): string
+    return fetch_once(host, port, target)
+  end)
+end
+
+local function finished_text(task: async.Task<|string, value|>): string
+  case async.join(task)
+  when succeeded(text) then return text
+  else return "<task did not succeed>"
+  end
+end
+
+local function query_sid(meta: mk.RequestMeta): string?
+  return meta:query_opt("sid")
+end
+
+local function required_sid(meta: mk.RequestMeta): string?
+  local sid? = meta:query_opt("sid")
+  if sid == nil or sid == "" then raise mk.HttpError(400, "sid is required", "missing_sid") end
+  return sid
+end
+
+local function whoami(ctx: mk.Context)
+  ctx:send_string(ctx:worker_id() .. ":" .. (ctx:session_id() or "nil"))
+end
+
+function test_session_affinity_and_fallback(context: test.Context)
+  local app = mk.App()
+  local sessions = app:group_with("/s", mk.GroupOptions {
+    workers = mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid }),
+  })
+  sessions:get("/", whoami)
+  local server = app:listen_test()
+  context:cleanup(function () server:close() end)
+  context:run("same_session_same_worker", function (_: test.Context)
+    within(5000, "session requests", function ()
+      local a1 = body_of(fetch_once(server.host, server.port, "/s?sid=a"))
+      local b1 = body_of(fetch_once(server.host, server.port, "/s?sid=b"))
+      local a2 = body_of(fetch_once(server.host, server.port, "/s?sid=a"))
+      test.assert(a1 == a2 and a1 ~= b1, "affinity: " .. a1 .. " " .. b1 .. " " .. a2)
+      test.assert(string.sub(a1, -2) == ":a" and string.sub(b1, -2) == ":b", "session ids visible")
+      local info = sessions:session_worker("a") as mk.WorkerInfo
+      test.assert(a1 == info.id .. ":a" and info.alive, "session_worker reports the live worker")
+      test.assert(app:session_worker("b") ~= nil, "App:session_worker searches session dispatchers")
+      test.assert(#app:active_session_ids() == 2 and #sessions:active_session_ids() == 2,
+        "two active sessions")
+    end)
+  end)
+  context:run("nil_session_falls_back_to_root", function (_: test.Context)
+    within(5000, "fallback request", function ()
+      test.assert(body_of(fetch_once(server.host, server.port, "/s")) == "0:nil",
+        "nil selector runs on Config.workers (parent)")
+    end)
+  end)
+end
+
+function test_selector_errors_run_parent_pipeline(_: test.Context)
+  local app = mk.App(mk.Config { error_handler = function (ctx: mk.Context, err: mk.HttpError)
+    ctx:status(err.status):send_string("handled " .. err.message)
+  end })
+  app:use(function (ctx: mk.Context)
+    ctx:set("X-Global", "yes")
+    ctx:next()
+  end)
+  app:get("/relay", whoami):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = required_sid }))
+  local server = app:listen_test()
+  defer server:close()
+  within(5000, "rejected selector", function ()
+    local text = fetch_once(server.host, server.port, "/relay")
+    test.assert(status_of(text) == "400" and body_of(text) == "handled sid is required",
+      "selector error response: " .. text)
+    test.assert(header_of(text, "X-Global") == "yes", "global middleware ran around the failure")
+    test.assert(#app:active_session_ids() == 0, "no session worker was spawned")
+  end)
+end
+
+function test_max_sessions(_: test.Context)
+  local exited = 0
+  local app = mk.App()
+  app:get("/s", whoami):workers(mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid, max_sessions = 1,
+    on_exit = function (_: string, _worker: integer, _failed: boolean) exited = exited + 1 end,
+  }))
+  app:get("/retire", function (ctx: mk.Context)
+    ctx:retire_worker()
+    ctx:send_string("retired")
+  end):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid }))
+  local server = app:listen_test()
+  defer server:close()
+  within(5000, "max sessions", function ()
+    test.assert(status_of(fetch_once(server.host, server.port, "/s?sid=a")) == "200", "first session")
+    local full = fetch_once(server.host, server.port, "/s?sid=b")
+    test.assert(status_of(full) == "503", "second session rejected: " .. full)
+    test.assert(status_of(fetch_once(server.host, server.port, "/s?sid=a")) == "200",
+      "the existing session keeps working")
+  end)
+end
+
+function test_retire_worker_is_causal_and_reports_exit(_: test.Context)
+  local exits: {string} = {}
+  local app = mk.App()
+  local mode = mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid,
+    on_exit = function (session_id: string, worker_id: integer, failed: boolean)
+      local outcome = "ok"
+      if failed then outcome = "failed" end
+      exits[#exits + 1] = session_id .. ":" .. worker_id .. ":" .. outcome
+    end,
+  })
+  app:get("/who", whoami):workers(mode)
+  app:get("/retire", function (ctx: mk.Context)
+    ctx:retire_worker()
+    ctx:retire_worker()
+    ctx:send_string("retired " .. ctx:worker_id())
+  end):workers(mode)
+  local server = app:listen_test()
+  defer server:close()
+  within(5000, "retirement", function ()
+    local first = body_of(fetch_once(server.host, server.port, "/who?sid=r"))
+    local retired = body_of(fetch_once(server.host, server.port, "/retire?sid=r"))
+    local first_id = string.sub(first, 1, (string.find(first, ":") or 1) - 1)
+    test.assert(retired == "retired " .. first_id, "retire ran on the session worker")
+    test.assert(app:session_worker("r") == nil, "the session is detached before the response")
+    local next_one = body_of(fetch_once(server.host, server.port, "/who?sid=r"))
+    test.assert(next_one ~= first, "a fresh worker serves the session: " .. next_one)
+    while #exits == 0 do timer.yield() end
+    test.assert(exits[1] == "r:" .. first_id .. ":ok", "on_exit after join: " .. exits[1])
+  end)
+end
+
+function test_ephemeral_reroutes_unread_queued_exchanges(_: test.Context)
+  local gate_tx, gate_rx = thread.channel<|string|>(8)
+  local entered_tx, entered_rx = thread.channel<|integer|>(8)
+  local exits = 0
+  local app = mk.App()
+  app:get("/e", whoami):workers(mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid, ephemeral = true,
+    on_start = function (wctx: mk.WorkerContext)
+      entered_tx:send(wctx.id)
+      gate_rx:receive()
+    end,
+    on_exit = function (_: string, _worker: integer, _failed: boolean) exits = exits + 1 end,
+  }))
+  local server = app:listen_test()
+  defer server:close()
+  local clients: {async.Task<|string, value|>} = {}
+  for index = 1, 3 do clients[index] = spawn_fetch(server.host, server.port, "/e?sid=x") end
+  within(10000, "ephemeral rerouting", function ()
+    entered_rx:receive()
+    -- The three requests queue behind the first worker's blocked on_start.
+    timer.sleep(150)
+    for _ = 1, 3 do gate_tx:send("go") end
+    local seen: {string: boolean} = {}
+    for index = 1, 3 do
+      local text = finished_text(clients[index] as async.Task<|string, value|>)
+      test.assert(status_of(text) == "200", "client " .. index .. " served: " .. text)
+      seen[body_of(text)] = true
+    end
+    local distinct = 0
+    for _, _ in iteration.pairs(seen) do distinct = distinct + 1 end
+    test.assert(distinct == 3, "each queued exchange ran on its own ephemeral worker")
+    while exits < 3 do timer.yield() end
+  end)
+end
+
+function test_session_crash_discards_unread_exchanges(_: test.Context)
+  local gate_tx, gate_rx = thread.channel<|string|>(8)
+  local entered_tx, entered_rx = thread.channel<|integer|>(8)
+  local exits: {string} = {}
+  local app = mk.App()
+  app:get("/c", whoami):workers(mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid,
+    on_start = function (wctx: mk.WorkerContext)
+      entered_tx:send(wctx.id)
+      if gate_rx:receive() == "crash" then raise "session init crashed" end
+    end,
+    on_exit = function (_: string, worker_id: integer, failed: boolean)
+      local outcome = "ok"
+      if failed then outcome = "failed" end
+      exits[#exits + 1] = worker_id .. ":" .. outcome
+    end,
+  }))
+  local server = app:listen_test()
+  defer server:close()
+  local first = spawn_fetch(server.host, server.port, "/c?sid=k")
+  local second = spawn_fetch(server.host, server.port, "/c?sid=k")
+  within(10000, "crash with queued exchanges", function ()
+    local crashed_worker = entered_rx:receive()
+    timer.sleep(150)
+    gate_tx:send("crash")
+    test.assert(finished_text(first) == "", "first queued exchange disposed")
+    test.assert(finished_text(second) == "", "second queued exchange disposed")
+    while #exits == 0 do timer.yield() end
+    test.assert(exits[1] == crashed_worker .. ":failed", "on_exit reports the failure: " .. exits[1])
+    test.assert(not app:is_worker_alive(crashed_worker), "crashed worker is not alive")
+    gate_tx:send("ok")
+    local again = fetch_once(server.host, server.port, "/c?sid=k")
+    test.assert(status_of(again) == "200", "the session respawns on demand: " .. again)
+  end)
+end
+
+function test_websocket_takeover_abort_and_retire(context: test.Context)
+  local app = mk.App()
+  app:get("/ws", function (ctx: mk.Context)
+    local connection = ctx:upgrade_websocket()
+    while true do
+      local _kind?, data? = connection:read()
+      if data == nil then return end
+      if data == "abort" then
+        ctx:abort()
+        return
+      elseif data == "retire" then
+        ctx:retire_worker()
+        connection:write(websocket.TEXT, "retired " .. ctx:worker_id())
+      else
+        connection:write(websocket.TEXT, "echo " .. data .. " from " .. ctx:worker_id())
+      end
+    end
+  end):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid }))
+  app:get("/plain", function (ctx: mk.Context) ctx:send_string("plain") end)
+  local server = app:listen_test()
+  context:cleanup(function () server:close() end)
+  local url = "ws://127.0.0.1:" .. server.port .. "/ws?sid="
+  context:run("echo_and_retire", function (_: test.Context)
+    within(5000, "websocket session", function ()
+      local client = websocket.connect(url .. "w")
+      defer client:close()
+      client:write(websocket.TEXT, "hi")
+      local _kind?, echoed? = client:read()
+      local info = app:session_worker("w") as mk.WorkerInfo
+      test.assert(echoed == "echo hi from " .. info.id, "echo from the session worker")
+      client:write(websocket.TEXT, "retire")
+      local _kind2?, retired? = client:read()
+      test.assert(retired == "retired " .. info.id, "retire acknowledged inside the session")
+      test.assert(app:session_worker("w") == nil, "retirement detached the session immediately")
+    end)
+  end)
+  context:run("abort_tears_down_the_connection", function (_: test.Context)
+    within(5000, "websocket abort", function ()
+      local client = websocket.connect(url .. "a")
+      defer client:close()
+      client:write(websocket.TEXT, "abort")
+      local closed = false
+      do
+        local _kind?, data? = client:read()
+        closed = data == nil
+      catch
+        closed = true
+      end
+      test.assert(closed, "the aborted connection ends")
+      test.assert(body_of(fetch_once(server.host, server.port, "/plain")) == "plain", "server keeps serving")
+    end)
+  end)
+end
+
+function test_on_exit_cannot_deadlock_shutdown(_: test.Context)
+  local guarded = false
+  local app_box: {mk.App} = {}
+  local app = mk.App()
+  app_box[1] = app
+  app:get("/s", whoami):workers(mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid,
+    on_exit = function (_: string, _worker: integer, _failed: boolean)
+      do (app_box[1] as mk.App):shutdown() catch guarded = true end
+    end,
+  }))
+  local server = app:listen_test()
+  within(5000, "session request", function ()
+    test.assert(status_of(fetch_once(server.host, server.port, "/s?sid=z")) == "200", "session served")
+  end)
+  within(5000, "shutdown with live sessions", function () server:close() end)
+  test.assert(guarded, "App:shutdown() inside on_exit raised instead of deadlocking")
+  test.assert(#app:active_session_ids() == 0, "sessions retired at shutdown")
+end

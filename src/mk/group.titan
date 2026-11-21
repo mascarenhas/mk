@@ -1,0 +1,185 @@
+-- Route groups, chained route builders, and route handles.
+
+--- Options for `App:group_with` / `Group:group_with`.
+-- @field name Route-name prefix for routes registered in the group.
+-- @field workers Worker dispatcher for the group's routes.
+record GroupOptions
+  const name: string?
+  const workers: WorkerMode?
+end
+
+--- A path-prefixed registration scope sharing middleware and a worker mode.
+record Group
+  local app: App
+  local prefix: string
+  local name_prefix: string
+  local mode: WorkerMode?
+end
+
+--- A handle to one registered endpoint route.
+record RouteHandle
+  local app: App
+  local entry: Entry
+  local name_prefix: string
+end
+
+--- A builder registering several methods on one path.
+record RouteChain
+  local app: App
+  local path: string
+  local group: Group?
+end
+
+--- Name the route (prefixed by its group name) and notify `on_name` hooks.
+function RouteHandle:name(route_name: string): RouteHandle
+  self.app:check_open()
+  self.entry.name = self.name_prefix .. route_name
+  local info = self.entry:info()
+  local hooks = self.app.hooks_value.name_hooks
+  for index = 1, #hooks do
+    local hook = hooks[index]
+    hook(info)
+  end
+  return self
+end
+
+--- Assign this route to a worker dispatcher (before start/test).
+function RouteHandle:workers(mode: WorkerMode): RouteHandle
+  self.app:check_open()
+  self.entry.mode = mode
+  return self
+end
+
+function RouteHandle:info(): RouteInfo
+  return self.entry:info()
+end
+
+local function RouteChain:add_methods(methods: {string}, handler: Handler, ...: Handler): RouteChain
+  self.app:register(methods, self.path, self.group, handler, ...)
+  return self
+end
+
+function RouteChain:all(handler: Handler, ...: Handler): RouteChain
+  return self:add_methods({"*"}, handler, ...)
+end
+function RouteChain:get(handler: Handler, ...: Handler): RouteChain
+  return self:add_methods({"GET"}, handler, ...)
+end
+function RouteChain:head(handler: Handler, ...: Handler): RouteChain
+  return self:add_methods({"HEAD"}, handler, ...)
+end
+function RouteChain:post(handler: Handler, ...: Handler): RouteChain
+  return self:add_methods({"POST"}, handler, ...)
+end
+function RouteChain:put(handler: Handler, ...: Handler): RouteChain
+  return self:add_methods({"PUT"}, handler, ...)
+end
+function RouteChain:delete(handler: Handler, ...: Handler): RouteChain
+  return self:add_methods({"DELETE"}, handler, ...)
+end
+function RouteChain:connect(handler: Handler, ...: Handler): RouteChain
+  return self:add_methods({"CONNECT"}, handler, ...)
+end
+function RouteChain:options(handler: Handler, ...: Handler): RouteChain
+  return self:add_methods({"OPTIONS"}, handler, ...)
+end
+function RouteChain:trace(handler: Handler, ...: Handler): RouteChain
+  return self:add_methods({"TRACE"}, handler, ...)
+end
+function RouteChain:patch(handler: Handler, ...: Handler): RouteChain
+  return self:add_methods({"PATCH"}, handler, ...)
+end
+
+--- Register `handler` for each method in `methods`.
+function RouteChain:add(methods: {string}, handler: Handler, ...: Handler): RouteChain
+  for index = 1, #methods do
+    self.app:register({methods[index]}, self.path, self.group, handler, ...)
+  end
+  return self
+end
+
+--- A chain for `sub_path` below this chain's path.
+function RouteChain:route_chain(sub_path: string): RouteChain
+  return RouteChain(self.app, router.join_paths(self.path, sub_path), self.group)
+end
+
+--- Group middleware for every request below the group prefix.
+function Group:use(handler: Handler, ...: Handler): Group
+  self.app:register_middleware(self.prefix, handler, ...)
+  return self
+end
+
+--- Group middleware for requests below `prefix` within the group.
+function Group:use_path(prefix: string, handler: Handler, ...: Handler): Group
+  self.app:register_middleware(router.join_paths(self.prefix, prefix), handler, ...)
+  return self
+end
+
+function Group:group(prefix: string, ...: Handler): Group
+  return self.app:make_group(prefix, nil, self, ...)
+end
+
+function Group:group_with(prefix: string, options: GroupOptions, ...: Handler): Group
+  return self.app:make_group(prefix, options, self, ...)
+end
+
+function Group:route_chain(path: string): RouteChain
+  return RouteChain(self.app, router.join_paths(self.prefix, path), self)
+end
+
+function Group:get(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self.app:register({"GET"}, router.join_paths(self.prefix, path), self, handler, ...)
+end
+function Group:head(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self.app:register({"HEAD"}, router.join_paths(self.prefix, path), self, handler, ...)
+end
+function Group:post(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self.app:register({"POST"}, router.join_paths(self.prefix, path), self, handler, ...)
+end
+function Group:put(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self.app:register({"PUT"}, router.join_paths(self.prefix, path), self, handler, ...)
+end
+function Group:delete(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self.app:register({"DELETE"}, router.join_paths(self.prefix, path), self, handler, ...)
+end
+function Group:connect(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self.app:register({"CONNECT"}, router.join_paths(self.prefix, path), self, handler, ...)
+end
+function Group:options(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self.app:register({"OPTIONS"}, router.join_paths(self.prefix, path), self, handler, ...)
+end
+function Group:trace(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self.app:register({"TRACE"}, router.join_paths(self.prefix, path), self, handler, ...)
+end
+function Group:patch(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self.app:register({"PATCH"}, router.join_paths(self.prefix, path), self, handler, ...)
+end
+function Group:all(path: string, handler: Handler, ...: Handler): RouteHandle
+  return self.app:register({"*"}, router.join_paths(self.prefix, path), self, handler, ...)
+end
+
+function Group:add(methods: {string}, path: string, handler: Handler, ...: Handler): {RouteHandle}
+  local full = router.join_paths(self.prefix, path)
+  local handles: {RouteHandle} = {}
+  for index = 1, #methods do
+    handles[index] = self.app:register({methods[index]}, full, self, handler, ...)
+  end
+  return handles
+end
+
+--- Pool workers of the group's dispatcher.
+function Group:pool_workers(): const {WorkerInfo}
+  return self.app:dispatcher_for(self.mode):pool_infos()
+end
+
+function Group:pool_next_index(): integer
+  return self.app:dispatcher_for(self.mode).next_index
+end
+
+function Group:session_worker(session_id: string): WorkerInfo?
+  return self.app:dispatcher_for(self.mode):session_info(session_id)
+end
+
+function Group:active_session_ids(): const {string}
+  return self.app:dispatcher_for(self.mode):session_ids()
+end

@@ -1,0 +1,611 @@
+-- Worker modes, cross-state handler wrappers, exchange pipes, and the worker
+-- thread runtime. Parent-side supervision lives in app.titan.
+
+--- Selects a session id from read-only request metadata; nil falls back to
+-- `Config.workers` without spawning a session worker.
+type SessionExtractor = function (RequestMeta): (string?)
+
+--- Runs once in a worker's root Task before it serves requests.
+type WorkerInit = function (WorkerContext): ()
+
+--- Parent-only observer `(session_id, worker_id, failed)` run after a session
+-- worker's OS thread joined.
+type SessionExitHook = function (string, integer, boolean): ()
+
+--- Worker identity and cleanup registry passed to `on_start`.
+record WorkerContext
+  const id: integer
+  const session_id: string?
+  const logger: log.Logger?
+  local const cleanups: {function (): ()}
+end
+
+--- Register cleanup run (LIFO) when the worker thread exits.
+function WorkerContext:defer_cleanup(cleanup: function (): ())
+  self.cleanups[#self.cleanups + 1] = cleanup
+end
+
+--- Round-robin worker pool options.
+-- @field size Worker threads (default 1, must be >= 1).
+-- @field queue_capacity Queued exchanges per worker (default 128, >= 1).
+-- @field on_start Per-worker initializer.
+record PoolOptions
+  const size: integer?
+  const queue_capacity: integer?
+  const on_start: WorkerInit?
+end
+
+--- On-demand per-session worker options.
+-- @field session_id Selector over read-only RequestMeta.
+-- @field queue_capacity Queued exchanges per session worker (default 64, >= 1).
+-- @field max_sessions Optional active-session cap (503 when full).
+-- @field ephemeral Retire the worker around its first exchange.
+-- @field on_start Initializer run in each spawned session worker.
+-- @field on_exit Parent-only hook run after the worker thread joined.
+record SessionOptions
+  const session_id: SessionExtractor
+  const queue_capacity: integer?
+  const max_sessions: integer?
+  const ephemeral: boolean?
+  const on_start: WorkerInit?
+  const on_exit: SessionExitHook?
+end
+
+--- Where a route's requests execute.
+union WorkerMode
+  parent()
+  pool(options: PoolOptions?)
+  session(options: SessionOptions)
+end
+
+--- Cross-state wrapper for a `Handler` closure.
+record TransferableHandler
+  local const fn: Handler
+end
+
+function TransferableHandler.new(fn: Handler): TransferableHandler
+  return { fn = fn }
+end
+
+function TransferableHandler:call(ctx: Context)
+  self.fn(ctx)
+end
+
+function TransferableHandler:to_transfer_payload(): string
+  local policy = transfer.TransferValue.from_value(self.fn)
+  return protobuf.serialize(policy)
+end
+
+function TransferableHandler.from_transfer_payload(payload: string): TransferableHandler
+  local policy: transfer.TransferValue =
+    protobuf.deserialize_nominal(payload, "titan.transfer.TransferValue", true)
+  local restored: Handler = policy:to_value()
+  return TransferableHandler(restored)
+end
+
+--- Cross-state wrapper for an `ErrorHandler` closure.
+record TransferableErrorHandler
+  local const fn: ErrorHandler
+end
+
+function TransferableErrorHandler.new(fn: ErrorHandler): TransferableErrorHandler
+  return { fn = fn }
+end
+
+function TransferableErrorHandler:call(ctx: Context, err: HttpError)
+  self.fn(ctx, err)
+end
+
+function TransferableErrorHandler:to_transfer_payload(): string
+  local policy = transfer.TransferValue.from_value(self.fn)
+  return protobuf.serialize(policy)
+end
+
+function TransferableErrorHandler.from_transfer_payload(payload: string): TransferableErrorHandler
+  local policy: transfer.TransferValue =
+    protobuf.deserialize_nominal(payload, "titan.transfer.TransferValue", true)
+  local restored: ErrorHandler = policy:to_value()
+  return TransferableErrorHandler(restored)
+end
+
+--- Cross-state wrapper for a `WorkerInit` closure.
+record TransferableWorkerInit
+  local const fn: WorkerInit
+end
+
+function TransferableWorkerInit.new(fn: WorkerInit): TransferableWorkerInit
+  return { fn = fn }
+end
+
+function TransferableWorkerInit:call(wctx: WorkerContext)
+  self.fn(wctx)
+end
+
+function TransferableWorkerInit:to_transfer_payload(): string
+  local policy = transfer.TransferValue.from_value(self.fn)
+  return protobuf.serialize(policy)
+end
+
+function TransferableWorkerInit.from_transfer_payload(payload: string): TransferableWorkerInit
+  local policy: transfer.TransferValue =
+    protobuf.deserialize_nominal(payload, "titan.transfer.TransferValue", true)
+  local restored: WorkerInit = policy:to_value()
+  return TransferableWorkerInit(restored)
+end
+
+--- One detached `http.Exchange` payload queued for a worker or the parent.
+record ExchangeEnvelope
+  const payload: string
+  const method: string
+  const target: string
+  const route_id: integer
+  const session_id: string
+  const reroute_preserving_session: boolean
+end
+
+--- A reusable single-consumer exchange queue using only try_send/try_receive
+-- for payload ownership plus coalesced capacity-1 wake signals.
+record ExchangePipe
+  const data_tx: thread.Sender<|ExchangeEnvelope|>
+  const data_rx: thread.Receiver<|ExchangeEnvelope|>
+  const item_sig_tx: thread.Sender<|boolean|>
+  const item_sig_rx: thread.Receiver<|boolean|>
+  const space_sig_tx: thread.Sender<|boolean|>
+  const space_sig_rx: thread.Receiver<|boolean|>
+end
+
+local function ExchangePipe.create(capacity: integer): ExchangePipe
+  local data_tx, data_rx = thread.channel<|ExchangeEnvelope|>(capacity)
+  local item_tx, item_rx = thread.channel<|boolean|>(1)
+  local space_tx, space_rx = thread.channel<|boolean|>(1)
+  return ExchangePipe(data_tx, data_rx, item_tx, item_rx, space_tx, space_rx)
+end
+
+local function signal_try(sender: thread.Sender<|boolean|>)
+  do sender:try_send(true) catch end
+end
+
+--- Enqueue `env`. Returns `(true, nil)` once queued, or `(false, leftover)`
+-- when the pipe closed: the caller then solely owns the payload bytes. On
+-- cancellation the payload is discarded exactly once.
+function ExchangePipe:send_exchange(env: ExchangeEnvelope): (boolean, string?)
+  local owned_payload: string? = env.payload
+  local waited_for_space = false
+  defer do
+    local pending? = owned_payload
+    if pending ~= nil then
+      owned_payload = nil
+      do http.Exchange.discard_transfer_payload(pending) catch end
+      if waited_for_space then signal_try(self.space_sig_tx) end
+    end
+  end
+  while true do
+    async.checkpoint()
+    local queued = false
+    local closed = false
+    do
+      queued = self.data_tx:try_send(env)
+    catch
+      if error ~= "channel is closed" then raise end
+      closed = true
+    end
+    if closed then
+      local leftover? = owned_payload
+      owned_payload = nil
+      return false, leftover
+    end
+    if queued then
+      owned_payload = nil
+      if waited_for_space then signal_try(self.space_sig_tx) end
+      signal_try(self.item_sig_tx)
+      return true, nil
+    end
+    waited_for_space = true
+    case self.space_sig_rx:receive_result()
+    when closed() then
+      local leftover? = owned_payload
+      owned_payload = nil
+      return false, leftover
+    else
+    end
+  end
+end
+
+--- Single-consumer receive: adopt the next exchange, or `(nil, nil)` at EOF.
+function ExchangePipe:pop_and_adopt(): (ExchangeEnvelope?, http.Exchange?)
+  while true do
+    async.checkpoint()
+    local ok, env? = self.data_rx:try_receive()
+    if ok then
+      local exchange = http.Exchange.from_transfer_payload(env.payload)
+      signal_try(self.space_sig_tx)
+      return env, exchange
+    end
+    case self.item_sig_rx:receive_result()
+    when closed() then
+      local last_ok, last? = self.data_rx:try_receive()
+      if not last_ok then return nil, nil end
+      local exchange = http.Exchange.from_transfer_payload(last.payload)
+      signal_try(self.space_sig_tx)
+      return last, exchange
+    else
+    end
+  end
+end
+
+local function ExchangePipe:close_senders()
+  do self.data_tx:close() catch end
+  do self.space_sig_tx:close() catch end
+  do self.item_sig_tx:close() catch end
+end
+
+-- Synchronously discard every queued payload (parent-side final drain).
+local function ExchangePipe:discard_queued()
+  while true do
+    local ok, env? = self.data_rx:try_receive()
+    if not ok then return end
+    do http.Exchange.discard_transfer_payload(env.payload) catch end
+  end
+end
+
+--- Worker-to-parent notice: readiness after `on_start`, or a retirement request.
+record RetireNotice
+  const ready: boolean
+  const dispatcher_id: integer
+  const worker_id: integer
+  const session_id: string
+  const ack_tx: thread.Sender<|boolean|>?
+end
+
+--- One routing entry shipped to a worker (handlers only for reachable entries).
+record EntrySpec
+  const is_route: boolean
+  const methods: {string}
+  const pattern: string
+  const name: string
+  const group_prefix: string
+  const mount_path: string
+  const dispatcher_id: integer
+  const handlers: {TransferableHandler}
+end
+
+--- Scalar routing and policy settings shipped to a worker.
+record WorkerSettings
+  const app_name: string
+  const server_header: string
+  const case_sensitive: boolean
+  const strict_routing: boolean
+  const unescape_path: boolean
+  const auto_head: boolean
+  const trust_forwarded: boolean
+  const body_limit: integer
+  const json_max_depth: integer
+  const idle_timeout_ms: integer
+  const log_level: string
+end
+
+--- Everything one worker thread needs, scoped to its dispatcher.
+record WorkerBootstrap
+  const worker_id: integer
+  const dispatcher_id: integer
+  const root_dispatcher_id: integer
+  const session_id: string
+  const ephemeral: boolean
+  const settings: WorkerSettings
+  const entries: {EntrySpec}
+  const error_handler: TransferableErrorHandler
+  const on_start: TransferableWorkerInit?
+  const pipe: ExchangePipe
+  const return_pipe: ExchangePipe
+  const retire_tx: thread.Sender<|RetireNotice|>
+  const log_tx: thread.Sender<|string|>?
+end
+
+-- Single-waiter wake helper: callers loop on their own predicate.
+local record Signal
+  waiter: async.Task<|value, value|>?
+  token: async.ResumeToken
+end
+
+local function Signal.create(source: string): Signal
+  return Signal(nil, async.ResumeToken(source))
+end
+
+local function Signal:notify()
+  local waiter? = self.waiter
+  if waiter ~= nil then waiter:resume(self.token) end
+end
+
+local function Signal:wait()
+  local current = async.running()
+  self.waiter = current
+  defer if self.waiter == current then self.waiter = nil end
+  async.suspend(self.token)
+end
+
+local const PHASE_STARTING = 0
+local const PHASE_HANDLING = 1
+local const PHASE_IDLE = 2
+
+-- One adopted connection served by `Exchange:serve` on this state.
+local record ActiveExchange
+  exchange: http.Exchange
+  task: async.Task<|nil, value|>?
+  phase: integer
+  ctx: Context?
+end
+
+-- Serve an adopted exchange in a new Task. `on_done` runs after the serve
+-- body, or instead of it when the Task is cancelled before it starts, in
+-- which case the never-served transport is aborted.
+local function serve_adopted(active: ActiveExchange, handler: http.Handler,
+                             idle_timeout: integer,
+                             on_done: function (): ()): async.Task<|nil, value|>
+  local started = false
+  local task = async.run_with_cleanup<|nil, value|>(function (): nil
+    started = true
+    active.exchange:serve(handler, idle_timeout)
+    return nil
+  end, function (_: async.CancellationReason<|value|>?)
+    if not started then active.exchange.response:abort() end
+    on_done()
+  end, nil)
+  active.task = task
+  return task
+end
+
+-- Abort an active exchange's transport (owner-exempt) and cancel its Task.
+local function ActiveExchange:stop(reason: string)
+  local ctx? = self.ctx
+  if ctx ~= nil then ctx:force_abort() end
+  local task? = self.task
+  if task ~= nil then task:cancel(async.CancellationReason.simple(reason)) end
+end
+
+-- Per-thread worker runtime.
+local record WorkerState
+  core: Core
+  boot: WorkerBootstrap
+  wctx: WorkerContext
+  retiring: boolean
+  adopted_count: integer
+  active: {ActiveExchange: boolean}
+  changed: Signal
+end
+
+local function compile_spec(settings: WorkerSettings, spec: EntrySpec, route_id: integer): Entry
+  local handlers: {Handler} = {}
+  for index = 1, #spec.handlers do handlers[index] = spec.handlers[index].fn end
+  local options = router.PatternOptions(settings.case_sensitive, settings.strict_routing,
+    settings.unescape_path, not spec.is_route)
+  return Entry {
+    is_route = spec.is_route, methods = spec.methods, pattern = spec.pattern,
+    matcher = router.compile_pattern(spec.pattern, options), handlers = handlers,
+    name = spec.name, group_prefix = spec.group_prefix, mount_path = spec.mount_path,
+    mode = nil, dispatcher_id = spec.dispatcher_id, route_id = route_id,
+  }
+end
+
+local function WorkerState.create(boot: WorkerBootstrap): WorkerState
+  local settings = boot.settings
+  local session_id: string? = nil
+  if boot.session_id ~= "" then session_id = boot.session_id end
+  local logger? = log.forward(settings.log_level, boot.log_tx)
+  local server_header: string? = nil
+  if settings.server_header ~= "" then server_header = settings.server_header end
+  local core = Core {
+    app_name = settings.app_name, server_header = server_header,
+    case_sensitive = settings.case_sensitive, strict_routing = settings.strict_routing,
+    unescape_path = settings.unescape_path, auto_head = settings.auto_head,
+    trust_forwarded = settings.trust_forwarded, body_limit = settings.body_limit,
+    json_max_depth = settings.json_max_depth, idle_timeout_ms = settings.idle_timeout_ms,
+    error_handler = boot.error_handler.fn, logger = logger, entries = {}, routes = {},
+    closing = false, worker_id = boot.worker_id, session_id = session_id, worker = nil,
+    root_dispatcher_id = boot.root_dispatcher_id,
+  }
+  for index = 1, #boot.entries do
+    local spec = boot.entries[index]
+    local route_id = 0
+    if spec.is_route then route_id = #core.routes + 1 end
+    local entry = compile_spec(settings, spec, route_id)
+    core.entries[#core.entries + 1] = entry
+    if spec.is_route then core.routes[route_id] = entry end
+  end
+  local state = WorkerState {
+    core = core, boot = boot,
+    wctx = WorkerContext { id = boot.worker_id, session_id = session_id, logger = logger, cleanups = {} },
+    retiring = false, adopted_count = 0, active = {}, changed = Signal.create("mk.worker"),
+  }
+  core.worker = state
+  return state
+end
+
+-- Hand the current exchange back to the parent through the return pipe.
+local function WorkerState:return_exchange(request: http.Request, response: http.Response,
+                                          route_id: integer, session_id: string,
+                                          preserving: boolean)
+  async.yield()
+  local payload = http.Exchange(request, response):to_transfer_payload()
+  local env = ExchangeEnvelope(payload, request.method, request.target, route_id,
+                               session_id, preserving)
+  local accepted, leftover? = self.boot.return_pipe:send_exchange(env)
+  if not accepted and leftover ~= nil then
+    do http.Exchange.discard_transfer_payload(leftover) catch end
+  end
+end
+
+-- Handle one request of an adopted connection on this worker.
+local function WorkerState:handle(active: ActiveExchange, first: boolean,
+                                  request: http.Request, response: http.Response)
+  active.phase = PHASE_HANDLING
+  local core = self.core
+  local meta, raw_path, target_error? = core:meta(request.method, request.target,
+                                                 request.headers, request.url.scheme)
+  local route?, found?, head_fallback = core:classify(request.method, raw_path)
+  local chain_id = core.root_dispatcher_id
+  if route ~= nil then chain_id = route.dispatcher_id end
+  if not first then
+    local own = chain_id == self.boot.dispatcher_id
+    if self.retiring or core.closing or core.session_id ~= nil or not own then
+      self:return_exchange(request, response, 0, "", false)
+      return
+    end
+  end
+  if found ~= nil then meta.params_map = found.params end
+  local ctx = Context.create(core, meta, raw_path, target_error, chain_id, head_fallback)
+  ctx.raw_request = request
+  ctx.raw_response = response
+  ctx.owner_task = async.running()
+  active.ctx = ctx
+  do
+    if self.boot.ephemeral then
+      defer self:retire()
+      core:run_live(ctx)
+    else
+      core:run_live(ctx)
+    end
+  end
+  active.ctx = nil
+  active.phase = PHASE_IDLE
+  if self.retiring or core.closing then
+    -- Never wait for another keep-alive request on a retiring worker.
+    async.running():cancel(async.CancellationReason.simple("worker retiring"))
+  end
+end
+
+local function WorkerState:start_exchange(exchange: http.Exchange)
+  local active = ActiveExchange(exchange, nil, PHASE_STARTING, nil)
+  self.active[active] = true
+  local first = true
+  serve_adopted(active, function (request: http.Request, response: http.Response)
+    local is_first = first
+    first = false
+    self:handle(active, is_first, request, response)
+  end, self.core.idle_timeout_ms, function ()
+    self.active[active] = nil
+    self.changed:notify()
+  end)
+end
+
+-- Forward unstarted envelopes to the parent, preserving the session.
+local function WorkerState:forward_unstarted()
+  local pipe = self.boot.pipe
+  while true do
+    local ok, env? = pipe.data_rx:try_receive()
+    if not ok then return end
+    signal_try(pipe.space_sig_tx)
+    local accepted, leftover? = self.boot.return_pipe:send_exchange(ExchangeEnvelope(
+      env.payload, env.method, env.target, env.route_id, self.boot.session_id, true))
+    if not accepted and leftover ~= nil then
+      do http.Exchange.discard_transfer_payload(leftover) catch end
+    end
+  end
+end
+
+-- An ephemeral worker adopts exactly one exchange; later envelopes stay
+-- queued until retirement forwards them to the parent.
+local function WorkerState:may_adopt(): boolean
+  return not self.retiring and not (self.boot.ephemeral and self.adopted_count > 0)
+end
+
+-- Adopt and start the next queued exchange; false when none was taken.
+local function WorkerState:take_one(): boolean
+  if not self:may_adopt() then return false end
+  local pipe = self.boot.pipe
+  local ok, env? = pipe.data_rx:try_receive()
+  if not ok then return false end
+  local exchange = http.Exchange.from_transfer_payload(env.payload)
+  self.adopted_count = self.adopted_count + 1
+  self:start_exchange(exchange)
+  signal_try(pipe.space_sig_tx)
+  return true
+end
+
+-- Consume this worker's pipe until the parent closes it. A retiring worker
+-- forwards unstarted envelopes to the parent instead of adopting them.
+local function WorkerState:inbox_loop()
+  local pipe = self.boot.pipe
+  while true do
+    async.checkpoint()
+    if self.retiring then self:forward_unstarted() end
+    if not self:take_one() then
+      case pipe.item_sig_rx:receive_result()
+      when closed() then
+        if self.retiring then
+          self:forward_unstarted()
+        else
+          while self:take_one() do end
+        end
+        return
+      else
+      end
+    end
+  end
+end
+
+-- Wait until every adopted connection finished.
+local function WorkerState:await_idle()
+  while next_active(self.active) do self.changed:wait() end
+end
+
+local function next_active(active: {ActiveExchange: boolean}): boolean
+  local key?, _present? = iteration.next(active, nil)
+  return key ~= nil
+end
+
+--- Immediate, idempotent session retirement requested from a handler.
+local function WorkerState:retire()
+  if self.retiring or self.core.session_id == nil then return end
+  self.retiring = true
+  for active, _ in iteration.pairs(self.active) do
+    if active.phase == PHASE_IDLE then active:stop("worker retiring") end
+  end
+  local ack_tx, ack_rx = thread.channel<|boolean|>(1)
+  local notice = RetireNotice(false, self.boot.dispatcher_id, self.boot.worker_id,
+                              self.boot.session_id, ack_tx)
+  local retire_tx = self.boot.retire_tx
+  async.run<|nil, value|>(function (): nil
+    do retire_tx:send(notice) catch ack_tx:close() end
+    return nil
+  end)
+  ack_rx:receive_result()
+end
+
+-- Root-Task teardown: abort active transports first, cancel and join their
+-- Tasks, then run worker cleanups LIFO.
+local function WorkerState:close_down()
+  self.core.closing = true
+  local tasks: {async.Task<|nil, value|>} = {}
+  for active, _ in iteration.pairs(self.active) do
+    active:stop("worker stopping")
+    local task? = active.task
+    if task ~= nil then tasks[#tasks + 1] = task end
+  end
+  for index = 1, #tasks do await_terminal(tasks[index]) end
+  local cleanups = self.wctx.cleanups
+  for index = #cleanups, 1, -1 do
+    local cleanup = cleanups[index]
+    -- Every cleanup runs even while the root Task unwinds from cancellation.
+    do cleanup()
+    catch
+      if not (error is async.CancellationReason) then
+        log.emit(self.core.logger, "error", "worker_cleanup_failed",
+          {["worker_id"] = self.boot.worker_id, ["error"] = string.tostring(error)})
+      end
+    end
+  end
+  local logger? = self.core.logger
+  if logger ~= nil then logger:close() end
+end
+
+-- OS-thread entry for pool and session workers.
+local function worker_entry(boot: WorkerBootstrap): nil
+  local state = WorkerState.create(boot)
+  defer state:close_down()
+  local init? = boot.on_start
+  if init ~= nil then init:call(state.wctx) end
+  boot.retire_tx:send(RetireNotice(true, boot.dispatcher_id, boot.worker_id, boot.session_id, nil))
+  state:inbox_loop()
+  state:await_idle()
+  return nil
+end

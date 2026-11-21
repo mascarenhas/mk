@@ -1,0 +1,69 @@
+-- JSON-only request body binding with HTTP error classification.
+
+--- JSON request-body binder obtained from `Context:bind()`.
+record Bind
+  local ctx: Context
+end
+
+-- json.Error codes that report a programmer schema or option bug.
+local const PROGRAMMER_ERROR_CODES: {string: boolean} = {
+  ["unknown_type"] = true, ["constructor_unavailable"] = true,
+  ["unsupported_type"] = true, ["invalid_option"] = true,
+}
+
+-- json.Error codes that report a well-formed document violating the schema.
+local const SCHEMA_ERROR_CODES: {string: boolean} = {
+  ["type_mismatch"] = true, ["missing_field"] = true, ["unknown_field"] = true,
+  ["invalid_union"] = true, ["unknown_variant"] = true, ["non_integral"] = true,
+}
+
+-- 415 without a JSON Content-Type, 413 over body_limit, 400 for an empty or
+-- malformed body, 422 for schema mismatches; programmer errors re-raise.
+local function Bind:decode(schema: reflect.Type?, ...: json.DecodeOption): value
+  local ctx = self.ctx
+  if not ctx:is_json() then
+    raise HttpError(415, "Unsupported Media Type", "unsupported_media_type", nil)
+  end
+  local body = ctx:body()
+  if body == "" then
+    raise HttpError(400, "empty JSON request body", "empty_body", nil)
+  end
+  local result: value = nil
+  do
+    result = json.decode(body, schema,
+      json.DecodeOption.max_depth(ctx.core.json_max_depth),
+      json.DecodeOption.max_bytes(ctx.core.body_limit), ...)
+  catch
+    if not (error is json.Error) then raise end
+    local failure = error as json.Error
+    local code = failure.code
+    if PROGRAMMER_ERROR_CODES[code] then raise end
+    if SCHEMA_ERROR_CODES[code] or
+        (schema ~= nil and (code == "integer_range" or code == "number_range")) then
+      raise HttpError(422, failure.message, code, failure)
+    end
+    raise HttpError(400, failure.message, code, failure)
+  end
+  return result
+end
+
+--- Decode the body, optionally against a reflected schema.
+function Bind:json(schema: reflect.Type?, ...: json.DecodeOption): value
+  return self:decode(schema, ...)
+end
+
+--- Decode the body as the initialized nominal type `type_name` (e.g. "app.User").
+function Bind:named(type_name: string, ...: json.DecodeOption): value
+  return self:decode(reflect.Type.is_named(reflect.NamedType(type_name)), ...)
+end
+
+--- Decode the body as a JSON object.
+function Bind:object(...: json.DecodeOption): {string: value}
+  return self:decode(reflect.Type.is_map(reflect.Type.is_string(), reflect.Type.is_value()), ...)
+end
+
+--- Decode the body as a JSON array.
+function Bind:array(...: json.DecodeOption): {value}
+  return self:decode(reflect.Type.is_array(reflect.ArrayTypeConstness.is_mutable(),
+    reflect.Type.is_value()), ...)
+end

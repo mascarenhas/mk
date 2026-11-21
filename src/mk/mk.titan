@@ -1,0 +1,25 @@
+--- GoFiber-inspired HTTP micro-framework: routing, Context, and worker threads.
+-- Folder module `mk`: this main owns the shared imports; `app`, `bind`,
+-- `context`, `errors`, `group`, `hooks`, `mime`, `testing`, and `workers`
+-- contribute declarations to the same module scope.
+-- @module mk
+
+local async = import "async"
+local fs = import "fs"
+local http = import "http"
+local io = import "io"
+local iteration = import "iteration"
+local json = import "json"
+local math = import "math"
+local net = import "net"
+local os = import "os"
+local protobuf = import "protobuf"
+local reflect = import "reflect"
+local string = import "string"
+local thread = import "thread"
+local timer = import "timer"
+local transfer = import "transfer"
+local uv = import "uv"
+local websocket = import "websocket"
+local log = import "mk.log"
+local router = import "mk.router"
