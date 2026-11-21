@@ -372,6 +372,7 @@ local record WorkerState
   boot: WorkerBootstrap
   wctx: WorkerContext
   retiring: boolean
+  retire_task: async.Task<|nil, value|>?
   adopted_count: integer
   active: {ActiveExchange: boolean}
   changed: Signal
@@ -418,7 +419,8 @@ local function WorkerState.create(boot: WorkerBootstrap): WorkerState
   local state = WorkerState {
     core = core, boot = boot,
     wctx = WorkerContext { id = boot.worker_id, session_id = session_id, logger = logger, cleanups = {} },
-    retiring = false, adopted_count = 0, active = {}, changed = Signal.create("mk.worker"),
+    retiring = false, retire_task = nil, adopted_count = 0, active = {},
+    changed = Signal.create("mk.worker"),
   }
   core.worker = state
   return state
@@ -557,22 +559,35 @@ local function next_active(active: {ActiveExchange: boolean}): boolean
   return key ~= nil
 end
 
---- Immediate, idempotent session retirement requested from a handler.
+--- Immediate, idempotent session retirement requested from a handler (or
+-- the ephemeral wrapper). The first call starts one retirement Task; every
+-- caller, even a cancelled one, waits for it cancellation-insensitively, so
+-- the parent has detached the session before any caller returns.
 local function WorkerState:retire()
-  if self.retiring or self.core.session_id == nil then return end
-  self.retiring = true
-  for active, _ in iteration.pairs(self.active) do
-    if active.phase == PHASE_IDLE then active:stop("worker retiring") end
+  if self.core.session_id == nil then return end
+  if not self.retiring then
+    self.retiring = true
+    for active, _ in iteration.pairs(self.active) do
+      if active.phase == PHASE_IDLE then active:stop("worker retiring") end
+    end
+    local ack_tx, ack_rx = thread.channel<|boolean|>(1)
+    local notice = RetireNotice(false, self.boot.dispatcher_id, self.boot.worker_id,
+                                self.boot.session_id, ack_tx)
+    local retire_tx = self.boot.retire_tx
+    self.retire_task = async.run<|nil, value|>(function (): nil
+      do
+        retire_tx:send(notice)
+      catch
+        if error is async.CancellationReason then raise end
+        -- The parent stopped listening (shutdown): nothing will acknowledge.
+        ack_tx:close()
+      end
+      ack_rx:receive_result()
+      return nil
+    end)
   end
-  local ack_tx, ack_rx = thread.channel<|boolean|>(1)
-  local notice = RetireNotice(false, self.boot.dispatcher_id, self.boot.worker_id,
-                              self.boot.session_id, ack_tx)
-  local retire_tx = self.boot.retire_tx
-  async.run<|nil, value|>(function (): nil
-    do retire_tx:send(notice) catch ack_tx:close() end
-    return nil
-  end)
-  ack_rx:receive_result()
+  local task? = self.retire_task
+  if task ~= nil then await_terminal(task) end
 end
 
 -- Root-Task teardown: abort active transports first, cancel and join their
@@ -586,6 +601,8 @@ local function WorkerState:close_down()
     if task ~= nil then tasks[#tasks + 1] = task end
   end
   for index = 1, #tasks do await_terminal(tasks[index]) end
+  local retire_task? = self.retire_task
+  if retire_task ~= nil then await_terminal(retire_task) end
   local cleanups = self.wctx.cleanups
   for index = #cleanups, 1, -1 do
     local cleanup = cleanups[index]

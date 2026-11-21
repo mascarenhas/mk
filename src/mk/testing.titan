@@ -158,6 +158,7 @@ function App:test(req: TestRequest, config: TestConfig?): TestResponse
       end)
       defer if not deadline:status():has_finished() then
         deadline:cancel(async.CancellationReason.simple("App:test finished"))
+        await_terminal(deadline)
       end
       case async.race_two(runner, deadline)
       when second() then timed_out = true
@@ -188,6 +189,9 @@ end
 -- (64 candidates, retrying only EADDRINUSE) and serve it in a Task.
 function App:listen_test(host: string?, listen_config: ListenConfig?): TestServer
   local bind_host = host or "127.0.0.1"
+  if strings.sub(bind_host, 1, 1) == "[" and strings.sub(bind_host, -1) == "]" then
+    bind_host = strings.sub(bind_host, 2, #bind_host - 1)
+  end
   local url_host = bind_host
   if strings.find(bind_host, ":") then url_host = "[" .. bind_host .. "]" end
   local scheme = "http"

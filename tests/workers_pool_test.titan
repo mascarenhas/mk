@@ -345,12 +345,14 @@ end
 
 function test_pool_worker_exit_fails_the_app(_: test.Context)
   local _gate_tx, gate_rx = thread.channel<|boolean|>(1)
+  local entered_tx, entered_rx = thread.channel<|integer|>(1)
   local post_failure = "none"
   local app = mk.App(mk.Config { workers = mk.WorkerMode.pool(mk.PoolOptions { size = 2 }) })
   app:hooks():on_post_shutdown(function (failure: async.Error?)
     if failure ~= nil then post_failure = strings.tostring(failure.error) end
   end)
   app:get("/block", function (ctx: mk.Context)
+    entered_tx:send(ctx:worker_id())
     gate_rx:receive()
     ctx:send_string("never")
   end)
@@ -359,7 +361,9 @@ function test_pool_worker_exit_fails_the_app(_: test.Context)
   local victim = (infos[1] as mk.WorkerInfo).id
   local survivor = (infos[2] as mk.WorkerInfo).id
   local blocked = spawn_fetch("127.0.0.1", port, "/block")
-  timer.sleep(50)
+  within(3000, "handler entry", function ()
+    test.assert(entered_rx:receive() == victim, "the first request ran on the first worker")
+  end)
   test.assert(app:stop_worker(victim), "stop_worker accepted a live pool worker")
   local expected = "mk: pool worker " .. victim .. " was cancelled"
   within(5000, "forced shutdown", function ()
@@ -419,15 +423,17 @@ end
 
 function test_shutdown_with_blocked_pool_handler(_: test.Context)
   local _gate_tx, gate_rx = thread.channel<|boolean|>(1)
+  local entered_tx, entered_rx = thread.channel<|boolean|>(1)
   local app = mk.App(mk.Config { workers = mk.WorkerMode.pool(mk.PoolOptions { size = 2 }),
                                  shutdown_timeout_ms = 50 })
   app:get("/block", function (ctx: mk.Context)
+    entered_tx:send(true)
     gate_rx:receive()
     ctx:send_string("never")
   end)
   local server = app:listen_test()
   local blocked = spawn_fetch(server.host, server.port, "/block")
-  timer.sleep(50)
+  within(3000, "handler entry", function () entered_rx:receive() end)
   within(5000, "shutdown with a blocked worker", function () server:close() end)
   within(3000, "client released", function ()
     test.assert(finished_text(blocked) == "", "the blocked exchange was aborted")
@@ -451,4 +457,78 @@ function test_start_fails_when_pool_init_fails(_: test.Context)
     end
   end)
   test.assert(raised, "start must fail when a pool worker cannot initialize")
+end
+
+local function header_line(text: string, name: string): string?
+  local wanted = strings.lower(name) .. ": "
+  for line in strings.split(text, "\r\n") do
+    if line == "" then break end
+    if strings.sub(strings.lower(line), 1, #wanted) == wanted then return strings.sub(line, #wanted + 1) end
+  end
+  return nil
+end
+
+function test_parameterized_middleware_reaches_workers(context: test.Context)
+  local app = mk.App()
+  local pooled = mk.WorkerMode.pool()
+  -- Parameterized prefixes must still ship their middleware to the workers.
+  app:use_path("/api/:version", function (ctx: mk.Context)
+    ctx:set("X-Auth", "checked")
+    ctx:next()
+  end)
+  local worlds = app:group_with("/worlds/:world", mk.GroupOptions { workers = pooled },
+    function (ctx: mk.Context)
+      ctx:set("X-World", "guarded")
+      ctx:next()
+    end)
+  worlds:get("/actors/:id", function (ctx: mk.Context) ctx:send_string("actor " .. ctx:worker_id()) end)
+  app:get("/api/v1/items", function (ctx: mk.Context) ctx:send_string("items " .. ctx:worker_id()) end)
+    :workers(pooled)
+  app:use_path("/other/A", function (ctx: mk.Context)
+    ctx:set("X-Escaped", "yes")
+    ctx:next()
+  end)
+  app:get("/other/%41", function (ctx: mk.Context) ctx:send_string("escaped " .. ctx:worker_id()) end)
+    :workers(pooled)
+  local server = app:listen_test()
+  context:cleanup(function () server:close() end)
+  local worker = (worlds:pool_workers()[1] as mk.WorkerInfo).id
+  context:run("use_path_with_parameter", function (_: test.Context)
+    within(5000, "request", function ()
+      local text = fetch_once(server.host, server.port, "/api/v1/items")
+      test.assert(body_of(text) == "items " .. worker, "pool route served: " .. text)
+      test.assert(header_line(text, "X-Auth") == "checked", "parameterized use_path ran on the worker")
+    end)
+  end)
+  context:run("group_with_parameter", function (_: test.Context)
+    within(5000, "request", function ()
+      local text = fetch_once(server.host, server.port, "/worlds/w1/actors/7")
+      test.assert(body_of(text) == "actor " .. worker, "group route served: " .. text)
+      test.assert(header_line(text, "X-World") == "guarded", "parameterized group middleware ran")
+    end)
+  end)
+  context:run("percent_escaped_route_literal", function (_: test.Context)
+    within(5000, "request", function ()
+      local text = fetch_once(server.host, server.port, "/other/A")
+      test.assert(body_of(text) == "escaped " .. worker, "escaped route served: " .. text)
+      test.assert(header_line(text, "X-Escaped") == "yes", "middleware overlapping an escape ran")
+    end)
+  end)
+end
+
+function test_mount_keeps_sub_app_workers(_: test.Context)
+  local sub = mk.App(mk.Config { workers = mk.WorkerMode.pool() })
+  sub:get("/who", function (ctx: mk.Context) ctx:send_string("" .. ctx:worker_id()) end)
+  local app = mk.App()
+  app:mount("/sub", sub)
+  app:get("/who", function (ctx: mk.Context) ctx:send_string("" .. ctx:worker_id()) end)
+  local route = app:routes()[1] as mk.RouteInfo
+  test.assert(route.group_prefix == "", "mounting does not invent a group prefix")
+  local server = app:listen_test()
+  defer server:close()
+  within(5000, "mounted requests", function ()
+    test.assert(body_of(fetch_once(server.host, server.port, "/who")) == "0", "root route on the parent")
+    local mounted = body_of(fetch_once(server.host, server.port, "/sub/who"))
+    test.assert(mounted ~= "0" and mounted ~= "", "mounted route kept the sub app's pool: " .. mounted)
+  end)
 end

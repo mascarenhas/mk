@@ -1,8 +1,11 @@
 -- Context accessors, cookies, response builders, framing, streaming, commit,
 -- run_with_timeout, and JSON Bind error classification (in-memory).
 local test = import "test"
+local async = import "async"
+local fs = import "fs"
 local http = import "http"
 local json = import "json"
+local os = import "os"
 local reflect = import "reflect"
 local strings = import "string"
 local timer = import "timer"
@@ -412,4 +415,137 @@ function test_in_memory_test_timeout(context: test.Context)
     local response = app:test(mk.TestRequest("GET", "/hang"), mk.TestConfig(30, false))
     test.assert(response.status == 0, "no response was committed")
   end)
+end
+
+local function raises(action: function (): ()): string
+  do
+    action()
+  catch
+    return strings.tostring(error)
+  end
+  return ""
+end
+
+function test_head_keeps_declared_length(_: test.Context)
+  local app = mk.App()
+  app:head("/size", function (ctx: mk.Context) ctx:set("Content-Length", "42") end)
+  local response = call(app, "HEAD", "/size")
+  test.assert(response.body == "" and response:header("Content-Length") == "42",
+    "an explicit HEAD Content-Length is kept: " .. (response:header("Content-Length") or "nil"))
+end
+
+function test_accepts_quality_rules(context: test.Context)
+  local app = mk.App()
+  app:get("/a", function (ctx: mk.Context)
+    ctx:send_string(ctx:accepts({"json", "text/plain"}) or "none")
+  end)
+  local accept = function (header: string): string
+    return call(app, "GET", "/a", {"Accept", header}).body
+  end
+  context:run("zero_quality_excludes", function (_: test.Context)
+    test.assert(accept("application/json;q=0, */*;q=0.5") == "text/plain", "q=0 excludes json")
+    test.assert(accept("application/json;Q=0, text/plain;q=0") == "none", "uppercase Q and no offer left")
+  end)
+  context:run("most_specific_range_wins", function (_: test.Context)
+    test.assert(accept("*/*;q=0.8, application/json;q=0.1") == "text/plain",
+      "the specific json range lowers json below the wildcard")
+    test.assert(accept("text/*;q=0.3, application/*;q=0.9") == "json", "type wildcards")
+  end)
+end
+
+function test_cookie_attributes_reject_injection(_: test.Context)
+  local app = mk.App()
+  app:get("/path", function (ctx: mk.Context)
+    ctx:set_cookie(mk.Cookie { name = "a", value = "b", path = "/; Secure" })
+  end)
+  app:get("/domain", function (ctx: mk.Context)
+    ctx:set_cookie(mk.Cookie { name = "a", value = "b", domain = "example.com\r\nX: y" })
+  end)
+  test.assert(raises(function () call(app, "GET", "/path") end) == "mk: invalid cookie path",
+    "a path cannot inject attributes")
+  test.assert(raises(function () call(app, "GET", "/domain") end) == "mk: invalid cookie domain",
+    "a domain cannot inject attributes")
+end
+
+function test_body_limit_is_sticky(_: test.Context)
+  local app = mk.App(mk.Config { body_limit = 4 })
+  app:post("/twice", function (ctx: mk.Context)
+    local first = "ok"
+    do ctx:body() catch first = "413" end
+    test.assert(first == "413", "the first read overflows")
+    ctx:send_string("second read " .. ctx:body())
+  end)
+  local response = call(app, "POST", "/twice", nil, "123456")
+  test.assert(response.status == 413, "a repeated read after a caught 413 raises 413 again")
+end
+
+function test_misc_accessor_rules(context: test.Context)
+  local app = mk.App()
+  app:get("/float", function (ctx: mk.Context) ctx:send_string("" .. ctx:query_float("r", 0.0)) end)
+  app:get("/vary", function (ctx: mk.Context)
+    ctx:append("Vary", "A"):append("Vary", "B, C"):vary("c", "D")
+  end)
+  app:get("/stream", function (ctx: mk.Context) ctx:send_stream(strings.reader("x"), -1) end)
+  context:run("non_finite_float_is_400", function (_: test.Context)
+    expect_status(call(app, "GET", "/float?r=1e999"), 400, "infinite float")
+    test.assert(call(app, "GET", "/float?r=2.5").body == "2.5", "finite float")
+  end)
+  context:run("vary_merges_every_line", function (_: test.Context)
+    test.assert(call(app, "GET", "/vary"):header("Vary") == "A, B, C, D", "merged Vary")
+  end)
+  context:run("negative_stream_length_raises", function (_: test.Context)
+    test.assert(raises(function () call(app, "GET", "/stream") end) ==
+      "mk: send_stream content_length must be non-negative", "negative length rejected")
+  end)
+end
+
+function test_send_file(context: test.Context)
+  local file_path = fs.tmpdir() .. "/mk-send-file-" .. os.pid() .. ".json"
+  fs.write_file(file_path, "{\"a\":1}")
+  context:cleanup(function () fs.unlink(file_path) end)
+  local app = mk.App()
+  app:get("/file", function (ctx: mk.Context) ctx:send_file(file_path) end)
+  app:get("/download", function (ctx: mk.Context) ctx:send_file(file_path, true) end)
+  app:get("/missing", function (ctx: mk.Context) ctx:send_file(file_path .. ".absent") end)
+  context:run("content_and_type", function (_: test.Context)
+    local response = call(app, "GET", "/file")
+    test.assert(response.body == "{\"a\":1}", "file body")
+    test.assert(response:header("Content-Type") == "application/json; charset=utf-8", "json type")
+    test.assert(response:header("Content-Length") == "7", "declared file size")
+  end)
+  context:run("download_attachment", function (_: test.Context)
+    local disposition = call(app, "GET", "/download"):header("Content-Disposition") or ""
+    test.assert(disposition == "attachment; filename=\"mk-send-file-" .. os.pid() .. ".json\"",
+      "attachment disposition: " .. disposition)
+  end)
+  context:run("missing_is_404", function (_: test.Context)
+    expect_status(call(app, "GET", "/missing"), 404, "missing file")
+  end)
+end
+
+function test_run_with_timeout_revokes_ownership(_: test.Context)
+  local rogues: {async.Task<|string, value|>} = {}
+  local app = mk.App()
+  app:get("/revoke", function (ctx: mk.Context)
+    ctx:run_with_timeout(20, function (inner: mk.Context)
+      -- A Task the action leaked tries to write after the deadline.
+      rogues[1] = async.run<|string, value|>(function (): string
+        timer.sleep(80)
+        do inner:send_string("late") catch return strings.tostring(error) end
+        return "wrote"
+      end)
+      timer.sleep(2000)
+    end, function (inner: mk.Context)
+      inner:status(504):send_string("timed out")
+    end)
+  end)
+  local response = call(app, "GET", "/revoke")
+  test.assert(response.status == 504 and response.body == "timed out", "on_timeout owns the Context")
+  local rogue = rogues[1]
+  local outcome = ""
+  case async.join(rogue)
+  when succeeded(text) then outcome = text
+  else
+  end
+  test.assert(outcome == "context ownership revoked", "late write rejected: " .. outcome)
 end

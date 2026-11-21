@@ -242,10 +242,19 @@ end
 
 local const COOKIE_NAME_PATTERN = "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
 local const COOKIE_VALUE_FORBIDDEN = "[\0-\32\34\44\59\127\\\\]"
+-- Attribute values must not end the attribute (`;`) or carry controls.
+local const COOKIE_ATTRIBUTE_FORBIDDEN = "[\0-\31\59\127]"
 
 local function http_date(unix: integer): string
   local formatted: string = os.date("!%a, %d %b %Y %H:%M:%S GMT", unix)
   return formatted
+end
+
+local function cookie_attribute(subject: string, text: string): string
+  if strings.match(text, COOKIE_ATTRIBUTE_FORBIDDEN) then
+    raise "mk: invalid cookie " .. subject
+  end
+  return text
 end
 
 local function Cookie:render(): string
@@ -257,8 +266,9 @@ local function Cookie:render(): string
   end
   local out = strings.writer()
   out:write(self.name .. "=" .. self.value)
-  out:write("; Path=" .. (self.path or "/"))
-  if self.domain then out:write("; Domain=" .. self.domain) end
+  out:write("; Path=" .. cookie_attribute("path", self.path or "/"))
+  local domain? = self.domain
+  if domain ~= nil then out:write("; Domain=" .. cookie_attribute("domain", domain)) end
   local max_age? = self.max_age
   if max_age ~= nil then
     if max_age < 0 then
@@ -326,6 +336,7 @@ record Context
   local body_cache: string?
   local body_read: integer
   local body_done: boolean
+  local body_overflow: boolean
   local terminal_error: HttpError?
   local upgrade_offer: boolean
 end
@@ -402,9 +413,12 @@ local function Context.create(core: Core, meta: RequestMeta, raw_path: string,
     upgraded_ws = nil, before_commit_hooks = {}, complete_hooks = {},
     last_err = nil, start_ns = uv.hrtime(), deadline = nil,
     owner_task = nil, in_socket_io = false, close_after_response = false,
-    body_cache = nil, body_read = 0, body_done = false, terminal_error = nil,
-    upgrade_offer = #meta.headers:values("Upgrade") > 0 or
-      headers_have_token(meta.headers, "Connection", "upgrade"),
+    body_cache = nil, body_read = 0, body_done = false, body_overflow = false,
+    terminal_error = nil,
+    -- llhttp also treats CONNECT as an upgrade: its body is never readable.
+    upgrade_offer = meta.headers:get("Upgrade") ~= nil or meta.method == "CONNECT" or
+      (meta.headers:get("Connection") ~= nil and
+       headers_have_token(meta.headers, "Connection", "upgrade")),
   }
 end
 
@@ -470,10 +484,13 @@ end
 --- Restart matching from the first entry for the current request.
 function Context:restart_routing()
   self:own()
-  local route?, _match?, head_fallback = self.core:classify(self.meta.method, self.raw_path)
+  local route?, found?, head_fallback = self.core:classify(self.meta.method, self.raw_path)
   if route ~= nil and route.dispatcher_id ~= self.dispatcher_id then
     raise HttpError(500, "cannot restart routing across worker dispatchers", nil, nil)
   end
+  local params: {string: string} = {}
+  if found ~= nil then params = found.params end
+  self.params_map = params
   self.head_fallback = head_fallback
   self.entry_index = 0
   self.current_entry = nil
@@ -769,7 +786,8 @@ function Context:query_int(name: string, default_val: integer?): integer
   return integer_or_400(self.meta.target.query[name], default_val, "query " .. name)
 end
 
---- Float query value; raises HttpError(400) when missing (without default) or malformed.
+--- Finite float query value; raises HttpError(400) when missing (without
+-- default), malformed, or not finite.
 function Context:query_float(name: string, default_val: float?): float
   local text? = self.meta.target.query[name]
   if text == nil or text == "" then
@@ -777,10 +795,12 @@ function Context:query_float(name: string, default_val: float?): float
     raise HttpError(400, "query " .. name .. " is required", "invalid_parameter", nil)
   end
   local parsed? = math.tonumber(text)
-  if parsed == nil then
-    raise HttpError(400, "query " .. name .. " must be a number", "invalid_parameter", nil)
+  local number = 0.0
+  if parsed ~= nil then number = parsed as float end
+  if parsed == nil or number ~= number or number == math.huge or number == -math.huge then
+    raise HttpError(400, "query " .. name .. " must be a finite number", "invalid_parameter", nil)
   end
-  return parsed as float
+  return number
 end
 
 --- Boolean query value ("true"/"1"/"yes"/"on" or "false"/"0"/"no"/"off").
@@ -834,7 +854,7 @@ end
 function Context:is_json(): boolean
   local media = self:media_type()
   return media == "application/json" or
-    (#media > 5 and strings.sub(media, -5) == "+json")
+    (strings.find(media, "/") ~= nil and #media > 5 and strings.sub(media, -5) == "+json")
 end
 
 local function offer_media(offer: string): string
@@ -844,46 +864,92 @@ local function offer_media(offer: string): string
   return MIME_TYPES[extension] or extension
 end
 
---- Best offer for the Accept header (first offer when Accept is absent), or nil.
-function Context:accepts(offers: {string}): string?
-  if #offers == 0 then return nil end
-  local accept? = self.meta.headers:get("Accept")
-  if accept == nil or trim_ows(accept) == "" then return offers[1] end
-  local best: string? = nil
-  local best_q = 0.0
-  local best_specificity = -1
-  for item in strings.split(accept, ",") do
-    local spec = trim_ows(item)
-    local quality = 1.0
-    local semicolon? = strings.find(spec, ";")
-    if semicolon then
-      local params = strings.sub(spec, semicolon + 1)
-      spec = trim_ows(strings.sub(spec, 1, semicolon - 1))
-      for param in strings.split(params, ";") do
-        local pair = trim_ows(param)
-        if strings.sub(pair, 1, 2) == "q=" then
-          local parsed? = math.tonumber(strings.sub(pair, 3))
-          if parsed ~= nil then quality = parsed as float end
+-- One parsed Accept media range: specificity 0 for */*, 1 for type/*, and
+-- 2 for type/subtype.
+local record MediaRange
+  range: string
+  quality: float
+  specificity: integer
+end
+
+local function MediaRange:matches(media: string): boolean
+  if self.specificity == 0 then return true end
+  if self.specificity == 1 then
+    local prefix = strings.sub(self.range, 1, #self.range - 1)
+    return strings.sub(media, 1, #prefix) == prefix
+  end
+  return media == self.range
+end
+
+local function parse_accept(lines: {string}): {MediaRange}
+  local ranges: {MediaRange} = {}
+  for line_index = 1, #lines do
+    for item in strings.split(lines[line_index], ",") do
+      local spec = trim_ows(item)
+      local quality = 1.0
+      local semicolon? = strings.find(spec, ";")
+      if semicolon ~= nil then
+        local params = strings.sub(spec, semicolon + 1)
+        spec = trim_ows(strings.sub(spec, 1, semicolon - 1))
+        for param in strings.split(params, ";") do
+          local pair = ascii_lower(trim_ows(param))
+          if strings.sub(pair, 1, 2) == "q=" then
+            local parsed? = math.tonumber(strings.sub(pair, 3))
+            if parsed ~= nil then
+              quality = parsed as float
+              if not (quality >= 0.0) then quality = 0.0 end
+              if quality > 1.0 then quality = 1.0 end
+            end
+          end
         end
+      end
+      spec = ascii_lower(spec)
+      if spec ~= "" then
+        local specificity = 2
+        if spec == "*/*" or spec == "*" then specificity = 0
+        elseif strings.sub(spec, -2) == "/*" then specificity = 1 end
+        ranges[#ranges + 1] = MediaRange(spec, quality, specificity)
       end
     end
-    spec = ascii_lower(spec)
-    if spec ~= "" and quality > 0.0 then
-      local specificity = 2
-      if spec == "*/*" or spec == "*" then specificity = 0
-      elseif strings.sub(spec, -2) == "/*" then specificity = 1 end
-      for index = 1, #offers do
-        local media = offer_media(offers[index])
-        local matches = specificity == 0 or media == spec or
-          (specificity == 1 and strings.sub(media, 1, #spec - 1) == strings.sub(spec, 1, #spec - 1))
-        if matches and (quality > best_q or
-            (quality == best_q and specificity > best_specificity)) then
-          best = offers[index]
-          best_q = quality
-          best_specificity = specificity
-          break
-        end
+  end
+  return ranges
+end
+
+-- RFC 9110 §12.5.1: an offer takes the quality of its most specific matching
+-- range (the highest q among equally specific ones); 0 excludes it.
+local function offer_quality(ranges: {MediaRange}, media: string): float
+  local best_specificity = -1
+  local quality = 0.0
+  for index = 1, #ranges do
+    local candidate = ranges[index]
+    if candidate:matches(media) then
+      if candidate.specificity > best_specificity then
+        best_specificity = candidate.specificity
+        quality = candidate.quality
+      elseif candidate.specificity == best_specificity and candidate.quality > quality then
+        quality = candidate.quality
       end
+    end
+  end
+  return quality
+end
+
+--- The first offer with the highest positive Accept quality (the first offer
+-- when Accept is absent), or nil when every offer is unacceptable.
+function Context:accepts(offers: {string}): string?
+  if #offers == 0 then return nil end
+  local lines = self.meta.headers:values("Accept")
+  if #lines == 0 then return offers[1] end
+  local ranges = parse_accept(lines)
+  if #ranges == 0 then return offers[1] end
+  local best: string? = nil
+  local best_quality = 0.0
+  for index = 1, #offers do
+    local offer = offers[index]
+    local quality = offer_quality(ranges, offer_media(offer))
+    if quality > best_quality then
+      best = offer
+      best_quality = quality
     end
   end
   return best
@@ -953,9 +1019,11 @@ end
 ------------------------------------------------------------------------------
 -- Request body
 
+-- Sticky: once the limit is exceeded, later body reads raise 413 again.
 local function Context:body_too_large()
   self.close_after_response = true
   self.body_done = true
+  self.body_overflow = true
   raise HttpError(413, "Content Too Large", "body_too_large", nil)
 end
 
@@ -985,6 +1053,7 @@ end
 --- Read the next request-body chunk (nil at EOF), enforcing `body_limit`.
 function Context:read_body_chunk(): string?
   self:own()
+  if self.body_overflow then self:body_too_large() end
   if self.body_done or self.upgrade_offer then return nil end
   self:check_declared_length()
   local chunk? = self:read_raw_chunk()
@@ -1096,18 +1165,24 @@ function Context:resp_headers(): http.Headers
   return http.headers(self.response_headers:all())
 end
 
---- Add fields to the Vary header without duplicates.
+--- Add fields to the Vary header (merging every existing Vary line) without
+-- duplicates.
 function Context:vary(field: string, ...: string): Context
   self:own()
   self:writable()
   local fields: {string} = {field, ...}
-  local existing = self.response_headers:get("Vary") or ""
   local present: {string: boolean} = {}
-  for item in strings.split(existing, ",") do
-    local name = ascii_lower(trim_ows(item))
-    if name ~= "" then present[name] = true end
+  local combined = ""
+  local existing = self.response_headers:values("Vary")
+  for line = 1, #existing do
+    for item in strings.split(existing[line], ",") do
+      local name = trim_ows(item)
+      if name ~= "" and not present[ascii_lower(name)] then
+        present[ascii_lower(name)] = true
+        if combined == "" then combined = name else combined = combined .. ", " .. name end
+      end
+    end
   end
-  local combined = trim_ows(existing)
   for index = 1, #fields do
     local name = trim_ows(fields[index])
     if name ~= "" and not present[ascii_lower(name)] then
@@ -1272,15 +1347,25 @@ local function Context:run_before_commit()
   end
 end
 
+local function Context:apply_server_header()
+  local server_header? = self.core.server_header
+  if server_header ~= nil and self.response_headers:get("Server") == nil then
+    self.response_headers:set("Server", server_header)
+  end
+end
+
+-- A response announces close when the transport ends after it: body-limit
+-- or explicit close, app shutdown, or a retiring/ephemeral session worker.
+local function Context:closes_connection(): boolean
+  if self.close_after_response or self.core.closing then return true end
+  local worker? = self.core.worker
+  return worker ~= nil and (worker.retiring or worker.boot.ephemeral)
+end
+
 local function Context:prepare_framing(buffered: boolean)
   local headers = self.response_headers
-  local server_header? = self.core.server_header
-  if server_header ~= nil and headers:get("Server") == nil then
-    headers:set("Server", server_header)
-  end
-  if self.close_after_response or self.core.closing then
-    headers:set("Connection", "close")
-  end
+  self:apply_server_header()
+  if self:closes_connection() then headers:set("Connection", "close") end
   local status = self.status_value
   if status == 204 or status == 304 then
     headers:remove("Content-Length")
@@ -1290,7 +1375,11 @@ local function Context:prepare_framing(buffered: boolean)
     headers:set("Content-Length", "0")
   elseif buffered then
     headers:remove("Transfer-Encoding")
-    headers:set("Content-Length", "" .. #self.response_body)
+    -- A HEAD handler may declare the length of a representation it never
+    -- buffers; keep that explicit Content-Length.
+    local keep_declared = self.meta.method == "HEAD" and #self.response_body == 0 and
+      headers:get("Content-Length") ~= nil
+    if not keep_declared then headers:set("Content-Length", "" .. #self.response_body) end
     if #self.response_body > 0 and headers:get("Content-Type") == nil then
       headers:set("Content-Type", "text/plain; charset=utf-8")
     end
@@ -1409,6 +1498,7 @@ function Context:send_stream(reader: io.Reader, content_length: integer?)
   self:own()
   if not self.committed_flag then
     if content_length ~= nil then
+      if content_length < 0 then raise "mk: send_stream content_length must be non-negative" end
       self.response_headers:set("Content-Length", "" .. content_length)
     end
     self:flush_headers()
@@ -1446,6 +1536,15 @@ function Context:upgrade_websocket(options: websocket.AcceptOptions?): websocket
   end
   local request = self.raw_request as http.Request
   local response = self.raw_response as http.Response
+  -- The 101 (or a handshake rejection) carries the buffered middleware
+  -- headers like any other response.
+  self:run_before_commit()
+  self:apply_server_header()
+  local entries = self.response_headers:all()
+  for index = 1, #entries do
+    local entry = entries[index]
+    response:add_header(entry.name, entry.contents)
+  end
   local outer_io = self.in_socket_io
   self.in_socket_io = true
   defer self.in_socket_io = outer_io
@@ -1476,8 +1575,7 @@ function Context:reject_upgrade(code: integer)
   if code < 400 or code > 599 then raise "mk: upgrade rejection status must be 400..599" end
   self.status_value = code
   self:run_before_commit()
-  self.committed_flag = true
-  self.finished = true
+  self:apply_server_header()
   local capture? = self.capture
   if capture ~= nil then
     self.response_headers:set("Content-Length", "0")
@@ -1486,14 +1584,16 @@ function Context:reject_upgrade(code: integer)
     capture.headers = http.headers(self.response_headers:all())
     capture.committed = true
     capture.closed = true
-    return
+  else
+    local request = self.raw_request as http.Request
+    local response = self.raw_response as http.Response
+    local outer_io = self.in_socket_io
+    self.in_socket_io = true
+    defer self.in_socket_io = outer_io
+    response:reject_upgrade(request, code, self.response_headers)
   end
-  local request = self.raw_request as http.Request
-  local response = self.raw_response as http.Response
-  local outer_io = self.in_socket_io
-  self.in_socket_io = true
-  defer self.in_socket_io = outer_io
-  response:reject_upgrade(request, code, self.response_headers)
+  self.committed_flag = true
+  self.finished = true
 end
 
 ------------------------------------------------------------------------------
@@ -1520,10 +1620,14 @@ function Context:log(level: string, event: string, fields: {string: value}?)
 end
 
 --- Retire the current session worker immediately (no-op for parent/pool).
+-- The response then closes its connection.
 function Context:retire_worker()
   self:own()
   local worker? = self.core.worker
-  if worker ~= nil then worker:retire() end
+  if worker ~= nil and self.core.session_id ~= nil then
+    self.close_after_response = true
+    worker:retire()
+  end
 end
 
 ------------------------------------------------------------------------------
@@ -1554,7 +1658,9 @@ local function Context:execute()
     local failure = error as HttpError
     self.last_err = failure
     if self.committed_flag or self.aborted_flag then
-      self:force_abort()
+      -- A finished response (explicit commit, handshake rejection) stands;
+      -- an unfinished stream or a WebSocket session is torn down.
+      if not self.finished or self.upgraded_ws ~= nil then self:force_abort() end
     else
       self:reset_body()
       do
@@ -1562,7 +1668,7 @@ local function Context:execute()
       catch
         if not (error is HttpError) then raise end
         if self.committed_flag or self.aborted_flag then
-          self:force_abort()
+          if not self.finished or self.upgraded_ws ~= nil then self:force_abort() end
         else
           local second = error as HttpError
           self:reset_body()

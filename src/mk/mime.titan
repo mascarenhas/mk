@@ -20,7 +20,10 @@ local const MIME_TYPES: {string: string} = {
   ["bin"] = "application/octet-stream",
 }
 
+-- ASCII-only lowering (independent of the process C locale); text without
+-- uppercase letters is returned unchanged, without a replacement pass.
 local function ascii_lower(text: string): string
+  if strings.match(text, "[A-Z]") == nil then return text end
   local lowered = strings.gsub(text, "[A-Z]", function (letter: string): string
     return strings.char(strings.byte(letter, 1) + 32)
   end, nil)

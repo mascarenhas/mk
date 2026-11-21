@@ -354,3 +354,79 @@ function test_shutdown_phases_and_guards(context: test.Context)
     within(3000, "aborted client", function () async.join(client) end)
   end)
 end
+
+local const WEBSOCKET_OPENING = "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n" ..
+  "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n" ..
+  "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+
+-- Send a raw WebSocket opening and return the response head.
+local function opening_head(server: mk.TestServer, extra_headers: string): string
+  local connection = net.connect(server.host, server.port)
+  defer connection:close()
+  connection:write(WEBSOCKET_OPENING .. extra_headers .. "\r\n")
+  return connection:read_until("\r\n\r\n", true) or ""
+end
+
+function test_websocket_upgrade_response_and_rejection(context: test.Context)
+  local observed = "none"
+  local app = mk.App(mk.Config { server_header = "mk-test" })
+  app:use(function (ctx: mk.Context)
+    ctx:set("X-Middleware", "yes")
+    ctx:on_before_commit(function (c: mk.Context) c:set("X-Before-Commit", "" .. c:status_code()) end)
+    ctx:on_complete(function (c: mk.Context)
+      -- Only the rejected opening is observed; accepted sessions end later.
+      if c:status_code() == 101 then return end
+      local code = "none"
+      local last? = c:last_error()
+      if last ~= nil then code = last.code or "nil" end
+      observed = c:status_code() .. ":" .. bool_text(c:aborted()) .. ":" .. code
+    end)
+    ctx:next()
+  end)
+  app:get("/ws", function (ctx: mk.Context)
+    local connection = ctx:upgrade_websocket()
+    do connection:read() catch end
+  end)
+  local server = app:listen_test()
+  context:cleanup(function () server:close() end)
+  context:run("upgrade_carries_buffered_headers", function (_: test.Context)
+    within(3000, "opening", function ()
+      local head = opening_head(server, "")
+      test.assert(strings.sub(head, 1, 12) == "HTTP/1.1 101", "switching protocols: " .. head)
+      test.assert(contains(head, "X-Middleware: yes"), "middleware header on the 101")
+      test.assert(contains(head, "X-Before-Commit: 200"), "on_before_commit ran before the 101")
+      test.assert(contains(head, "Server: mk-test"), "server header on the 101")
+    end)
+  end)
+  context:run("handshake_rejection_is_not_an_abort", function (_: test.Context)
+    within(3000, "rejected opening", function ()
+      local head = opening_head(server, "Origin: http://evil.example\r\n")
+      test.assert(strings.sub(head, 1, 12) == "HTTP/1.1 403", "origin rejected: " .. head)
+      test.assert(contains(head, "X-Middleware: yes"), "middleware header on the rejection")
+      while observed == "none" do timer.yield() end
+      test.assert(observed == "403:false:websocket_handshake", "observers saw a finished 403: " .. observed)
+    end)
+  end)
+end
+
+function test_live_timeout_aborts_blocked_writer_before_join(_: test.Context)
+  local completed = "no"
+  local app = mk.App()
+  app:get("/flood", function (ctx: mk.Context)
+    ctx:on_complete(function (c: mk.Context) completed = "aborted=" .. bool_text(c:aborted()) end)
+    ctx:run_with_timeout(100, function (inner: mk.Context)
+      local chunk = strings.rep("x", 65536)
+      -- The client never reads, so these writes block once socket buffers fill.
+      for _ = 1, 4096 do inner:write_chunk(chunk) end
+    end)
+  end)
+  local server = app:listen_test()
+  defer server:close()
+  local connection = net.connect(server.host, server.port)
+  defer connection:close()
+  connection:write("GET /flood HTTP/1.1\r\nHost: t\r\n\r\n")
+  within(5000, "timed-out blocked writer", function ()
+    while completed == "no" do timer.yield() end
+  end)
+  test.assert(completed == "aborted=true", "the blocked transport was aborted: " .. completed)
+end

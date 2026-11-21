@@ -9,7 +9,17 @@ local strings = import "string"
 local thread = import "thread"
 local timer = import "timer"
 local websocket = import "websocket"
-local mk = import "mk"
+-- The source import exposes parent supervision state for queue oracles.
+local mk = import "mk.titan"
+
+-- Exchanges queued so far to the live worker of session `sid`.
+local function queued_for(app: mk.App, sid: string): integer
+  for index = 1, #app.dispatchers do
+    local slot? = app.dispatchers[index].sessions[sid]
+    if slot ~= nil then return slot.delivered_count end
+  end
+  return 0
+end
 
 local function within(ms: integer, what: string, action: function (): ())
   local worker = async.run<|nil, value|>(function (): nil
@@ -216,8 +226,8 @@ function test_ephemeral_reroutes_unread_queued_exchanges(_: test.Context)
   for index = 1, 3 do clients[index] = spawn_fetch(server.host, server.port, "/e?sid=x") end
   within(10000, "ephemeral rerouting", function ()
     entered_rx:receive()
-    -- The three requests queue behind the first worker's blocked on_start.
-    timer.sleep(150)
+    -- All three requests queue behind the first worker's blocked on_start.
+    while queued_for(app, "x") < 3 do timer.yield() end
     for _ = 1, 3 do gate_tx:send("go") end
     local seen: {string: boolean} = {}
     for index = 1, 3 do
@@ -255,7 +265,7 @@ function test_session_crash_discards_unread_exchanges(_: test.Context)
   local second = spawn_fetch(server.host, server.port, "/c?sid=k")
   within(10000, "crash with queued exchanges", function ()
     local crashed_worker = entered_rx:receive()
-    timer.sleep(150)
+    while queued_for(app, "k") < 2 do timer.yield() end
     gate_tx:send("crash")
     test.assert(finished_text(first) == "", "first queued exchange disposed")
     test.assert(finished_text(second) == "", "second queued exchange disposed")
@@ -362,5 +372,69 @@ function test_app_test_session_routes(context: test.Context)
     local rejected = false
     do app:test(mk.TestRequest("GET", "/relay?sid=a")) catch rejected = true end
     test.assert(rejected, "a selected session worker cannot run in memory")
+  end)
+end
+
+function test_pooled_client_survives_retirement(context: test.Context)
+  local app = mk.App()
+  local persistent = mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid })
+  app:get("/retire", function (ctx: mk.Context)
+    ctx:retire_worker()
+    ctx:send_string("retired " .. ctx:worker_id())
+  end):workers(persistent)
+  app:get("/once", whoami):workers(mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid, ephemeral = true,
+  }))
+  local server = app:listen_test()
+  context:cleanup(function () server:close() end)
+  -- TestServer:request reuses pooled keep-alive connections, so a retiring
+  -- or ephemeral worker must announce Connection: close.
+  context:run("retire_worker", function (_: test.Context)
+    within(5000, "retiring requests", function ()
+      local first = server:request("GET", "/retire?sid=p")
+      test.assert(first.status == 200 and first:header("Connection") == "close",
+        "retiring response closes its connection")
+      local second = server:request("GET", "/retire?sid=p")
+      test.assert(second.status == 200 and second.body ~= first.body,
+        "the next request reaches a fresh worker: " .. first.body .. " / " .. second.body)
+    end)
+  end)
+  context:run("ephemeral", function (_: test.Context)
+    within(5000, "ephemeral requests", function ()
+      local first = server:request("GET", "/once?sid=e")
+      test.assert(first.status == 200 and first:header("Connection") == "close",
+        "ephemeral response closes its connection")
+      local second = server:request("GET", "/once?sid=e")
+      test.assert(second.status == 200 and second.body ~= first.body,
+        "each ephemeral request has its own worker")
+    end)
+  end)
+end
+
+function test_concurrent_retire_worker_is_causal(_: test.Context)
+  local entered_tx, entered_rx = thread.channel<|boolean|>(4)
+  local gate_tx, gate_rx = thread.channel<|boolean|>(4)
+  local app = mk.App()
+  app:get("/both", function (ctx: mk.Context)
+    entered_tx:send(true)
+    gate_rx:receive()
+    ctx:retire_worker()
+    ctx:send_string("retired")
+  end):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid }))
+  local server = app:listen_test()
+  defer server:close()
+  local left = spawn_fetch(server.host, server.port, "/both?sid=c")
+  local right = spawn_fetch(server.host, server.port, "/both?sid=c")
+  within(5000, "concurrent retirement", function ()
+    entered_rx:receive()
+    entered_rx:receive()
+    gate_tx:send(true)
+    gate_tx:send(true)
+    -- Whichever handler retires second also waits for the shared
+    -- acknowledgment, so the session is gone once either response arrives.
+    test.assert(body_of(finished_text(left)) == "retired", "first concurrent retirement")
+    test.assert(app:session_worker("c") == nil, "detached before the first response")
+    test.assert(body_of(finished_text(right)) == "retired", "second concurrent retirement")
+    test.assert(app:session_worker("c") == nil, "still detached")
   end)
 end

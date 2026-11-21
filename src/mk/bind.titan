@@ -21,6 +21,7 @@ local const SCHEMA_ERROR_CODES: {string: boolean} = {
 -- malformed body, 422 for schema mismatches; programmer errors re-raise.
 local function Bind:decode(schema: reflect.Type?, ...: json.DecodeOption): value
   local ctx = self.ctx
+  ctx:own()
   if not ctx:is_json() then
     raise HttpError(415, "Unsupported Media Type", "unsupported_media_type", nil)
   end

@@ -43,7 +43,7 @@ local record WorkerSlot
   alive: boolean
   retiring: boolean
   ready: boolean
-  delivered: boolean
+  delivered_count: integer
   in_flight_sends: integer
   drained: Signal
   pool_index: integer
@@ -240,6 +240,7 @@ local function App:pattern_options(prefix: boolean): router.PatternOptions
 end
 
 local function upper_method(method: string): string
+  if strings.match(method, "[a-z]") == nil then return method end
   local upper = strings.gsub(method, "[a-z]", function (letter: string): string
     return strings.char(strings.byte(letter, 1) - 32)
   end, nil)
@@ -361,7 +362,8 @@ function App:use_path(prefix: string, handler: Handler, ...: Handler): App
   return self
 end
 
---- Copy `sub_app`'s middleware and routes below `prefix`.
+--- Copy `sub_app`'s middleware and routes below `prefix`. Routes without an
+-- explicit worker mode keep `sub_app`'s `Config.workers`.
 function App:mount(prefix: string, sub_app: App): App
   self:check_open()
   local base = router.join_paths("/", prefix)
@@ -370,14 +372,19 @@ function App:mount(prefix: string, sub_app: App): App
     local source = entries[index]
     local pattern = router.join_paths(base, source.pattern)
     local route_id = 0
-    if source.is_route then route_id = #self.core.routes + 1 end
+    local mode: WorkerMode? = nil
+    if source.is_route then
+      route_id = #self.core.routes + 1
+      mode = source.mode or sub_app.config_value.workers
+    end
+    local group_prefix = ""
+    if source.group_prefix ~= "" then group_prefix = router.join_paths(base, source.group_prefix) end
     self:add_entry(Entry {
       is_route = source.is_route, methods = source.methods, pattern = pattern,
       matcher = router.compile_pattern(pattern, self:pattern_options(not source.is_route)),
-      handlers = source.handlers, name = source.name,
-      group_prefix = router.join_paths(base, source.group_prefix),
+      handlers = source.handlers, name = source.name, group_prefix = group_prefix,
       mount_path = router.join_paths(base, source.mount_path),
-      mode = source.mode, dispatcher_id = 0, route_id = route_id,
+      mode = mode, dispatcher_id = 0, route_id = route_id,
     })
   end
   return self
@@ -449,20 +456,24 @@ end
 ------------------------------------------------------------------------------
 -- Worker bootstrap scoping
 
--- Literal byte prefix of a route pattern, up to its first dynamic token.
+-- Literal byte prefix of a route or middleware pattern, up to its first
+-- dynamic token (`:`, `*`, `+`), escape (`\`), or percent escape (`%`, whose
+-- decoded byte may match either spelling in a request path).
 local function literal_prefix(pattern: string): string
   for index = 1, #pattern do
     local byte = strings.byte(pattern, index)
-    if byte == 58 or byte == 42 or byte == 43 or byte == 92 then
+    if byte == 58 or byte == 42 or byte == 43 or byte == 92 or byte == 37 then
       return strings.sub(pattern, 1, index - 1)
     end
   end
   return pattern
 end
 
+-- Conservative overlap of a middleware prefix and a route: one literal
+-- prefix extends the other, so some request path may reach both.
 local function App:prefix_overlaps(middleware: string, route_pattern: string): boolean
-  local left = middleware
-  if left == "/" then return true end
+  local left = literal_prefix(middleware)
+  if left == "/" or left == "" then return true end
   local right = literal_prefix(route_pattern)
   if not self.core.case_sensitive then
     left = ascii_lower(left)
@@ -563,6 +574,14 @@ end
 
 local function App:monitor_slot(slot: WorkerSlot)
   local status = (slot.worker as thread.Thread<|nil|>):join()
+  -- After the OS join, every exit path disposes of unread exchanges exactly
+  -- once and forgets the slot, even if a hook below raises or is cancelled.
+  defer do
+    slot.pipe:discard_queued()
+    do slot.pipe.data_rx:close() catch end
+    self.slots[slot.id] = nil
+    self.workers_changed:notify()
+  end
   slot.alive = false
   self:retire_slot(slot)
   local failed = false
@@ -591,8 +610,6 @@ local function App:monitor_slot(slot: WorkerSlot)
     end
   end
   while slot.in_flight_sends > 0 do slot.drained:wait() end
-  slot.pipe:discard_queued()
-  do slot.pipe.data_rx:close() catch end
   -- A pool never silently loses capacity: an exit outside shutdown fails
   -- the whole App. A session exit stays isolated to its session.
   if slot.dispatcher.kind == DISPATCH_POOL and not self.closing then
@@ -605,7 +622,6 @@ local function App:monitor_slot(slot: WorkerSlot)
     self:begin_shutdown(async.Error("mk: pool worker " .. slot.id .. " " .. reason,
                                     thread_traceback(status)))
   end
-  self.workers_changed:notify()
 end
 
 local function thread_traceback(status: thread.ThreadStatus<|nil|>): string
@@ -622,7 +638,7 @@ local function App:spawn_worker(dispatcher: Dispatcher, session_id: string?): Wo
   local slot = WorkerSlot {
     id = id, dispatcher = dispatcher, session_id = session_id, pipe = pipe,
     worker = nil, monitor = nil, alive = true, retiring = false, ready = false,
-    delivered = false, in_flight_sends = 0, drained = Signal.create("mk.slot"),
+    delivered_count = 0, in_flight_sends = 0, drained = Signal.create("mk.slot"),
     pool_index = 0, failure = nil,
   }
   local init: TransferableWorkerInit? = nil
@@ -649,8 +665,10 @@ local function App:spawn_worker(dispatcher: Dispatcher, session_id: string?): Wo
   return slot
 end
 
--- Pick (or spawn) the worker for a handoff; raises HttpError(503) when none.
+-- Pick (or spawn) the worker for a handoff; raises HttpError(503) when none
+-- is available or the App is shutting down (no worker spawns after that).
 local function App:select_slot(dispatcher: Dispatcher, session_id: string?): WorkerSlot
+  if self.closing then raise HttpError(503, "Service Unavailable", "shutting_down", nil) end
   if dispatcher.kind == DISPATCH_POOL then
     local count = #dispatcher.slots
     for _ = 1, count do
@@ -674,12 +692,23 @@ local function App:select_slot(dispatcher: Dispatcher, session_id: string?): Wor
   return slot
 end
 
--- Deliver a detached exchange, retrying a closed pipe on a fresh worker
--- while the app is running; otherwise the leftover is disposed exactly once.
+-- An ephemeral session worker that never received an exchange (failed or
+-- cancelled handoff) retires immediately instead of idling forever.
+local function App:release_unused_ephemeral(slot: WorkerSlot)
+  if slot.delivered_count > 0 or slot.session_id == nil then return end
+  local options? = slot.dispatcher.session
+  if options ~= nil and options.ephemeral then self:retire_slot(slot) end
+end
+
+local const MAX_DELIVERY_ATTEMPTS = 8
+
+-- Deliver a detached exchange. A pipe closed by retirement is retried on a
+-- fresh worker (at most MAX_DELIVERY_ATTEMPTS, only while running and only
+-- for workers that did not fail); otherwise the leftover is disposed once.
 local function App:deliver(dispatcher: Dispatcher, slot: WorkerSlot, env: ExchangeEnvelope)
   local target = slot
   local current = env
-  while true do
+  for attempt = 1, MAX_DELIVERY_ATTEMPTS do
     local accepted = false
     local leftover: string? = nil
     do
@@ -687,18 +716,15 @@ local function App:deliver(dispatcher: Dispatcher, slot: WorkerSlot, env: Exchan
       defer do
         target.in_flight_sends = target.in_flight_sends - 1
         target.drained:notify()
-        if not accepted and not target.delivered and target.session_id ~= nil then
-          local options? = target.dispatcher.session
-          if options ~= nil and options.ephemeral then self:retire_slot(target) end
-        end
+        if not accepted then self:release_unused_ephemeral(target) end
       end
       accepted, leftover = target.pipe:send_exchange(current)
-      if accepted then target.delivered = true end
+      if accepted then target.delivered_count = target.delivered_count + 1 end
     end
     if accepted or leftover == nil then return end
     local payload = leftover as string
     local next_slot: WorkerSlot? = nil
-    if not self.closing then
+    if not self.closing and target.failure == nil and attempt < MAX_DELIVERY_ATTEMPTS then
       do
         local session_id: string? = nil
         if current.session_id ~= "" then session_id = current.session_id end
@@ -793,6 +819,10 @@ local function App:handle_http(request: http.Request, response: http.Response,
     self:run_in_place(meta, raw_path, target_error, chain_id, head_fallback, request, response, nil)
     return
   end
+  -- Let the transport's read callback retire before detaching the exchange.
+  -- The selector above may also have yielded: shutdown is re-checked after
+  -- both, and select_slot refuses to spawn once the App is closing.
+  async.yield()
   local slot: WorkerSlot? = nil
   local failure: HttpError? = nil
   do
@@ -805,11 +835,13 @@ local function App:handle_http(request: http.Request, response: http.Response,
     self:run_in_place(meta, raw_path, target_error, -1, head_fallback, request, response, failure)
     return
   end
-  -- Let the transport's read callback retire before detaching the exchange.
-  async.yield()
+  local target = slot as WorkerSlot
+  -- A fresh ephemeral worker is retired if detaching or delivering fails or
+  -- is cancelled before its first exchange is queued.
+  defer self:release_unused_ephemeral(target)
   local payload = http.Exchange(request, response):to_transfer_payload()
-  self:deliver(dispatcher, slot as WorkerSlot, ExchangeEnvelope(payload, request.method,
-    request.target, route_id, session_id or "", false))
+  self:deliver(dispatcher, target, ExchangeEnvelope(payload, request.method, request.target,
+    route_id, session_id or "", false))
 end
 
 -- Serve an exchange returned by a worker on the parent (tracked for shutdown).
@@ -1213,6 +1245,8 @@ function App:stop_worker(worker_id: integer): boolean
   if slot == nil or not slot.alive then return false end
   local worker? = slot.worker
   if worker == nil then return false end
+  -- Stop routing new exchanges to the dying worker first.
+  self:retire_slot(slot)
   worker:cancel(async.CancellationReason.simple("worker stopped"))
   return true
 end
