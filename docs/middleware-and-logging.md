@@ -32,13 +32,13 @@ function fatal(event: string, reason: string, fields: {string: value}?)
 
 - **Levels:** `"error"` (1), `"warn"` (2), `"info"` (3, default), and `"debug"` (4). `resolve_level(level?, allow_warn?, env_name?)` validates level strings (pass `allow_warn = false` when only `error`/`info`/`debug` are permitted).
 - **Non-suspending bounded admission:** `Logger.new` defaults to `"info"`, `os.stderr:write`, and a queue capacity of `1024`. `emit` / `accept` never yield; a single owned writer Task delivers admitted lines to the sink in order.
-- **Drop accounting & failure isolation:** Queue overflow, invalid levels, encoding errors (invalid UTF-8, cycles, unsupported values, or lines exceeding `MAX_LINE_BYTES`), or non-blocking sink refusals never raise into callers—they increment a drop counter and emit `{"event":"log_dropped","level":"error","count":N,"timestamp":"..."}` as soon as capacity returns. An exception from the destination sink disables the logger instead of crashing the application.
+- **Drop accounting & failure isolation:** Queue overflow, invalid levels, encoding errors (invalid UTF-8, cycles, unsupported values, or lines exceeding `MAX_LINE_BYTES`), or non-blocking sink refusals never raise into callers—they increment a drop counter and the writer Task emits `{"event":"log_dropped","level":"error","count":N,"timestamp":"..."}` around its next delivered line or at `Logger:close()`. An exception from the destination sink disables the logger instead of crashing the application.
 - **Cross-thread forwarding:** `log.forward(level, lines)` creates a bounded (`1024`) logger that forwards encoded lines via non-blocking `lines:try_send` without owning or closing the borrowed `Sender`. When `Config.logger` is set on `mk.App`, `mk` automatically wires a forwarding logger into every pool and session worker (`wctx.logger` / `ctx:logger()` / `ctx:log(...)`).
 - **Drain on shutdown:** Always `defer logger:close()` so the writer Task flushes every admitted line before the process exits. Use `log.fatal(event, reason, fields?)` for best-effort stderr diagnostics before a `Logger` exists.
 
 ## Built-in Middleware (`mk.middleware.*`)
 
-Most middleware `Config` records accept an optional `next: (function (mk.Context): boolean)?` predicate: when `next(ctx)` returns `true`, the middleware skips its own logic and delegates directly to `ctx:next()`.
+Most middleware `Config` records accept an optional `next: (function (mk.Context): boolean)?` predicate: when `next(ctx)` returns `true`, the middleware skips its own logic and delegates directly to `ctx:next()` (except `timeout.new(handler, ...)`, which runs its wrapped `handler(ctx)` without a deadline instead of calling `ctx:next()`).
 
 A typical global middleware stack registers outer cross-cutting observers first:
 
@@ -136,7 +136,7 @@ function new(config: Config?): mk.Handler
 
 ### 4. `mk.middleware.keyauth`
 
-Extracts and validates API keys or bearer tokens using constant-time comparison.
+Extracts API keys or bearer tokens, delegates validation to a caller-supplied `validator`, and provides `constant_time_equal` for timing-safe secret checks.
 
 ```text
 record CustomExtractor
@@ -280,11 +280,15 @@ end
 function new(root: string, config: Config?): mk.Handler
 ```
 
+- **Path selection (which path is served):**
+  - If the matched route has a raw `*` or `+` wildcard capture (for example `app:get("/assets/*", static.new(root))`), `static` serves that wildcard capture (mapping `/assets/app.js` to `<root>/app.js`).
+  - Otherwise, if mounted inside a sub-app via `App:mount`, `static` serves the path below `ctx:mount_path()`.
+  - Otherwise, `static` serves the **full** request path (so `app:use_path("/assets", static.new(root))` maps `/assets/app.js` to `<root>/assets/app.js`).
 - **Confinement and path validation:**
-  - `new(root, config?)` validates `root ~= ""` and verifies each `index_names` entry is a single basename (no `/`, `\`, `:`, NUL, `.`, or `..`).
+  - `new(root, config?)` validates `root ~= ""`, `max_age >= 0`, and each `index_names` entry as a single valid basename (non-empty, not equal to `.` or `..`, not a Windows reserved device name, and containing no `/`, `\`, `:`, or NUL).
   - `canonical_root = fs.realpath(root)` is resolved lazily per worker (`404` if missing or not a directory). Because `titan.fs` is path-based without `openat`/`O_NOFOLLOW`, `root` must be a deployment-trusted directory not concurrently mutated by untrusted local processes.
   - Non-`GET`/`HEAD` requests pass through to `ctx:next()`.
-  - Relative request paths split on `/`, percent-decode each segment once (`400` on invalid `%XX`), and reject (`404` / `not_found_handler`) any segment containing NUL, `/`, `\`, `:`, `.`, `..`, or a Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`, case-insensitive, with or without extension).
+  - Selected paths split on `/`, skip empty raw segments, percent-decode each non-empty segment once (`400` on invalid `%XX`), and reject (`404` / `not_found_handler`) any decoded segment that is equal to `.` or `..`, contains NUL, `/`, `\`, or `:`, or matches a Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`, case-insensitive, with or without extension or trailing spaces).
   - Joined candidates require `fs.lstat` non-symlink leaves (or directories probing validated `index_names`) **and** `fs.realpath(candidate)` matching a strict path-component boundary under `canonical_root` (preventing sibling-prefix escapes such as `/srv/public2` under `/srv/public` and intermediate symlink escapes).
 - **Serving behavior:**
   - Regular files emit MIME `Content-Type`, weak `ETag` and `Last-Modified` (`304 Not Modified` on conditional match), optional `Cache-Control` (`max_age`), `Content-Disposition` (`download`), and single-range `206`/`416` (`byte_range`), run `modify_response` before commit, and stream in 64 KiB chunks (`HEAD` omits body).
@@ -305,4 +309,4 @@ function new(handler: mk.Handler, timeout_ms: integer, config: Config?): mk.Hand
 function middleware(timeout_ms: integer, config: Config?): mk.Handler
 ```
 
-Both `new` (wrapping a specific handler) and `middleware` (wrapping `ctx:next()`) delegate to `ctx:run_with_timeout(timeout_ms, action, config.on_timeout)`, enforcing owner-Task revocation and abort-before-join cleanup inside `mk`.
+Both `new` (wrapping a specific handler) and `middleware` (wrapping `ctx:next()`) delegate to `ctx:run_with_timeout(timeout_ms, action, config.on_timeout)`, enforcing owner-Task revocation and abort-before-join cleanup inside `mk`. When `config.next(ctx)` returns `true`, `timeout.new` invokes `handler(ctx)` directly without a deadline, whereas `timeout.middleware` calls `ctx:next()`.

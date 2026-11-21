@@ -63,15 +63,15 @@ Inside a session worker handler, call `ctx:retire_worker()` to retire that sessi
 
 ### Keep-Alive Return Across Worker Modes
 
-After a worker finishes a reusable HTTP/1.1 exchange (without `retire_worker()`, `abort()`, `Connection: close`, or WebSocket takeover), the idle connection returns to the parent via the internal `return_pipe`. The next keep-alive request on the same TCP connection is classified fresh by the parent and can dispatch to any route or worker mode.
+After a worker finishes a reusable HTTP/1.1 exchange (without `retire_worker()`, `abort()`, `Connection: close`, or WebSocket takeover), the worker keeps the idle keep-alive connection and waits under `idle_timeout_ms` for the next request's headers. Once that follow-up request's headers are parsed, the worker sends the already-parsed exchange back to the parent through the internal `return_pipe`, where the parent classifies it fresh and dispatches it to any route or worker mode.
 
 ## Titan Cross-State Transfer Constraints and `Transferable*` Wrappers
 
 Every `pool` and `session` worker runs in an independent Lua state on its own OS thread. When `App:start()` (or on-demand session spawn) creates a worker, it sends a `WorkerBootstrap` packet over `titan.thread` / `titan.transfer`:
 
 - **Closure snapshot rules:** Every `Handler`, `ErrorHandler`, `WorkerInit` (`on_start`), and middleware callback reaching a worker thread must satisfy Titan's cross-state closure transfer rules:
-  - Captures must be transfer-compatible values (scalars, plain records/unions, immutable data, `thread.Sender<|T|>`, or other transferable closures).
-  - Closures **cannot** capture shared mutable upvalue cells, open sockets or files, `http.Server`, `mk.App`, or non-transferable native handles.
+  - Allowed captures include scalars, plain transferable records/unions, transferable closures, mutable upvalues (which become fresh independent cells on the destination, losing aliasing), and records with custom transfer hooks (such as `thread.Sender<|T|>`, `net.Connection`, or `fs.File`, which transfer ownership).
+  - Rejected captures include reference cycles, direct Arrays or Maps (even `const`), Interfaces, `owned` C storage, `local` nominal types, non-nil Lua Udata, and records with `local` fields and no custom transfer hooks (such as `http.Server` and `mk.App`).
   - Note that `SessionOptions.session_id` and `SessionOptions.on_exit` run **only on the parent** and never cross thread boundaries.
 - **`Transferable*` wrappers:** `mk` exports `TransferableHandler`, `TransferableErrorHandler`, and `TransferableWorkerInit` (each implementing `to_transfer_payload()` and `from_transfer_payload()` over `transfer.TransferValue` + `protobuf`) to carry typed callbacks inside `WorkerBootstrap` (and `mk.middleware.keyauth.CustomExtractor` follows the same pattern).
 - **Socket handoff safety:** Detached `http.Exchange` payloads cross between parent and workers exclusively through single-consumer `ExchangePipe` queues using synchronous `try_send` / `try_receive` with capacity-1 wake signals, ensuring Task cancellation never races an inline packet commit or leaks a detached OS socket descriptor.
@@ -118,7 +118,7 @@ end
 
 | Event outside shutdown | `pool` worker | `session` worker |
 | --- | --- | --- |
-| Uncaught thread error / panic or `App:stop_worker(id)` | **Fails the entire `App`:** logs `"worker_failed"`, triggers forced shutdown, and causes `App:serve()` / `App:listen()` to raise the failure error. A pool never silently loses capacity. | **Isolated to that session:** logs `"worker_failed"` (on error), detaches the session slot, runs `on_exit(session_id, worker_id, failed)` after OS join, discards unread queued exchanges, and lets future requests spawn a fresh worker. |
+| Uncaught thread error / panic or `App:stop_worker(id)` | **Fails the entire `App`:** logs `"worker_failed"` (on error; `stop_worker` cancels without logging `"worker_failed"`), triggers forced shutdown, and causes `App:serve()` / `App:listen()` to raise the failure error. A pool never silently loses capacity. | **Isolated to that session:** logs `"worker_failed"` (on error), detaches the session slot, runs `on_exit(session_id, worker_id, failed)` after OS join, discards unread queued exchanges, and lets future requests spawn a fresh worker. |
 | Normal handler `HttpError` | Handled by `Config.error_handler`; worker stays alive. | Handled by `Config.error_handler`; worker stays alive. |
 | Unhandled non-`HttpError` in a request (without `recover`) | Aborts that connection and logs `"http_request_failed"`; worker stays alive. | Aborts that connection and logs `"http_request_failed"`; worker stays alive. |
 
@@ -149,8 +149,8 @@ app:serve()
 1. Close the `http.Server` listener (no new connections accepted; any in-flight arrival sees `503` `"shutting_down"`).
 2. Run `Hooks:on_pre_shutdown` hooks.
 3. Drain active parent requests up to `Config.shutdown_timeout_ms` (default 10 s), then `force_abort()`, cancel, and join any remaining parent Tasks and adopted keep-alive Tasks.
-4. Close every worker pipe, cancel and join every pool and session worker thread and monitor (running worker `defer_cleanup` callbacks and session `on_exit` hooks).
-5. Close and drain `return_pipe` and the retirement listener, discarding any undelivered `http.Exchange` payloads cleanly.
+4. Close every worker pipe, cancel and join every pool and session worker thread and monitor (running worker `defer_cleanup` callbacks and session `on_exit` hooks), and close and join the retirement listener.
+5. Close and drain `return_pipe` and adopted connections, discarding any undelivered `http.Exchange` payloads cleanly.
 6. Close and drain the cross-worker log forwarder into the parent's `Config.logger`.
 7. Run `Hooks:on_post_shutdown(first_failure?)` hooks.
 

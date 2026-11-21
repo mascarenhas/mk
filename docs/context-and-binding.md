@@ -148,7 +148,7 @@ local function find_user(ctx: mk.Context)
 end
 ```
 
-- `mk.HttpError(status, message?, code?, cause?)` normalizes any status outside `200..999` to `500` and defaults `message` to `mk.status_message(status)`.
+- `mk.HttpError(status, message?, code?, cause?)` normalizes any status outside `200..999` to `500` first and defaults `message` to `mk.status_message` of that normalized status (so an out-of-range status defaults to `"Internal Server Error"`).
 - Outer middleware can `catch` and inspect or transform `HttpError` values freely.
 - When an `HttpError` escapes the handler chain:
   - `ctx:last_error()` records it.

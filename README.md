@@ -74,7 +74,7 @@ The repository `Makefile` delegates incremental compilation and native tests to 
 ```sh
 make build                      # build build/mk.so and build/mk.a
 make test                       # build and run tests/ via build/mk-tests
-make test TEST_ARGS='--filter router'
+make test TEST_ARGS='--filter=router'   # or TEST_ARGS='-f router'
 make clean
 ```
 
@@ -115,7 +115,7 @@ See [Workers and Sessions](docs/workers-and-sessions.md) for cross-state closure
 | `mk.middleware.env` | Serves selected environment variables as JSON on `GET`/`HEAD`. |
 | `mk.middleware.healthcheck` | Liveness (`/livez`), readiness (`/readyz`), and startup (`/startupz`) probe endpoints. |
 | `mk.middleware.helmet` | Security response headers (XSS, nosniff, framing, HSTS, CSP, cross-origin policies). |
-| `mk.middleware.keyauth` | Token extraction (`Bearer`, headers, query, cookie, chained, custom) and constant-time validation. |
+| `mk.middleware.keyauth` | Token extraction (`Bearer`, headers, query, cookie, chained, custom), custom validation, and `constant_time_equal` helper. |
 | `mk.middleware.logger` | Structured JSON request logging on admission or completion (`on_complete`). |
 | `mk.middleware.recover` | Catches unexpected non-`HttpError` exceptions without swallowing `async.CancellationReason`. |
 | `mk.middleware.requestid` | Validates or CSPRNG-generates a per-request ID header (`X-Request-ID`). |

@@ -127,7 +127,7 @@ app:route_chain("/articles/:id")
 
 By default (`Config.auto_head = true`), when a `HEAD` request arrives:
 
-1. `mk` first checks whether any explicit `HEAD` (or `all("*")`) route matches the path. If one matches, it runs directly.
+1. `mk` first checks whether any explicit `HEAD` (or an `all(...)`) route matches the path. If one matches, it runs directly.
 2. Otherwise, `mk` falls back to matching `GET` routes in registration order, runs the matching `GET` handler chain, and suppresses the response body on the wire while keeping status and headers intact.
 
 Set `Config.auto_head = false` to disable `GET` fallback for `HEAD` requests.
