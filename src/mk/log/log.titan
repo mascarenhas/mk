@@ -1,0 +1,225 @@
+-- Bounded, non-suspending JSON-line logging. Admission never yields; one owned
+-- writer Task delivers encoded lines to the sink in order.
+local async = import "async"
+local iteration = import "iteration"
+local json = import "json"
+local os = import "os"
+local thread = import "thread"
+
+const MAX_LINE_BYTES: integer = 16384
+
+local const encode_limit = json.EncodeOption.max_bytes(16384)
+
+local record SimpleRecord
+  const event: string
+  const level: string
+  const timestamp: string
+end
+
+record Logger
+  local const minimum: integer
+  local const sink: function (string): ()
+  local const source: async.BufferedSubscription<|string, nil|>
+  local const publish: function (string): (boolean)
+  local const finish: function (): (boolean)
+  local const capacity: integer
+  local queued: integer
+  local dropped: integer
+  local closed: boolean
+  local failed: boolean
+  local worker: async.Task<|nil, value|>?
+end
+
+local function write_stderr(text: string)
+  os.stderr:write(text)
+end
+
+local function noop_stop()
+end
+
+local function noop_close(_: function (): async.SubscriptionBatch<|string|>)
+end
+
+local function rank(level: string): integer?
+  if level == "error" then return 1 end
+  if level == "warn" then return 2 end
+  if level == "info" then return 3 end
+  if level == "debug" then return 4 end
+  return nil
+end
+
+-- Cleanup must outlive cancellation of the Task that requested it.
+local function await_terminal(task: async.Task<|nil, value|>)
+  if task:status():has_finished() then return end
+  local remove: (function (): ())? = nil
+  defer if remove then remove() end
+  async.await_cleanup<|nil, nil|>(function (resolve, _reject, _fatal)
+    if task:status():has_finished() then resolve(nil)
+    else remove = task:add_terminal_listener(function (_) resolve(nil) end)
+    end
+  end)
+end
+
+function resolve_level(level: string?, allow_warn: boolean?, env_name: string?): string
+  local selected = level or "info"
+  local strict = allow_warn == false
+  local severity? = rank(selected)
+  if severity == nil or (strict and severity == 2) then
+    local name = env_name or "log level"
+    if strict then raise name .. " must be error, info, or debug" end
+    raise name .. " must be error, warn, info, or debug"
+  end
+  return selected
+end
+
+function format_line(level: string, event: string, fields: {string: value}?): string
+  local timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  if fields == nil then
+    return json.encode(SimpleRecord(event, level, timestamp), encode_limit) .. "\n"
+  end
+  local contents: {string: value} = {}
+  for key, item in iteration.pairs(fields) do contents[key] = item end
+  contents["timestamp"] = timestamp
+  contents["level"] = level
+  contents["event"] = event
+  return json.encode(contents, encode_limit) .. "\n"
+end
+
+local function Logger:report_dropped()
+  if self.dropped == 0 then return end
+  local count = self.dropped
+  self.dropped = 0
+  self.sink(format_line("error", "log_dropped", {["count"] = count}))
+end
+
+local function Logger:write_loop(): nil
+  defer self.source:close()
+  while true do
+    case self.source:next()
+    when item(text) then
+      self.queued = self.queued - 1
+      self.sink(text)
+      self:report_dropped()
+    else
+      self:report_dropped()
+      return nil
+    end
+  end
+  return nil
+catch
+  -- A failed destination disables logging and discards unread records. It must
+  -- never become an uncaught Task error or replace an application failure.
+  self.failed = true
+  self.queued = 0
+  return nil
+end
+
+function Logger.new(level: string?, sink: (function (string): ())?, capacity: integer?): Logger
+  local selected = resolve_level(level)
+  local maximum = capacity or 1024
+  if maximum < 1 then raise "log queue capacity must be positive" end
+  local publish: (function (string): (boolean))? = nil
+  local finish: (function (): (boolean))? = nil
+  local source = async.BufferedSubscription<|string, nil|>(function (p, _fail, f)
+    publish = p
+    finish = f
+    return async.SubscriptionActions<|string|>(noop_stop, noop_close)
+  end)
+  local result: Logger = {minimum = rank(selected), sink = sink or write_stderr,
+    source = source, publish = publish, finish = finish, capacity = maximum,
+    queued = 0, dropped = 0, closed = false, failed = false, worker = nil}
+  result.worker = async.run<|nil, value|>(result:write_loop)
+  return result
+end
+
+function Logger:level(): string
+  if self.minimum == 1 then return "error" end
+  if self.minimum == 2 then return "warn" end
+  if self.minimum == 4 then return "debug" end
+  return "info"
+end
+
+function Logger:emit(level: string, event: string, fields: {string: value}?)
+  if self.closed or self.failed then return end
+  local severity? = rank(level)
+  if severity == nil then self.dropped = self.dropped + 1; return end
+  if severity > self.minimum then return end
+  if self.queued >= self.capacity then self.dropped = self.dropped + 1; return end
+  local encoded = format_line(level, event, fields)
+  if self.publish(encoded) then self.queued = self.queued + 1
+  else self.dropped = self.dropped + 1
+  end
+catch
+  -- Encoding rejects invalid UTF-8, cycles, unsupported values, and oversized
+  -- records without exposing their contents or changing the caller's outcome.
+  self.dropped = self.dropped + 1
+end
+
+function Logger:error(event: string, fields: {string: value}?)
+  self:emit("error", event, fields)
+end
+
+function Logger:warn(event: string, fields: {string: value}?)
+  self:emit("warn", event, fields)
+end
+
+function Logger:info(event: string, fields: {string: value}?)
+  self:emit("info", event, fields)
+end
+
+function Logger:debug(event: string, fields: {string: value}?)
+  self:emit("debug", event, fields)
+end
+
+-- Lines already encoded by this module (for example by a worker thread's
+-- forward Logger) join this sink with the same bounded admission.
+function Logger:accept(encoded: string)
+  if self.closed or self.failed then return end
+  if #encoded > MAX_LINE_BYTES + 1 or self.queued >= self.capacity then
+    self.dropped = self.dropped + 1
+    return
+  end
+  if self.publish(encoded) then self.queued = self.queued + 1
+  else self.dropped = self.dropped + 1
+  end
+end
+
+function Logger:close()
+  if self.closed then return end
+  self.closed = true
+  self.finish()
+  if self.worker then await_terminal(self.worker) end
+end
+
+function emit(logger: Logger?, level: string, event: string, fields: {string: value}?)
+  if logger then logger:emit(level, event, fields) end
+end
+
+-- The Sender is borrowed: closing it would end logging for every producer.
+-- Lines lost to a full channel are reported before the next delivered line.
+function forward(level: string, lines: thread.Sender<|string|>?): Logger?
+  if not lines then return nil end
+  local lost = 0
+  return Logger(level, function (text: string)
+    if lost > 0 then
+      if not lines:try_send(format_line("error", "log_dropped", {["count"] = lost})) then
+        lost = lost + 1
+        return
+      end
+      lost = 0
+    end
+    if not lines:try_send(text) then lost = lost + 1 end
+  end)
+end
+
+-- Startup may fail before a Logger exists. Callers supply fixed, safe
+-- event/reason strings; failure of this final diagnostic remains isolated.
+function fatal(event: string, reason: string, fields: {string: value}?)
+  local contents: {string: value} = {}
+  if fields then
+    for key, item in iteration.pairs(fields) do contents[key] = item end
+  end
+  contents["reason"] = reason
+  os.stderr:write(format_line("error", event, contents))
+catch
+end
