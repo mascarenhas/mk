@@ -35,13 +35,14 @@ lr() {
   fi
 }
 
+# Native Windows programs end lines with CRLF; command substitution keeps the CR.
 mkdir "$workspace"
-same_path "$(titanc --print-root)" "$sdk"
+same_path "$(titanc --print-root | tr -d '\r')" "$sdk"
 
 # 1. Build and install from the checkout (luarocks make never fetches source.url).
 lr make "$rockspec"
 
-rock_dir=$(lr show --rock-dir titan-mk)
+rock_dir=$(lr show --rock-dir titan-mk | tr -d '\r')
 if ((windows)); then rock_dir=$(cygpath -u "$rock_dir"); fi
 test -s "$rock_dir/doc/index.md"
 test -s "$rock_dir/skills/titan-mk/SKILL.md"

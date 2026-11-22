@@ -48,7 +48,7 @@ jobs:
           sudo apt-get update
           sudo env DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
             build-essential ca-certificates cmake curl gcc-14 git libreadline-dev \
-            libssl-dev pkg-config python3-venv
+            libssl-dev pkg-config python3-venv unzip
           echo "TITAN_PREFIX=$RUNNER_TEMP/titan-sdk" >> "$GITHUB_ENV"
 
       # A release can be re-cut under the same tag: the cache names the exact
@@ -59,12 +59,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: &identify-release |
           set -euo pipefail
-          commit=$(gh api "repos/mascarenhas/titan/commits/$TITAN_RELEASE" --jq '.sha')
+          # Strip CR: on Windows this runs in Git Bash around the native gh.exe.
+          commit=$(gh api "repos/mascarenhas/titan/commits/$TITAN_RELEASE" --jq '.sha' | tr -d '\r')
           [[ $commit =~ ^[0-9a-f]{40}$ ]]
           digest=$(gh api "repos/mascarenhas/titan/releases/tags/$TITAN_RELEASE" --jq "
             [.assets[] | select(.name == \"$TITAN_ROCK\")] | select(length == 1) | first |
             .digest | select(type == \"string\" and test(\"^sha256:[0-9a-f]{64}$\")) |
-            sub(\"^sha256:\"; \"\")")
+            sub(\"^sha256:\"; \"\")" | tr -d '\r')
           [[ $digest =~ ^[0-9a-f]{64}$ ]]
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "rock-sha256=$digest" >> "$GITHUB_OUTPUT"
@@ -146,13 +147,17 @@ jobs:
           gcc-14 --version
           gcov-14 --version
 
-      # Titan's gcc-gcov backend needs GCC 14+ with the matching gcov. The
-      # covered build lives in build/coverage; its LCOV report is
+      # Titan's gcc-gcov backend needs GCC 14+ with the matching gcov; titanc
+      # reads CC, GCOV, and GCOVR from the environment. The covered build lives
+      # in build/coverage; its LCOV report is
       # build/coverage/.coverage/report/coverage.info.
       - name: Measure line coverage
+        env:
+          CC: gcc-14
+          GCOV: gcov-14
+          GCOVR: ${{ runner.temp }}/mk-coverage-tools/bin/gcovr
         run: |
-          make coverage CC=gcc-14 COVERAGE_GCOV=gcov-14 COVERAGE_FORMAT=lcov \
-            COVERAGE_GCOVR="$RUNNER_TEMP/mk-coverage-tools/bin/gcovr"
+          make coverage COVERAGE_FORMAT=lcov
           test -s build/coverage/.coverage/report/coverage.info
 
       - name: Retain the coverage report
@@ -386,8 +391,10 @@ jobs:
           test -x "$sdk/bin/titanc.exe"
           test -f "$sdk/bin/lua55.dll"
           test -f "$sdk/lib/titan/0.6/titan.dll"
-          test "$(cat "$sdk/etc/titan/build-profile")" = "$TITAN_BUILD_PROFILE"
-          test "$(cygpath -m "$("$sdk/bin/titanc.exe" --print-root)")" = "$(cygpath -m "$TITAN_PREFIX")"
+          # Native Windows programs end lines with CRLF.
+          test "$(tr -d '\r' < "$sdk/etc/titan/build-profile")" = "$TITAN_BUILD_PROFILE"
+          root=$("$sdk/bin/titanc.exe" --print-root | tr -d '\r')
+          test "$(cygpath -m "$root")" = "$(cygpath -m "$TITAN_PREFIX")"
 
       - name: Save the Titan SDK
         if: steps.sdk-cache.outputs.cache-hit != 'true'
