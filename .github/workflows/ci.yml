@@ -296,6 +296,7 @@ jobs:
     env:
       TITAN_PREFIX: C:/titan-sdk
       LUAROCKS_CONFIG: C:/titan-sdk/etc/luarocks/config-5.5.lua
+      OPENSSL_MODE: bundled
       TITAN_JOBS: "4"
       LC_ALL: C.UTF-8
       LANG: C.UTF-8
@@ -360,7 +361,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: C:/titan-sdk
-          key: titan-sdk-layout-v1-windows-2025-vs2026-${{ runner.arch }}-CLANG64-${{ env.TITAN_BUILD_PROFILE }}-openssl-clang64-${{ env.TITAN_RELEASE }}-${{ steps.release.outputs.commit }}-rock-${{ steps.release.outputs.rock-sha256 }}-toolchain-${{ steps.toolchain.outputs.digest }}
+          key: titan-sdk-layout-v1-windows-2025-vs2026-${{ runner.arch }}-CLANG64-${{ env.TITAN_BUILD_PROFILE }}-openssl-${{ env.OPENSSL_MODE }}-${{ env.TITAN_RELEASE }}-${{ steps.release.outputs.commit }}-rock-${{ steps.release.outputs.rock-sha256 }}-toolchain-${{ steps.toolchain.outputs.digest }}
 
       # The source rock carries the Titan tree, Makefile.win, and the Lua
       # sources; Makefile.win builds lua55.dll, LuaRocks, and the compiler
@@ -382,7 +383,8 @@ jobs:
           unzip -q "$TITAN_ROCK"
           cd titan
           mingw32-make -f Makefile.win lua luarocks compiler \
-            PREFIX="$TITAN_PREFIX" TITAN_BUILD_PROFILE="$TITAN_BUILD_PROFILE"
+            PREFIX="$TITAN_PREFIX" OPENSSL_MODE="$OPENSSL_MODE" \
+            TITAN_BUILD_PROFILE="$TITAN_BUILD_PROFILE"
 
       - name: Validate the Titan SDK
         run: |
