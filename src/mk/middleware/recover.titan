@@ -21,17 +21,27 @@ record Config
   const exception_handler: (function (mk.Context, value, string): mk.HttpError)?
 end
 
+-- Reporting must not turn a recovered failure into a transport abort, so a
+-- failed stderr write is ignored.
 local function report_stack_trace(ctx: mk.Context, failure: value, trace: string)
   if ctx:logger() ~= nil then
     local route = ctx:matched_route()
-    ctx:log("error", "panic_recovered", {
+    if route == "" then route = ctx:classified_route() end
+    local fields: {string: value} = {
       ["error"] = strings.tostring(failure),
       ["traceback"] = trace,
       ["method"] = ctx:method(),
       ["route"] = route ~= "" and route or "<unmatched>",
-    })
-  else
+    }
+    local worker = ctx:worker_id()
+    if worker ~= 0 then fields["worker_id"] = worker end
+    ctx:log("error", "panic_recovered", fields)
+    return
+  end
+  do
     os.stderr:write("panic: " .. strings.tostring(failure) .. "\n" .. trace .. "\n")
+  catch
+    if error is async.CancellationReason then raise end
   end
 end
 

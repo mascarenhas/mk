@@ -129,7 +129,8 @@ function new(config: Config?): mk.Handler
   end
   if event == "" then raise "logger: event must not be empty" end
   return function (ctx: mk.Context)
-    if skip_all ~= nil and skip_all(ctx) then
+    -- Without a sink or app logger (fixed per state) there is nothing to do.
+    if (skip_all ~= nil and skip_all(ctx)) or (sink == nil and ctx:logger() == nil) then
       ctx:next()
       return
     end
@@ -144,7 +145,11 @@ function new(config: Config?): mk.Handler
     local start = uv.hrtime()
     ctx:on_complete(function (done: mk.Context)
       if skip_line ~= nil and skip_line(done) then return end
-      local fields = request_fields(done, done:matched_route(), include_path, include_request_id, extra)
+      -- The executed endpoint, else the classified route (requests rejected
+      -- before reaching it, session pre-dispatch failures).
+      local route = done:matched_route()
+      if route == "" then route = done:classified_route() end
+      local fields = request_fields(done, route, include_path, include_request_id, extra)
       fields["status"] = done:status_code()
       fields["latency_ms"] = (uv.hrtime() - start) / 1000000.0
       if done:aborted() then fields["aborted"] = true end

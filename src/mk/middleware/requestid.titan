@@ -11,7 +11,6 @@ local const REQUEST_ID_LOCAL = "requestid"
 local const MAX_ID_BYTES = 256
 local const GENERATOR_ATTEMPTS = 3
 local const RANDOM_BYTES = 16
-local const HEX_DIGITS = "0123456789abcdef"
 local const TOKEN_PATTERN = "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
 
 --- Request-id options.
@@ -42,15 +41,8 @@ local function random_id(): string
   if status < 0 then
     raise async.OperationError(status, uv.err_name(status), uv.strerror(status), "requestid.random")
   end
-  local bytes = buffer:to_string(RANDOM_BYTES)
-  local out = strings.writer()
-  for index = 1, RANDOM_BYTES do
-    local byte = strings.byte(bytes, index)
-    local high = byte // 16 + 1
-    local low = byte % 16 + 1
-    out:write(strings.sub(HEX_DIGITS, high, high) .. strings.sub(HEX_DIGITS, low, low))
-  end
-  return out:drain()
+  local first, second, third, fourth = strings.unpack(">I4I4I4I4", buffer:to_string(RANDOM_BYTES))
+  return strings.format("%08x%08x%08x%08x", first, second, third, fourth)
 end
 
 local function generate(generator: (function (): string)?): string
