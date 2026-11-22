@@ -169,6 +169,7 @@ record RequestMeta
   const scheme: string
   const host: string
   local params_map: {string: string}
+  local route_pattern: string
   local target: router.Target
   local headers: http.Headers
   local cookie_map: {string: string}?
@@ -392,7 +393,7 @@ local function Core:meta(method: string, target: string, headers: http.Headers,
   end
   local meta = RequestMeta {
     method = method, path = path, original_url = target, scheme = actual_scheme,
-    host = host, params_map = {}, target = target_value, headers = headers,
+    host = host, params_map = {}, route_pattern = "", target = target_value, headers = headers,
     cookie_map = nil,
   }
   return meta, raw_path, failure
@@ -491,6 +492,7 @@ function Context:restart_routing()
   local params: {string: string} = {}
   if found ~= nil then params = found.params end
   self.params_map = params
+  self.meta.route_pattern = route ~= nil and route.pattern or ""
   self.head_fallback = head_fallback
   self.entry_index = 0
   self.current_entry = nil
@@ -569,6 +571,12 @@ function Context:matched_route(): string
   local entry? = self.endpoint_entry
   if entry == nil then return "" end
   return entry.pattern
+end
+
+--- Declared pattern of the endpoint route this request classified to at
+-- dispatch (known before any handler runs), or "".
+function Context:classified_route(): string
+  return self.meta.route_pattern
 end
 
 --- Info for the matched endpoint route, or nil before/without a match.

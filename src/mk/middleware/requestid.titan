@@ -1,0 +1,101 @@
+--- Per-request ids propagated through a header (GoFiber requestid).
+-- @module mk.middleware.requestid
+
+local async = import "async"
+local mk = import "mk"
+local strings = import "string"
+local uv = import "uv"
+
+-- `Context:request_id()` reads this local.
+local const REQUEST_ID_LOCAL = "requestid"
+local const MAX_ID_BYTES = 256
+local const GENERATOR_ATTEMPTS = 3
+local const RANDOM_BYTES = 16
+local const HEX_DIGITS = "0123456789abcdef"
+local const TOKEN_PATTERN = "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+
+--- Request-id options.
+-- @field next Skip the middleware (continue the chain) when it returns true.
+-- @field header Request and response header (default "X-Request-ID").
+-- @field generator Id source; invalid ids are retried, then replaced by a
+-- random one (default: 16 CSPRNG bytes as hex).
+record Config
+  const next: (function (mk.Context): boolean)?
+  const header: string?
+  const generator: (function (): string)?
+end
+
+-- 1..256 visible ASCII bytes (VCHAR 0x21..0x7E): no spaces or controls.
+local function valid_id(text: string): boolean
+  local length = #text
+  if length < 1 or length > MAX_ID_BYTES then return false end
+  for index = 1, length do
+    local byte = strings.byte(text, index)
+    if byte < 0x21 or byte > 0x7E then return false end
+  end
+  return true
+end
+
+local function random_id(): string
+  local buffer = uv.buf_t.allocate(RANDOM_BYTES)
+  local status = uv.random(nil, nil, buffer, RANDOM_BYTES, 0, nil)
+  if status < 0 then
+    raise async.OperationError(status, uv.err_name(status), uv.strerror(status), "requestid.random")
+  end
+  local bytes = buffer:to_string(RANDOM_BYTES)
+  local out = strings.writer()
+  for index = 1, RANDOM_BYTES do
+    local byte = strings.byte(bytes, index)
+    local high = byte // 16 + 1
+    local low = byte % 16 + 1
+    out:write(strings.sub(HEX_DIGITS, high, high) .. strings.sub(HEX_DIGITS, low, low))
+  end
+  return out:drain()
+end
+
+local function generate(generator: (function (): string)?): string
+  if generator ~= nil then
+    for _ = 1, GENERATOR_ATTEMPTS do
+      local candidate = generator()
+      if valid_id(candidate) then return candidate end
+    end
+  end
+  return random_id()
+end
+
+--- Reuse a valid incoming id or generate one, echo it in the response
+-- header, and store it for `from_context`/`Context:request_id()`.
+function new(config: Config?): mk.Handler
+  local skip: (function (mk.Context): boolean)? = nil
+  local header = "X-Request-ID"
+  local generator: (function (): string)? = nil
+  if config ~= nil then
+    skip = config.next
+    header = config.header or header
+    generator = config.generator
+  end
+  if strings.match(header, TOKEN_PATTERN) == nil then
+    raise "requestid: header must be an HTTP token"
+  end
+  return function (ctx: mk.Context)
+    if skip ~= nil and skip(ctx) then
+      ctx:next()
+      return
+    end
+    local incoming? = ctx:header_opt(header)
+    local id = ""
+    if incoming ~= nil and valid_id(incoming) then
+      id = incoming
+    else
+      id = generate(generator)
+    end
+    ctx:set(header, id)
+    ctx:set_local(REQUEST_ID_LOCAL, id)
+    ctx:next()
+  end
+end
+
+--- The id stored by this middleware for the current request, or "".
+function from_context(ctx: mk.Context): string
+  return ctx:request_id()
+end

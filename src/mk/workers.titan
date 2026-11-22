@@ -457,7 +457,10 @@ local function WorkerState:handle(active: ActiveExchange, first: boolean,
   local route?, found?, head_fallback = core:classify(request.method, raw_path)
   local chain_id = core.root_dispatcher_id
   if route ~= nil then chain_id = route.dispatcher_id end
-  if found ~= nil then meta.params_map = found.params end
+  if route ~= nil and found ~= nil then
+    meta.params_map = found.params
+    meta.route_pattern = route.pattern
+  end
   local ctx = Context.create(core, meta, raw_path, target_error, chain_id, head_fallback)
   ctx.raw_request = request
   ctx.raw_response = response

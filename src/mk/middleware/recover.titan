@@ -1,0 +1,74 @@
+--- Convert unexpected handler failures into 500 responses (GoFiber recover).
+-- @module mk.middleware.recover
+
+local async = import "async"
+local mk = import "mk"
+local os = import "os"
+local strings = import "string"
+
+--- Recovery options.
+-- @field next Skip the middleware (continue the chain) when it returns true.
+-- @field enable_stack_trace Report each recovered failure with its traceback.
+-- @field stack_trace_handler Receives the failure and traceback when
+-- stack traces are enabled (default: an error log line through
+-- `Context:logger()`, else stderr).
+-- @field exception_handler Maps a failure to the HttpError to raise
+-- (default: 500 with code "internal_error" and the failure as cause).
+record Config
+  const next: (function (mk.Context): boolean)?
+  const enable_stack_trace: boolean?
+  const stack_trace_handler: (function (mk.Context, value, string): ())?
+  const exception_handler: (function (mk.Context, value, string): mk.HttpError)?
+end
+
+local function report_stack_trace(ctx: mk.Context, failure: value, trace: string)
+  if ctx:logger() ~= nil then
+    local route = ctx:matched_route()
+    ctx:log("error", "panic_recovered", {
+      ["error"] = strings.tostring(failure),
+      ["traceback"] = trace,
+      ["method"] = ctx:method(),
+      ["route"] = route ~= "" and route or "<unmatched>",
+    })
+  else
+    os.stderr:write("panic: " .. strings.tostring(failure) .. "\n" .. trace .. "\n")
+  end
+end
+
+--- Run the rest of the chain and turn any failure other than an HttpError
+-- or a cancellation into an HttpError for the app's error handler. HttpErrors
+-- and cancellation propagate unchanged with their original tracebacks.
+function new(config: Config?): mk.Handler
+  local skip: (function (mk.Context): boolean)? = nil
+  local trace_enabled = false
+  local trace_handler: (function (mk.Context, value, string): ())? = nil
+  local exception_handler: (function (mk.Context, value, string): mk.HttpError)? = nil
+  if config ~= nil then
+    skip = config.next
+    trace_enabled = config.enable_stack_trace or false
+    trace_handler = config.stack_trace_handler
+    exception_handler = config.exception_handler
+  end
+  return function (ctx: mk.Context)
+    if skip ~= nil and skip(ctx) then
+      ctx:next()
+      return
+    end
+    do
+      ctx:next()
+    catch
+      if error is async.CancellationReason or error is mk.HttpError then raise end
+      local failure = error
+      local trace = traceback
+      if trace_enabled then
+        if trace_handler ~= nil then
+          trace_handler(ctx, failure, trace)
+        else
+          report_stack_trace(ctx, failure, trace)
+        end
+      end
+      if exception_handler ~= nil then raise exception_handler(ctx, failure, trace) end
+      raise mk.HttpError(500, nil, "internal_error", failure)
+    end
+  end
+end

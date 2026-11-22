@@ -107,7 +107,10 @@ function App:test(req: TestRequest, config: TestConfig?): TestResponse
   local core = self.core
   local meta, raw_path, target_error? = core:meta(method, req.target, headers, scheme)
   local route?, found?, head_fallback = core:classify(method, raw_path)
-  if found ~= nil then meta.params_map = found.params end
+  if route ~= nil and found ~= nil then
+    meta.params_map = found.params
+    meta.route_pattern = route.pattern
+  end
   local chain_id = self.root_dispatcher.id
   if route ~= nil then chain_id = route.dispatcher_id end
   local terminal: HttpError? = nil

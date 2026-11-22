@@ -774,7 +774,10 @@ local function App:handle_http(request: http.Request, response: http.Response,
   local meta, raw_path, target_error? = core:meta(request.method, request.target,
                                                  request.headers, request.url.scheme)
   local route?, found?, head_fallback = core:classify(request.method, raw_path)
-  if found ~= nil then meta.params_map = found.params end
+  if route ~= nil and found ~= nil then
+    meta.params_map = found.params
+    meta.route_pattern = route.pattern
+  end
   if self.closing then
     self:run_in_place(meta, raw_path, target_error, -1, head_fallback, request, response,
       HttpError(503, "Service Unavailable", "shutting_down", nil))
