@@ -33,6 +33,12 @@ build = {
          install_command = '(if not exist "$(PREFIX)\\dist\\modules" mkdir "$(PREFIX)\\dist\\modules") && copy /Y build\\mk.dll "$(PREFIX)\\dist\\modules\\mk.dll"',
       },
    },
+   -- Installed into the rock directory so the guide, reference, and the
+   -- titan-mk agent skill ship with the provider.
+   copy_directories = {
+      "doc",
+      "skills",
+   },
 }
 
 hooks = {

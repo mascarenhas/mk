@@ -1,0 +1,411 @@
+name: CI
+
+on:
+  push:
+    # "**" also matches branch names with slashes, so every pushed branch runs.
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # The SDK every job builds: Titan's Lua fork, stock LuaRocks, and the
+  # Titan release source rock, in the validation profile.
+  LUA_RELEASE: v5.5.1-1
+  LUAROCKS_VERSION: "3.13.0"
+  TITAN_RELEASE: v0.6.0
+  TITAN_ROCK: titan-0.6.0-1.src.rock
+  TITAN_BUILD_PROFILE: validation
+
+jobs:
+  linux:
+    name: Linux x64 (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      OPENSSL_MODE: system
+      TITAN_JOBS: "4"
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install build, test, and coverage prerequisites
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+            build-essential ca-certificates cmake curl gcc-14 git libreadline-dev \
+            libssl-dev pkg-config python3-venv
+          echo "TITAN_PREFIX=$RUNNER_TEMP/titan-sdk" >> "$GITHUB_ENV"
+
+      # A release can be re-cut under the same tag: the cache names the exact
+      # source rock digest and the commit the tag currently selects.
+      - name: Identify the Titan release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: &identify-release |
+          set -euo pipefail
+          commit=$(gh api "repos/mascarenhas/titan/commits/$TITAN_RELEASE" --jq '.sha')
+          [[ $commit =~ ^[0-9a-f]{40}$ ]]
+          digest=$(gh api "repos/mascarenhas/titan/releases/tags/$TITAN_RELEASE" --jq "
+            [.assets[] | select(.name == \"$TITAN_ROCK\")] | select(length == 1) | first |
+            .digest | select(type == \"string\" and test(\"^sha256:[0-9a-f]{64}$\")) |
+            sub(\"^sha256:\"; \"\")")
+          [[ $digest =~ ^[0-9a-f]{64}$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "rock-sha256=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Identify the native toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          {
+            cat /etc/os-release
+            cc --version
+            dpkg-query -W -f='${Package} ${Version}\n' libc6-dev libreadline-dev libssl-dev
+            printf '%s\n' "$TITAN_PREFIX"
+          } | tee "$RUNNER_TEMP/titan-toolchain"
+          echo "digest=$(sha256sum "$RUNNER_TEMP/titan-toolchain" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # No fallback keys: another source rock or toolchain is never a valid
+      # hit. Bump layout-v1 when the install recipe or cached layout changes.
+      - name: Restore the Titan SDK
+        id: sdk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.TITAN_PREFIX }}
+          key: titan-sdk-layout-v1-ubuntu-24.04-${{ runner.arch }}-${{ env.TITAN_BUILD_PROFILE }}-openssl-${{ env.OPENSSL_MODE }}-lua-${{ env.LUA_RELEASE }}-luarocks-${{ env.LUAROCKS_VERSION }}-${{ env.TITAN_RELEASE }}-${{ steps.release.outputs.commit }}-rock-${{ steps.release.outputs.rock-sha256 }}-toolchain-${{ steps.toolchain.outputs.digest }}
+
+      - name: Build Lua, LuaRocks, and the Titan release rock
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        env:
+          ROCK_SHA256: ${{ steps.release.outputs.rock-sha256 }}
+        run: |
+          set -euo pipefail
+          sources="$RUNNER_TEMP/titan-sources"
+          mkdir -p "$sources/lua"
+          cd "$sources"
+          curl -fL --retry 3 -o lua.tar.gz \
+            "https://github.com/mascarenhas/lua-5.5.1/archive/refs/tags/$LUA_RELEASE.tar.gz"
+          tar -xzf lua.tar.gz --strip-components=1 -C lua
+          make -C lua -j4 linux-readline PREFIX="$TITAN_PREFIX" \
+            MYCFLAGS='-O2 -fno-lto' MYLDFLAGS='-O2 -fno-lto'
+          make -C lua install PREFIX="$TITAN_PREFIX"
+          curl -fL --retry 3 -o luarocks.tar.gz \
+            "https://luarocks.org/releases/luarocks-$LUAROCKS_VERSION.tar.gz"
+          tar -xzf luarocks.tar.gz
+          (cd "luarocks-$LUAROCKS_VERSION" &&
+            ./configure --prefix="$TITAN_PREFIX" --rocks-tree="$TITAN_PREFIX" \
+              --with-lua="$TITAN_PREFIX" --force-config &&
+            make LUA_DIR="$TITAN_PREFIX" &&
+            make install LUA_DIR="$TITAN_PREFIX")
+          curl -fL --retry 3 -o "$TITAN_ROCK" \
+            "https://github.com/mascarenhas/titan/releases/download/$TITAN_RELEASE/$TITAN_ROCK"
+          echo "$ROCK_SHA256  $TITAN_ROCK" | sha256sum --check --strict
+          PATH="$TITAN_PREFIX/bin:$PATH" "$TITAN_PREFIX/bin/luarocks" install "$TITAN_ROCK"
+
+      - name: Validate the Titan SDK
+        run: &validate-unix-sdk |
+          set -euo pipefail
+          test -x "$TITAN_PREFIX/bin/titanc"
+          test -s "$TITAN_PREFIX/lib/titan/0.6/titan.a"
+          test -s "$TITAN_PREFIX/lib/titan/0.6/libtitan.a"
+          test "$(cat "$TITAN_PREFIX/etc/titan/build-profile")" = "$TITAN_BUILD_PROFILE"
+          test "$("$TITAN_PREFIX/bin/titanc" --print-root)" = "$TITAN_PREFIX"
+          echo "$TITAN_PREFIX/bin" >> "$GITHUB_PATH"
+
+      # Save before mk is installed into the prefix by the packaging check.
+      - name: Save the Titan SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.TITAN_PREFIX }}
+          key: ${{ steps.sdk-cache.outputs.cache-primary-key }}
+
+      - name: Run the mk test suite
+        run: make test
+
+      - name: Prepare the LCOV reporter
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mk-coverage-tools"
+          "$RUNNER_TEMP/mk-coverage-tools/bin/pip" install gcovr==8.4
+          gcc-14 --version
+          gcov-14 --version
+
+      # Titan's gcc-gcov backend needs GCC 14+ with the matching gcov. The
+      # covered build lives in build/coverage; its LCOV report is
+      # build/coverage/.coverage/report/coverage.info.
+      - name: Measure line coverage
+        run: |
+          make coverage CC=gcc-14 COVERAGE_GCOV=gcov-14 COVERAGE_FORMAT=lcov \
+            COVERAGE_GCOVR="$RUNNER_TEMP/mk-coverage-tools/bin/gcovr"
+          test -s build/coverage/.coverage/report/coverage.info
+
+      - name: Retain the coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mk-line-coverage
+          path: build/coverage/.coverage/report/coverage.info
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload line coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: build/coverage/.coverage/report/coverage.info
+          flags: mk
+          name: mk-linux-lines
+          use_oidc: true
+
+      - name: Install, consume, and uninstall the titan-mk rock
+        run: bash .github/scripts/package-smoke.sh "$RUNNER_TEMP/mk-package-smoke"
+
+  macos:
+    name: macOS arm64 (macos-15)
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      OPENSSL_MODE: system
+      TITAN_JOBS: "3"
+
+    steps:
+      - name: Install build prerequisites
+        run: |
+          brew install cmake make openssl@3 pkgconf readline
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          {
+            # Homebrew's openssl@3 is keg-only; system-OpenSSL mode finds it here.
+            echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig"
+            echo "TMPDIR=$(mktemp -d /private/tmp/mk-ci.XXXXXX)"
+            echo "TITAN_PREFIX=$RUNNER_TEMP/titan-sdk"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Identify the Titan release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: *identify-release
+
+      - name: Identify the native toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          {
+            sw_vers
+            cc --version
+            xcrun --show-sdk-path
+            make --version
+            brew list --versions cmake make openssl@3 pkgconf readline
+            printf '%s\n' "$TITAN_PREFIX"
+          } | tee "$RUNNER_TEMP/titan-toolchain"
+          echo "digest=$(shasum -a 256 "$RUNNER_TEMP/titan-toolchain" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # No fallback keys. Bump layout-v1 when the install recipe or cached
+      # layout changes.
+      - name: Restore the Titan SDK
+        id: sdk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.TITAN_PREFIX }}
+          key: titan-sdk-layout-v1-macos-15-${{ runner.arch }}-${{ env.TITAN_BUILD_PROFILE }}-openssl-${{ env.OPENSSL_MODE }}-lua-${{ env.LUA_RELEASE }}-luarocks-${{ env.LUAROCKS_VERSION }}-${{ env.TITAN_RELEASE }}-${{ steps.release.outputs.commit }}-rock-${{ steps.release.outputs.rock-sha256 }}-toolchain-${{ steps.toolchain.outputs.digest }}
+
+      - name: Build Lua, LuaRocks, and the Titan release rock
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        env:
+          ROCK_SHA256: ${{ steps.release.outputs.rock-sha256 }}
+        run: |
+          set -euo pipefail
+          readline=$(brew --prefix readline)
+          sources="$RUNNER_TEMP/titan-sources"
+          mkdir -p "$sources/lua"
+          cd "$sources"
+          curl -fL --retry 3 -o lua.tar.gz \
+            "https://github.com/mascarenhas/lua-5.5.1/archive/refs/tags/$LUA_RELEASE.tar.gz"
+          tar -xzf lua.tar.gz --strip-components=1 -C lua
+          make -C lua -j3 macosx PREFIX="$TITAN_PREFIX" \
+            MYCFLAGS="-O2 -fno-lto -I$readline/include" \
+            MYLDFLAGS="-O2 -fno-lto -L$readline/lib"
+          make -C lua install PREFIX="$TITAN_PREFIX"
+          curl -fL --retry 3 -o luarocks.tar.gz \
+            "https://luarocks.org/releases/luarocks-$LUAROCKS_VERSION.tar.gz"
+          tar -xzf luarocks.tar.gz
+          (cd "luarocks-$LUAROCKS_VERSION" &&
+            ./configure --prefix="$TITAN_PREFIX" --rocks-tree="$TITAN_PREFIX" \
+              --with-lua="$TITAN_PREFIX" --force-config &&
+            make LUA_DIR="$TITAN_PREFIX" &&
+            make install LUA_DIR="$TITAN_PREFIX")
+          curl -fL --retry 3 -o "$TITAN_ROCK" \
+            "https://github.com/mascarenhas/titan/releases/download/$TITAN_RELEASE/$TITAN_ROCK"
+          echo "$ROCK_SHA256  $TITAN_ROCK" | shasum -a 256 --check --strict
+          PATH="$TITAN_PREFIX/bin:$PATH" "$TITAN_PREFIX/bin/luarocks" install "$TITAN_ROCK"
+
+      - name: Validate the Titan SDK
+        run: *validate-unix-sdk
+
+      - name: Save the Titan SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.TITAN_PREFIX }}
+          key: ${{ steps.sdk-cache.outputs.cache-primary-key }}
+
+      - name: Run the mk test suite
+        run: make test
+
+      - name: Install, consume, and uninstall the titan-mk rock
+        run: bash .github/scripts/package-smoke.sh "$RUNNER_TEMP/mk-package-smoke"
+
+  windows:
+    name: Windows x64 CLANG64 (windows-2025-vs2026)
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: msys2 {0}
+        working-directory: C:/mk-ci
+    env:
+      TITAN_PREFIX: C:/titan-sdk
+      LUAROCKS_CONFIG: C:/titan-sdk/etc/luarocks/config-5.5.lua
+      TITAN_JOBS: "4"
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+
+    steps:
+      - uses: actions/checkout@v6
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+        with:
+          persist-credentials: false
+
+      - name: Install MSYS2 CLANG64 build tools
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          location: C:/mk-msys2
+          cache: true
+          install: >-
+            git make perl curl tar unzip
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-llvm
+            mingw-w64-clang-x86_64-make
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-openssl
+
+      # Filesystem tests need a fixed NTFS volume; D: may be ReFS.
+      - name: Stage the checkout on local NTFS
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          test ! -e /c/mk-ci
+          cp -a . /c/mk-ci
+          df -h /c
+
+      - name: Identify the Titan release
+        id: release
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: *identify-release
+
+      - name: Identify the CLANG64 toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          digest=$({
+            cygpath -m "$TITAN_PREFIX"
+            cygpath -m /clang64
+            uname -r
+            pacman -Q
+          } | tee /tmp/titan-windows-toolchain | sha256sum | cut -d' ' -f1)
+          echo "digest=$digest" >> "$(cygpath -u "$GITHUB_OUTPUT")"
+
+      # No fallback keys. Bump layout-v1 when the install recipe or cached
+      # layout changes.
+      - name: Restore the Titan SDK
+        id: sdk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: C:/titan-sdk
+          key: titan-sdk-layout-v1-windows-2025-vs2026-${{ runner.arch }}-CLANG64-${{ env.TITAN_BUILD_PROFILE }}-openssl-clang64-${{ env.TITAN_RELEASE }}-${{ steps.release.outputs.commit }}-rock-${{ steps.release.outputs.rock-sha256 }}-toolchain-${{ steps.toolchain.outputs.digest }}
+
+      # The source rock carries the Titan tree, Makefile.win, and the Lua
+      # sources; Makefile.win builds lua55.dll, LuaRocks, and the compiler
+      # into one SDK prefix.
+      - name: Build Lua, LuaRocks, and Titan from the release rock
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        working-directory: C:/
+        env:
+          ROCK_SHA256: ${{ steps.release.outputs.rock-sha256 }}
+        run: |
+          set -euo pipefail
+          unset LD
+          export PATH="/clang64/bin:$PATH"
+          mkdir -p /c/titan-src
+          cd /c/titan-src
+          curl -fL --retry 3 -o "$TITAN_ROCK" \
+            "https://github.com/mascarenhas/titan/releases/download/$TITAN_RELEASE/$TITAN_ROCK"
+          echo "$ROCK_SHA256  $TITAN_ROCK" | sha256sum --check --strict
+          unzip -q "$TITAN_ROCK"
+          cd titan
+          mingw32-make -f Makefile.win lua luarocks compiler \
+            PREFIX="$TITAN_PREFIX" TITAN_BUILD_PROFILE="$TITAN_BUILD_PROFILE"
+
+      - name: Validate the Titan SDK
+        run: |
+          set -euo pipefail
+          sdk=$(cygpath -u "$TITAN_PREFIX")
+          test -x "$sdk/bin/titanc.exe"
+          test -f "$sdk/bin/lua55.dll"
+          test -f "$sdk/lib/titan/0.6/titan.dll"
+          test "$(cat "$sdk/etc/titan/build-profile")" = "$TITAN_BUILD_PROFILE"
+          test "$(cygpath -m "$("$sdk/bin/titanc.exe" --print-root)")" = "$(cygpath -m "$TITAN_PREFIX")"
+
+      - name: Save the Titan SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:/titan-sdk
+          key: ${{ steps.sdk-cache.outputs.cache-primary-key }}
+
+      - name: Run the mk test suite
+        run: |
+          set -euo pipefail
+          unset LD
+          export PATH="$(cygpath -u "$TITAN_PREFIX")/bin:/clang64/bin:$PATH"
+          make test
+
+      - name: Install, consume, and uninstall the titan-mk rock
+        run: |
+          set -euo pipefail
+          unset LD
+          export PATH="$(cygpath -u "$TITAN_PREFIX")/bin:/clang64/bin:$PATH"
+          bash .github/scripts/package-smoke.sh /c/mk-package-smoke
