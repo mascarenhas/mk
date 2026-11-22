@@ -82,6 +82,7 @@ end
 - **Errors:** Signal expected HTTP failures with `raise mk.HttpError(status, message?, code?, cause?)`. Out-of-range statuses normalize to `500` first (defaulting message to `"Internal Server Error"`). Never swallow `async.CancellationReason`.
 - **Observers & route/peer metadata:** Use `ctx:on_before_commit` (header mutation before wire write) and `ctx:on_complete` (LIFO post-response observation) instead of wrapping `ctx:next()` in `catch`. `ctx:classified_route()` exposes the dispatched route pattern even before endpoint execution (for error/auth/session/logger middleware). `ctx:peer_address()` / `meta:peer_address()` returns the direct socket `net.Address?` (`nil` in `App:test` or if disconnected before capture; `X-Forwarded-For` / `trusted_proxies` are intentionally omitted).
 - **Forwarded scheme/host headers:** `Config.trust_forwarded_headers` defaults to `false`; enable only behind a trusted reverse proxy stripping client `X-Forwarded-Proto` and `X-Forwarded-Host`.
+- **Optional logger bindings:** Both `ctx:logger()` and `wctx.logger` are `log.Logger?` (`nil` when `Config.logger` is omitted). Bind them with `local logger? = ctx:logger()` / `local logger? = wctx.logger` (never `local logger = ...`, which asserts non-nil in Titan and raises when no logger is configured), or call `ctx:log(...)` which is a no-op without a logger.
 
 ### 3. Worker Threads (`WorkerMode`) and Transfer Constraints
 - **Modes:** `WorkerMode.parent()` (default), `WorkerMode.pool(PoolOptions { size?, queue_capacity?, on_start? })`, `WorkerMode.session(SessionOptions { session_id, queue_capacity?, max_sessions?, ephemeral?, on_start?, on_exit? })`.
@@ -92,7 +93,7 @@ end
   - *Parent-only:* `SessionOptions.session_id` and `on_exit` never cross threads.
   - `mk` wraps callbacks with `TransferableHandler`, `TransferableErrorHandler`, and `TransferableWorkerInit` (and `keyauth.CustomExtractor` for custom extractors).
 - **Session retirement & isolation:** Call `ctx:retire_worker()` in a session handler for immediate causal retirement (no-op on `parent`/`pool`). Keep-alive connections stay on the worker under `idle_timeout_ms` until the next request's headers are parsed, then return via `return_pipe` for fresh parent classification. Pool worker exit outside shutdown **fails the whole `App`**; session worker exit stays isolated to that session and runs `on_exit` after OS join.
-- **Shutdown:** Call `app:initiate_shutdown()` inside handlers/hooks/monitors (non-blocking). `app:shutdown()` waits for full retirement and **raises** if called from a handler or lifecycle hook.
+- **Shutdown & hooks:** Call `app:initiate_shutdown()` inside handlers/hooks/monitors (non-blocking). `app:shutdown()` waits for full retirement and **raises** if called from a handler or lifecycle hook. `on_pre_shutdown` and `on_post_shutdown` also run during startup rollback if `App:start()` fails after binding the listener and on `App:shutdown()` of a never-started `App`, so keep hook-owned resource teardown idempotent and tolerant of unstarted/partial state.
 
 ### 4. Built-in Middleware Quick Reference (`mk.middleware.*`)
 

@@ -53,7 +53,7 @@ local function proxy_health(ctx: mk.Context)
 end
 ```
 
-`wctx` also provides `wctx.id` (`>= 1`), `wctx.session_id` (`string?`), and `wctx.logger` (a non-blocking cross-thread forwarding `log.Logger` wired to `Config.logger`).
+`wctx` also provides `wctx.id` (`>= 1`), `wctx.session_id` (`string?`), and `wctx.logger` (`log.Logger?`, a non-blocking cross-thread forwarding logger wired to `Config.logger`, or `nil` when `Config.logger` is unset). Because `wctx.logger` is optional, bind it with `local logger? = wctx.logger`—omitting `?` asserts non-nil in Titan and raises when no logger is configured.
 
 ## Cross-State Closure Transfer Constraints and `Transferable*`
 
@@ -89,6 +89,8 @@ Shutdown always runs in this exact order:
 5. Close and drain `return_pipe` and adopted connections, discarding any undelivered `http.Exchange` payloads cleanly.
 6. Close and drain the cross-worker log forwarder into `Config.logger`.
 7. Run `Hooks:on_post_shutdown(first_failure?)` hooks.
+
+Because `on_pre_shutdown` and `on_post_shutdown` also run on startup rollback (when `App:start()` fails after listener bind) and on `App:shutdown()` of a never-started `App`, keep hook-owned teardown idempotent and safe when startup did not complete.
 
 ---
 

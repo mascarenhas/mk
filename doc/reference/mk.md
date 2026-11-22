@@ -109,11 +109,11 @@ function App:is_worker_alive(worker_id: integer): boolean
 function App:stop_worker(worker_id: integer): boolean
 ```
 
-- **`App:start(addr, listen_config?)`:** Freezes routes, binds `http.listen` (or `http.listen_tls` when `cert_file ~= nil`), resolves an ephemeral port `0` via `server:local_address().port` (so `ListenData.port` carries the OS-assigned port), sets `read_ahead(false)` and `header_limit`, spawns pool workers and supervision Tasks, and runs `on_listen` hooks. Raises if already started.
+- **`App:start(addr, listen_config?)`:** Freezes routes, binds `http.listen` (or `http.listen_tls` when `cert_file ~= nil`), resolves an ephemeral port `0` via `server:local_address().port` (so `ListenData.port` carries the OS-assigned port), sets `read_ahead(false)` and `header_limit`, spawns pool workers and supervision Tasks, and runs `on_listen` hooks. Raises if already started. If startup fails after binding the listener (for example during worker startup or an `on_listen` hook), `App:start` rolls back by running full shutdown (including `on_pre_shutdown` and `on_post_shutdown`) before re-raising.
 - **`App:serve()`:** Runs the accept loop until shutdown closes the listener, joins shutdown retirement, and re-raises any fatal failure (such as a pool worker exit outside shutdown).
 - **`App:listen(addr, listen_config?)`:** Calls `start` then `serve`.
-- **`App:initiate_shutdown()`:** Begins shutdown asynchronously without waiting (safe inside handlers, lifecycle hooks, and monitors).
-- **`App:shutdown()`:** Begins shutdown and waits for complete retirement. Raises if called inside an active request handler or lifecycle hook.
+- **`App:initiate_shutdown()`:** Begins shutdown asynchronously without waiting (safe inside handlers, lifecycle hooks, and monitors). Idempotent once shutdown has begun.
+- **`App:shutdown()`:** Begins shutdown and waits for complete retirement. Raises if called inside an active request handler or lifecycle hook. Calling `shutdown()` on a never-started `App` (including one whose `App:start()` failed before listener bind) still executes `on_pre_shutdown` and `on_post_shutdown` once.
 - **`App:stop_worker(worker_id)`:** Cancels a live worker thread (`false` if not alive). Retires only that session for a `session` worker; triggers forced shutdown of the `App` without logging `"worker_failed"` for a `pool` worker outside shutdown.
 
 ---
@@ -191,6 +191,8 @@ function Hooks:on_listen(fn: function (ListenData): ())
 function Hooks:on_pre_shutdown(fn: function (): ())
 function Hooks:on_post_shutdown(fn: function (async.Error?): ())
 ```
+
+`on_pre_shutdown` and `on_post_shutdown` run once during shutdown, including during startup rollback when `App:start()` fails after binding the listener and when `App:shutdown()` (or `App:initiate_shutdown()`) is called on a never-started `App`. Keep hook-owned resource teardown idempotent and tolerant of unstarted or partially initialized state.
 
 ---
 
@@ -353,6 +355,7 @@ function Context:retire_worker()
 
 - **`Context:classified_route()` vs. `Context:matched_route()`:** `classified_route()` returns the declared pattern of the endpoint route the request classified to at dispatch (or `""`), available even in outer admission middleware before endpoint execution. `matched_route()` returns the pattern of the endpoint route once `ctx:next()` reaches it (or `""` beforehand / if unmatched).
 - **`Context:peer_address(): net.Address?`:** Returns the captured client socket address (see [`RequestMeta`](#requestmeta)).
+- **`Context:logger(): log.Logger?`:** Returns `nil` when `Config.logger` is unset. Bind with `local logger? = ctx:logger()` (omitting `?` in Titan asserts non-nil and raises when no logger is configured), or use `ctx:log(...)` which is a no-op without a logger.
 - **Closing exchanges & `413` completion:** When a closing condition (such as uncommitted `413 Content Too Large`, shutdown, retiring/ephemeral session worker, or explicit `Connection: close`) or the client request announces `Connection: close`, `titan.http` closes the connection after the response finishes without reading the unread request body, so `mk` completes normally without calling `response:abort()`. If a response was already committed as persistent before a close decision or if bounded request-body drain fails, `mk` aborts the transport.
 - **`Context:type(extension_or_mime, charset?)` and MIME defaults (`src/mk/mime.titan`):** Accepts a full MIME type (containing `/`), dotted extension (`".json"`), or bare extension (`"json"`). Unknown extensions fall back to `"application/octet-stream"`. Text-like media types (`text/*`, `application/json`, `application/javascript`, `application/xml`, `image/svg+xml`, `application/yaml`) default to `; charset=utf-8` unless `charset` is supplied or a `;` parameter is already present. (`mime.titan` exports no public symbols of its own.)
 
@@ -430,6 +433,8 @@ function TransferableWorkerInit:call(wctx: WorkerContext)
 function TransferableWorkerInit:to_transfer_payload(): string
 function TransferableWorkerInit.from_transfer_payload(payload: string): TransferableWorkerInit
 ```
+
+`WorkerContext.logger` is `log.Logger?` (`nil` when `Config.logger` is unset). Inside `on_start(wctx)`, bind it with `local logger? = wctx.logger` rather than `local logger = wctx.logger` (which asserts non-nil in Titan and raises when no logger is configured).
 
 *(Note: `workers.titan` also declares nominal wire records `ExchangeEnvelope`, `ExchangePipe`, `RetireNotice`, `EntrySpec`, `WorkerSettings`, and `WorkerBootstrap` for internal `protobuf`/`thread` cross-state transport; applications do not construct them directly.)*
 
