@@ -120,7 +120,7 @@ local function Detacher:wait_for(count: integer)
 end
 
 local function envelope(payload: string): mk.ExchangeEnvelope
-  return mk.ExchangeEnvelope(payload, "GET", "/", 0, "", false)
+  return mk.ExchangeEnvelope(payload, "GET", "/", 0, "", false, nil)
 end
 
 local function answer(exchange: http.Exchange, text: string)
@@ -187,29 +187,26 @@ function test_worker_logs_are_forwarded(_: test.Context)
   test.assert(found, "the worker log line reached the parent logger")
 end
 
--- Read one bodyless keep-alive response and return its status and X-Owner.
-local function read_owner(connection: net.Connection): (integer, string)
+-- Read one keep-alive response whose body is one "\n"-terminated line and
+-- return its status and body line.
+local function read_line_response(connection: net.Connection): (integer, string)
   local head? = connection:read_until("\r\n\r\n", true)
   if head == nil then raise "connection closed before a response" end
-  local owner = ""
-  for line in strings.split(head, "\r\n") do
-    if strings.sub(strings.lower(line), 1, 8) == "x-owner:" then owner = strings.sub(line, 10) end
-  end
-  return math.tointeger(strings.sub(head, 10, 12)) or 0, owner
+  local body? = connection:read_until("\n", true)
+  if body == nil then raise "connection closed before the response body" end
+  return math.tointeger(strings.sub(head, 10, 12)) or 0, body
 end
 
 function test_sustained_keep_alive_returns(_: test.Context)
-  -- Bodyless 204 responses are one write each, so the round trips are not
-  -- throttled by Nagle/delayed-ACK on the header-then-body write pair.
   local app = mk.App()
   app:get("/parent", function (ctx: mk.Context)
-    ctx:set("X-Owner", "parent " .. ctx:worker_id()):no_content()
+    ctx:send_string("parent " .. ctx:worker_id() .. "\n")
   end)
   local pooled = app:group_with("/pool", mk.GroupOptions {
     workers = mk.WorkerMode.pool(mk.PoolOptions { size = 1 }),
   })
   pooled:get("/", function (ctx: mk.Context)
-    ctx:set("X-Owner", "pool " .. ctx:worker_id()):no_content()
+    ctx:send_string("pool " .. ctx:worker_id() .. "\n")
   end)
   local server = app:listen_test()
   defer server:close()
@@ -217,19 +214,52 @@ function test_sustained_keep_alive_returns(_: test.Context)
   local worker = (pooled:pool_workers()[1] as mk.WorkerInfo).id
   -- Every /parent request after a /pool request arrives at the worker on the
   -- same keep-alive connection and is returned to the parent through the
-  -- 256-slot return pipe; 300 rounds prove the pipe slots are reused.
-  within(60000, "300 keep-alive round trips", function ()
+  -- 256-slot return pipe; 300 rounds prove the pipe slots are reused. With
+  -- default TCP_NODELAY and coalesced header+body writes, responses with
+  -- bodies are not throttled by Nagle/delayed ACK (about 40 ms per round
+  -- trip, which would exceed this bound).
+  within(15000, "300 keep-alive round trips with bodies", function ()
     local connection = net.connect(server.host, server.port)
     defer connection:close()
     for round = 1, 300 do
       connection:write("GET /pool HTTP/1.1\r\nHost: t\r\n\r\n")
-      local pool_status, pool_owner = read_owner(connection)
-      test.assert(pool_status == 204 and pool_owner == "pool " .. worker,
-        "round " .. round .. " pool: " .. pool_status .. " " .. pool_owner)
+      local pool_status, pool_body = read_line_response(connection)
+      test.assert(pool_status == 200 and pool_body == "pool " .. worker,
+        "round " .. round .. " pool: " .. pool_status .. " " .. pool_body)
       connection:write("GET /parent HTTP/1.1\r\nHost: t\r\n\r\n")
-      local parent_status, parent_owner = read_owner(connection)
-      test.assert(parent_status == 204 and parent_owner == "parent 0",
-        "round " .. round .. " parent: " .. parent_status .. " " .. parent_owner)
+      local parent_status, parent_body = read_line_response(connection)
+      test.assert(parent_status == 200 and parent_body == "parent 0",
+        "round " .. round .. " parent: " .. parent_status .. " " .. parent_body)
+    end
+  end)
+end
+
+local function report_peer(ctx: mk.Context)
+  local peer? = ctx:peer_address()
+  local text = "none"
+  if peer ~= nil then text = peer.ip .. ":" .. peer.port end
+  ctx:send_string(text .. " worker " .. ctx:worker_id() .. "\n")
+end
+
+function test_peer_address_across_pool_handoffs(_: test.Context)
+  local app = mk.App()
+  app:get("/parent", report_peer)
+  app:get("/pool", report_peer):workers(mk.WorkerMode.pool(mk.PoolOptions { size = 1 }))
+  local server = app:listen_test()
+  defer server:close()
+  within(5000, "peer address requests", function ()
+    local connection = net.connect(server.host, server.port)
+    defer connection:close()
+    local expected = "127.0.0.1:" .. connection:local_address().port
+    -- Worker, then a keep-alive return to the parent, then a worker again.
+    local targets: {string} = {"/pool", "/parent", "/pool"}
+    for index = 1, #targets do
+      connection:write("GET " .. targets[index] .. " HTTP/1.1\r\nHost: t\r\n\r\n")
+      local status, body = read_line_response(connection)
+      local prefix = expected .. " worker "
+      local on_parent = body == prefix .. "0"
+      test.assert(status == 200 and strings.sub(body, 1, #prefix) == prefix and
+        on_parent == (targets[index] == "/parent"), targets[index] .. " request " .. index .. ": " .. body)
     end
   end)
 end
@@ -383,7 +413,7 @@ end
 function test_keep_alive_requests_rotate_pool_workers(_: test.Context)
   local app = mk.App(mk.Config { workers = mk.WorkerMode.pool(mk.PoolOptions { size = 3 }) })
   app:options("/health", function (ctx: mk.Context)
-    ctx:set("X-Owner", "" .. ctx:worker_id()):no_content()
+    ctx:send_string(ctx:worker_id() .. "\n")
   end)
   local server = app:listen_test()
   defer server:close()
@@ -394,9 +424,9 @@ function test_keep_alive_requests_rotate_pool_workers(_: test.Context)
     defer connection:close()
     for index = 1, 7 do
       connection:write("OPTIONS /health HTTP/1.1\r\nHost: t\r\n\r\n")
-      local status, owner = read_owner(connection)
+      local status, owner = read_line_response(connection)
       local expected = (infos[(index - 1) % 3 + 1] as mk.WorkerInfo).id
-      test.assert(status == 204 and owner == "" .. expected,
+      test.assert(status == 200 and owner == "" .. expected,
         "request " .. index .. " ran on " .. owner .. ", expected " .. expected)
       test.assert(app:pool_next_index() == index % 3 + 1,
         "keep-alive request " .. index .. " did not advance round-robin dispatch")

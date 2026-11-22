@@ -11,6 +11,7 @@ local strings = import "string"
 local timer = import "timer"
 local mk = import "mk"
 local static = import "mk.middleware.static"
+local uv = import "uv"
 
 local function within(ms: integer, what: string, action: function (): ())
   local worker = async.run<|nil, value|>(function (): nil
@@ -61,20 +62,32 @@ local function raises(action: function (): ()): string
   return ""
 end
 
-local function symlink(target: string, link: string)
-  local process = os.spawn("ln", {"-s", target, link})
-  local status = process:wait()
-  if status.code ~= 0 then raise "ln -s failed" end
+-- Windows cannot hold `<`/`>` in file names and maps device names such as
+-- `con.txt` to devices, so those fixtures differ there.
+local function running_on_windows(): boolean
+  local status, info? = uv.os_uname()
+  return status == 0 and info ~= nil and info.sysname == "Windows_NT"
 end
 
+-- A listed file name that needs HTML escaping, and its escaped form.
+local function markup_name(): (string, string)
+  if running_on_windows() then return "&b'.txt", "&amp;b&#39;.txt" end
+  return "<b>&.txt", "&lt;b&gt;&amp;.txt"
+end
+
+local const NO_SYMLINKS = "platform: symbolic links unavailable"
+
 -- A fixture tree:
---   <base>/public/{index.html,app.js,style.css,data.json,a b.txt,<b>&.txt,con.txt}
+--   <base>/public/{index.html,app.js,style.css,data.json,a b.txt,LICENSE,
+--                  markup_name(), con.txt (not on Windows)}
 --   <base>/public/sub/page.txt, <base>/public/empty/ (no index)
---   <base>/public/link.txt -> ../secret.txt, <base>/public/escape -> ../public2
+--   with symbolic links: <base>/public/link.txt -> ../secret.txt,
+--   <base>/public/escape -> ../public2, <base>/public/linked/index.html -> ../index.html
 --   <base>/public2/file.txt, <base>/secret.txt
 local record Fixture
   base: string
   root: string
+  symlinks: boolean
 end
 
 local function remove_tree(path: string)
@@ -87,6 +100,21 @@ local function remove_tree(path: string)
   else
     fs.unlink(path)
   end
+end
+
+-- Create `link` pointing at `target`. False when this platform cannot make
+-- real symbolic links: no `ln`, missing privilege, or copy semantics (MSYS).
+local function try_symlink(target: string, link: string): boolean
+  local created = false
+  do
+    created = os.spawn("ln", {"-s", target, link}):wait().code == 0
+  catch
+    if error is async.CancellationReason then raise end
+  end
+  local info? = fs.lstat(link)
+  if created and info ~= nil and info.kind == "symlink" then return true end
+  if info ~= nil then remove_tree(link) end
+  return false
 end
 
 local function make_fixture(context: test.Context): Fixture
@@ -104,17 +132,18 @@ local function make_fixture(context: test.Context): Fixture
   fs.write_file(root .. "/style.css", "a{}")
   fs.write_file(root .. "/data.json", "{\"a\":1}")
   fs.write_file(root .. "/a b.txt", "spaced")
-  fs.write_file(root .. "/<b>&.txt", "markup")
-  fs.write_file(root .. "/con.txt", "device")
+  local markup = markup_name()
+  fs.write_file(root .. "/" .. markup, "markup")
+  if not running_on_windows() then fs.write_file(root .. "/con.txt", "device") end
   fs.write_file(root .. "/sub/page.txt", "0123456789")
   fs.write_file(root .. "/LICENSE", "license text")
   fs.mkdir(root .. "/linked")
   fs.write_file(base .. "/public2/file.txt", "outside sibling")
   fs.write_file(base .. "/secret.txt", "top secret")
-  symlink("../secret.txt", root .. "/link.txt")
-  symlink("../public2", root .. "/escape")
-  symlink("../index.html", root .. "/linked/index.html")
-  return Fixture(base, root)
+  local symlinks = try_symlink("../secret.txt", root .. "/link.txt") and
+    try_symlink("../public2", root .. "/escape") and
+    try_symlink("../index.html", root .. "/linked/index.html")
+  return Fixture(base, root, symlinks)
 end
 
 function test_files_and_indexes(context: test.Context)
@@ -152,8 +181,9 @@ function test_confinement(context: test.Context)
   local fixture = make_fixture(context)
   local app = mk.App()
   app:get("/assets/*", static.new(fixture.root))
-  local rejected = function (target: string, what: string)
+  local rejected = function (target: string, what: string, needs_symlinks: boolean?)
     context:run(what, function (_: test.Context)
+      if needs_symlinks and not fixture.symlinks then test.skip(NO_SYMLINKS) end
       local response = call(app, "GET", target)
       expect(response.status == 404, what .. " -> " .. response.status .. " " .. response.body)
       expect(strings.find(response.body, "secret") == nil and
@@ -167,8 +197,8 @@ function test_confinement(context: test.Context)
   rejected("/assets/app.js:stream", "colon")
   rejected("/assets/con.txt", "windows_device_with_extension")
   rejected("/assets/LPT9", "windows_device")
-  rejected("/assets/link.txt", "symlink_leaf")
-  rejected("/assets/escape/file.txt", "intermediate_symlink_to_prefix_sibling")
+  rejected("/assets/link.txt", "symlink_leaf", true)
+  rejected("/assets/escape/file.txt", "intermediate_symlink_to_prefix_sibling", true)
   rejected("/assets/./app.js", "single_dot")
 end
 
@@ -241,17 +271,21 @@ function test_browse_listing(context: test.Context)
   fs.mkdir(root)
   context:cleanup(function () remove_tree(root) end)
   fs.write_file(root .. "/a b.txt", "x")
-  fs.write_file(root .. "/<b>&.txt", "y")
+  local markup, escaped = markup_name()
+  fs.write_file(root .. "/" .. markup, "y")
   fs.mkdir(root .. "/dir")
   fs.write_file(root .. "/outside.txt", "z")
-  symlink("outside.txt", root .. "/alias.txt")
+  local linked = try_symlink("outside.txt", root .. "/alias.txt")
   local app = mk.App()
   app:get("/b/*", static.new(root, static.Config { browse = true }))
   local listing = call(app, "GET", "/b/").body
   expect(strings.find(listing, "href=\"/b/a%20b.txt\">a b.txt</a>") ~= nil, "encoded href: " .. listing)
-  expect(strings.find(listing, "&lt;b&gt;&amp;.txt</a>") ~= nil, "escaped name")
+  expect(strings.find(listing, escaped .. "</a>") ~= nil, "escaped name: " .. listing)
   expect(strings.find(listing, "href=\"/b/dir/\">dir/</a>") ~= nil, "directory entry")
-  expect(strings.find(listing, "alias.txt") == nil, "symlinks are omitted")
+  context:run("symlinks_are_omitted", function (_: test.Context)
+    if not linked then test.skip(NO_SYMLINKS) end
+    expect(strings.find(listing, "alias.txt") == nil, "symlink listed: " .. listing)
+  end)
 end
 
 function test_configuration_validation(_: test.Context)
@@ -288,8 +322,9 @@ function test_unservable_paths_are_404(context: test.Context)
   local fixture = make_fixture(context)
   local app = mk.App()
   app:get("/assets/*", static.new(fixture.root))
-  local expect_404 = function (target: string, what: string)
+  local expect_404 = function (target: string, what: string, needs_symlinks: boolean?)
     context:run(what, function (_: test.Context)
+      if needs_symlinks and not fixture.symlinks then test.skip(NO_SYMLINKS) end
       local response = call(app, "GET", target)
       expect(response.status == 404, what .. " -> " .. response.status .. " " .. response.body)
     end)
@@ -297,7 +332,7 @@ function test_unservable_paths_are_404(context: test.Context)
   expect_404("/assets/app.js/child", "not_a_directory")
   expect_404("/assets/" .. strings.rep("x", 300) .. ".txt", "name_too_long")
   expect_404("/assets/a%00b", "nul_escape")
-  expect_404("/assets/linked/", "symlinked_index_is_skipped")
+  expect_404("/assets/linked/", "symlinked_index_is_skipped", true)
 end
 
 function test_listing_links_stay_origin_relative(context: test.Context)
@@ -367,5 +402,26 @@ function test_response_headers_by_outcome(context: test.Context)
   context:run("modify_response_may_finish_the_response", function (_: test.Context)
     local response = call(app, "GET", "/hook/sub/page.txt")
     expect(response.status == 200 and response.body == "hooked", "the hook's committed response stands")
+  end)
+end
+
+function test_pass_through_and_missing_root(context: test.Context)
+  local fixture = make_fixture(context)
+  local app = mk.App()
+  app:use(static.new(fixture.root, static.Config {
+    next = function (ctx: mk.Context): boolean return ctx:query_opt("dynamic") ~= nil end,
+  }))
+  app:all("/*", function (ctx: mk.Context) ctx:send_string("dynamic " .. ctx:method()) end)
+  local missing = mk.App()
+  missing:get("/m/*", static.new(fixture.base .. "/no-such-root"))
+  context:run("other_methods_continue", function (_: test.Context)
+    expect(call(app, "POST", "/app.js").body == "dynamic POST", "POST falls through")
+    expect(call(app, "GET", "/app.js").body == "console.log(1)", "GET is served")
+  end)
+  context:run("next_skips_the_files", function (_: test.Context)
+    expect(call(app, "GET", "/app.js?dynamic=1").body == "dynamic GET", "skipped request")
+  end)
+  context:run("missing_root_is_404", function (_: test.Context)
+    expect(call(missing, "GET", "/m/app.js").status == 404, "no root directory")
   end)
 end

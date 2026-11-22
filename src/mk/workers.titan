@@ -134,7 +134,7 @@ function TransferableWorkerInit.from_transfer_payload(payload: string): Transfer
 end
 
 --- Internal wire record: one detached `http.Exchange` payload queued for a
--- worker or the parent.
+-- worker or the parent, with the client address captured by the parent.
 record ExchangeEnvelope
   const payload: string
   const method: string
@@ -142,6 +142,7 @@ record ExchangeEnvelope
   const route_id: integer
   const session_id: string
   const reroute_preserving_session: boolean
+  const peer: net.Address?
 end
 
 --- A reusable single-consumer exchange queue using only try_send/try_receive
@@ -429,11 +430,11 @@ end
 -- Hand the current exchange back to the parent through the return pipe.
 local function WorkerState:return_exchange(request: http.Request, response: http.Response,
                                           route_id: integer, session_id: string,
-                                          preserving: boolean)
+                                          preserving: boolean, peer: net.Address?)
   async.yield()
   local payload = http.Exchange(request, response):to_transfer_payload()
   local env = ExchangeEnvelope(payload, request.method, request.target, route_id,
-                               session_id, preserving)
+                               session_id, preserving, peer)
   local accepted, leftover? = self.boot.return_pipe:send_exchange(env)
   if not accepted and leftover ~= nil then
     do http.Exchange.discard_transfer_payload(leftover) catch end
@@ -444,16 +445,17 @@ end
 -- request delivered in the envelope runs here: every keep-alive follow-up
 -- returns to the parent, which classifies it again (pool round-robin,
 -- session selection, or parent dispatch), so connections never pin a worker.
-local function WorkerState:handle(active: ActiveExchange, first: boolean,
+local function WorkerState:handle(active: ActiveExchange, first: boolean, peer: net.Address?,
                                   request: http.Request, response: http.Response)
   active.phase = PHASE_HANDLING
   if not first then
-    self:return_exchange(request, response, 0, "", false)
+    self:return_exchange(request, response, 0, "", false, peer)
     return
   end
   local core = self.core
   local meta, raw_path, target_error? = core:meta(request.method, request.target,
                                                  request.headers, request.url.scheme)
+  meta.peer = peer
   local route?, found?, head_fallback = core:classify(request.method, raw_path)
   local chain_id = core.root_dispatcher_id
   if route ~= nil then chain_id = route.dispatcher_id end
@@ -482,14 +484,14 @@ local function WorkerState:handle(active: ActiveExchange, first: boolean,
   end
 end
 
-local function WorkerState:start_exchange(exchange: http.Exchange)
+local function WorkerState:start_exchange(exchange: http.Exchange, peer: net.Address?)
   local active = ActiveExchange(exchange, nil, PHASE_STARTING, nil)
   self.active[active] = true
   local first = true
   serve_adopted(active, function (request: http.Request, response: http.Response)
     local is_first = first
     first = false
-    self:handle(active, is_first, request, response)
+    self:handle(active, is_first, peer, request, response)
   end, self.core.idle_timeout_ms, function ()
     self.active[active] = nil
     self.changed:notify()
@@ -504,7 +506,7 @@ local function WorkerState:forward_unstarted()
     if not ok then return end
     signal_try(pipe.space_sig_tx)
     local accepted, leftover? = self.boot.return_pipe:send_exchange(ExchangeEnvelope(
-      env.payload, env.method, env.target, env.route_id, self.boot.session_id, true))
+      env.payload, env.method, env.target, env.route_id, self.boot.session_id, true, env.peer))
     if not accepted and leftover ~= nil then
       do http.Exchange.discard_transfer_payload(leftover) catch end
     end
@@ -525,7 +527,7 @@ local function WorkerState:take_one(): boolean
   if not ok then return false end
   local exchange = http.Exchange.from_transfer_payload(env.payload)
   self.adopted_count = self.adopted_count + 1
-  self:start_exchange(exchange)
+  self:start_exchange(exchange, env.peer)
   signal_try(pipe.space_sig_tx)
   return true
 end

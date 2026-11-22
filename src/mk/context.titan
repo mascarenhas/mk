@@ -173,6 +173,13 @@ record RequestMeta
   local target: router.Target
   local headers: http.Headers
   local cookie_map: {string: string}?
+  local peer: net.Address?
+end
+
+--- Socket address of the client connection, captured while the exchange
+-- was live; nil in `App:test` or when the peer disconnected first.
+function RequestMeta:peer_address(): net.Address?
+  return self.peer
 end
 
 --- Matched route parameter, or `default_val` (or "") when absent.
@@ -394,7 +401,7 @@ local function Core:meta(method: string, target: string, headers: http.Headers,
   local meta = RequestMeta {
     method = method, path = path, original_url = target, scheme = actual_scheme,
     host = host, params_map = {}, route_pattern = "", target = target_value, headers = headers,
-    cookie_map = nil,
+    cookie_map = nil, peer = nil,
   }
   return meta, raw_path, failure
 end
@@ -577,6 +584,11 @@ end
 -- dispatch (known before any handler runs), or "".
 function Context:classified_route(): string
   return self.meta.route_pattern
+end
+
+--- Socket address of the client connection (see `RequestMeta:peer_address`).
+function Context:peer_address(): net.Address?
+  return self.meta.peer
 end
 
 --- Info for the matched endpoint route, or nil before/without a match.
@@ -1394,7 +1406,9 @@ local function Context:prepare_framing(buffered: boolean)
   end
 end
 
-local function Context:io_send_headers()
+-- Transfer status and headers to the transport; `flush` sends them now,
+-- otherwise the first body write (or close) sends them with its data.
+local function Context:io_send_headers(flush: boolean)
   local capture? = self.capture
   if capture ~= nil then
     capture.status = self.status_value
@@ -1409,6 +1423,7 @@ local function Context:io_send_headers()
     local entry = entries[index]
     response:add_header(entry.name, entry.contents)
   end
+  if not flush then return end
   local outer_io = self.in_socket_io
   self.in_socket_io = true
   defer self.in_socket_io = outer_io
@@ -1442,11 +1457,13 @@ local function Context:io_close()
   response:close()
 end
 
+-- A buffered response leaves header transmission to its single body write
+-- or close, which coalesces headers and body into one transport write.
 local function Context:commit_buffered()
   self:run_before_commit()
   self:prepare_framing(true)
   self.committed_flag = true
-  self:io_send_headers()
+  self:io_send_headers(false)
   if #self.response_body > 0 and self:body_allowed() then
     self:io_write(self.response_body)
   end
@@ -1485,10 +1502,12 @@ function Context:flush_headers()
   self:run_before_commit()
   self:prepare_framing(false)
   self.committed_flag = true
-  self:io_send_headers()
   local pending = self.response_body
   self.response_body = ""
-  if #pending > 0 and self:body_allowed() then self:io_write(pending) end
+  local write_pending = #pending > 0 and self:body_allowed()
+  -- Pending body bytes carry the headers; otherwise send them now.
+  self:io_send_headers(not write_pending)
+  if write_pending then self:io_write(pending) end
 end
 
 --- Write one streamed body chunk (committing headers first).
@@ -1562,6 +1581,10 @@ function Context:upgrade_websocket(options: websocket.AcceptOptions?): websocket
   catch
     if error is websocket.HandshakeError then
       local failure = error as websocket.HandshakeError
+      -- The rejection ended the exchange: nothing is left to drain.
+      self.response_headers:set("Content-Length", "0")
+      self.response_headers:set("Connection", "close")
+      self.body_done = true
       self.committed_flag = true
       self.finished = true
       self.status_value = failure.status or 400
@@ -1599,7 +1622,11 @@ function Context:reject_upgrade(code: integer)
     self.in_socket_io = true
     defer self.in_socket_io = outer_io
     response:reject_upgrade(request, code, self.response_headers)
+    -- The rejection ended the exchange: nothing is left to drain.
+    self.response_headers:set("Content-Length", "0")
+    self.response_headers:set("Connection", "close")
   end
+  self.body_done = true
   self.committed_flag = true
   self.finished = true
 end
@@ -1700,6 +1727,14 @@ local function Context:release_transport()
   if response ~= nil then response:abort() end
 end
 
+-- Whether the exchange ends after this response: the committed response or
+-- the client announced `Connection: close`, so `http` closes the connection
+-- without reading the unread request body.
+local function Context:announced_close(): boolean
+  return headers_have_token(self.response_headers, "Connection", "close") or
+    headers_have_token(self.meta.headers, "Connection", "close")
+end
+
 -- Live-transport request lifecycle on the executing owner Task: chain,
 -- error handling, response completion, bounded drain, and on_complete.
 -- Unexpected failures abort the transport and are logged; cancellation is
@@ -1710,8 +1745,10 @@ local function Core:run_live(ctx: Context)
   local trace = ""
   do
     ctx:execute()
-    if not ctx.aborted_flag and ctx.upgraded_ws == nil then
-      if ctx.close_after_response or self.closing then
+    if not ctx.aborted_flag and ctx.upgraded_ws == nil and not ctx:announced_close() then
+      if ctx:closes_connection() then
+        -- Committed as persistent before the close was decided: `http`
+        -- would drain the unread body, so end the transport instead.
         ctx:release_transport()
       elseif not ctx:drain_request() then
         ctx:release_transport()

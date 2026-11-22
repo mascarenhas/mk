@@ -46,6 +46,19 @@ local function raw(server: mk.TestServer, request_text: string): string
   return out:drain()
 end
 
+-- Like `raw`, but a transport reset ends the read instead of failing.
+local function raw_until_end(server: mk.TestServer, request_text: string): string
+  local connection = net.connect(server.host, server.port)
+  defer connection:close()
+  connection:write(request_text)
+  local out = strings.writer()
+  do
+    for chunk in connection:read do out:write(chunk) end
+  catch
+  end
+  return out:drain()
+end
+
 local function joined(items: {string}): string
   local out = strings.writer()
   for index = 1, #items do
@@ -193,6 +206,47 @@ function test_commit_and_complete_observers(context: test.Context)
   end)
 end
 
+function test_live_upgrade_rejection(_: test.Context)
+  local lines: {string} = {}
+  local logger = log.Logger.new("debug", function (text: string) lines[#lines + 1] = text end)
+  local app = mk.App(mk.Config { logger = logger })
+  local outcomes: {string} = {}
+  local observe = function (ctx: mk.Context)
+    ctx:on_complete(function (done: mk.Context)
+      outcomes[#outcomes + 1] = done:status_code() .. ":" .. bool_text(done:aborted())
+    end)
+  end
+  app:get("/reject", function (ctx: mk.Context)
+    observe(ctx)
+    ctx:reject_upgrade(403)
+  end)
+  app:get("/accept", function (ctx: mk.Context)
+    observe(ctx)
+    ctx:upgrade_websocket()
+  end)
+  local server = app:listen_test()
+  defer server:close()
+  local offer = "Upgrade: websocket\r\nConnection: Upgrade\r\n" ..
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+  within(3000, "rejected upgrades", function ()
+    local offered = raw_until_end(server, "GET /reject HTTP/1.1\r\nHost: t\r\n" .. offer .. "\r\n")
+    test.assert(strings.sub(offered, 1, 12) == "HTTP/1.1 403" and contains(offered, "Connection: close") and
+      strings.sub(offered, -4) == "\r\n\r\n", "bodyless rejection: " .. offered)
+    -- Plain requests (no upgrade offer) also end their exchange this way.
+    local plain = raw_until_end(server, "GET /reject HTTP/1.1\r\nHost: t\r\n\r\n")
+    test.assert(strings.sub(plain, 1, 12) == "HTTP/1.1 403", "plain rejection: " .. plain)
+    local handshake = raw_until_end(server, "GET /accept HTTP/1.1\r\nHost: t\r\n\r\n")
+    test.assert(strings.sub(handshake, 1, 10) == "HTTP/1.1 4", "failed handshake: " .. handshake)
+  end)
+  server:close()
+  logger:close()
+  test.assert(#outcomes == 3 and outcomes[1] == "403:false" and outcomes[2] == "403:false" and
+    strings.sub(outcomes[3], -6) == ":false", "completed without aborts: " .. joined(outcomes))
+  for index = 1, #lines do
+    test.assert(not contains(lines[index], "http_request_failed"), "spurious failure log: " .. lines[index])
+  end
+end
+
 function test_live_bodyless_framing(context: test.Context)
   local app = mk.App()
   app:get("/s/:code", function (ctx: mk.Context)
@@ -228,16 +282,32 @@ end
 function test_live_body_limits(context: test.Context)
   local app = mk.App(mk.Config { body_limit = 1024 })
   app:post("/read", function (ctx: mk.Context) ctx:send_string("read " .. #ctx:body()) end)
+  app:post("/stream-read", function (ctx: mk.Context)
+    ctx:write_chunk("started\n")
+    ctx:write_chunk("read " .. #ctx:body())
+  end)
   app:post("/ignore", function (ctx: mk.Context) ctx:send_string("ignored") end)
   app:get("/next", function (ctx: mk.Context) ctx:send_string("second") end)
   local server = app:listen_test()
   context:cleanup(function () server:close() end)
-  context:run("declared_oversize_413_aborts_without_drain", function (_: test.Context)
+  context:run("declared_oversize_413_closes_without_drain", function (_: test.Context)
     within(3000, "413 response", function ()
-      -- The declared body is never sent; any drain attempt would block.
+      -- The declared body is never sent; any drain attempt would block. The
+      -- uncommitted 413 announces close and completes without an abort.
       local text = raw(server, "POST /read HTTP/1.1\r\nHost: t\r\nContent-Length: 100000000\r\n\r\npartial")
       test.assert(strings.sub(text, 1, 12) == "HTTP/1.1 413", "413 status: " .. strings.sub(text, 1, 40))
-      test.assert(contains(text, "Connection: close"), "413 announces close")
+      test.assert(contains(text, "Connection: close") and contains(text, "Content-Length: 17\r\n") and
+        strings.sub(text, -17) == "Content Too Large", "complete 413 response announcing close: " .. text)
+    end)
+  end)
+  context:run("committed_stream_then_oversize_aborts", function (_: test.Context)
+    within(3000, "aborted stream", function ()
+      -- Headers were committed as persistent before the 413: the stream is
+      -- cut off instead of draining the unread body.
+      local text = raw_until_end(server,
+        "POST /stream-read HTTP/1.1\r\nHost: t\r\nContent-Length: 100000000\r\n\r\npartial")
+      test.assert(strings.sub(text, 1, 12) == "HTTP/1.1 200" and contains(text, "started\n") and
+        not contains(text, "read ") and strings.sub(text, -5) ~= "0\r\n\r\n", "truncated stream: " .. text)
     end)
   end)
   context:run("streamed_oversize_413", function (_: test.Context)
@@ -253,6 +323,16 @@ function test_live_body_limits(context: test.Context)
       local text = raw(server, "POST /ignore HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello" ..
         "GET /next HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
       test.assert(contains(text, "ignored") and contains(text, "second"), "both pipelined responses")
+    end)
+  end)
+  context:run("client_close_skips_the_drain", function (_: test.Context)
+    within(3000, "client close", function ()
+      -- The client announced close and withholds most of a small body; the
+      -- exchange must end without reading it.
+      local text = raw(server, "POST /ignore HTTP/1.1\r\nHost: t\r\nConnection: close\r\n" ..
+        "Content-Length: 100\r\n\r\nabc")
+      test.assert(strings.sub(text, 1, 12) == "HTTP/1.1 200" and contains(text, "ignored"),
+        "response without a drain: " .. text)
     end)
   end)
   context:run("unread_oversized_body_aborts_after_response", function (_: test.Context)
@@ -293,12 +373,43 @@ function test_live_unhandled_exception(_: test.Context)
   test.assert(found, "http_request_failed was logged")
 end
 
+function test_peer_address_on_the_parent(_: test.Context)
+  local completed = "unset"
+  local app = mk.App()
+  app:get("/peer", function (ctx: mk.Context)
+    -- Observers run after the exchange ended and still see the address.
+    ctx:on_complete(function (done: mk.Context)
+      local peer? = done:peer_address()
+      completed = peer ~= nil and peer.ip .. ":" .. peer.port or "none"
+    end)
+    local peer? = ctx:peer_address()
+    ctx:send_string(peer ~= nil and peer.ip .. ":" .. peer.port or "none")
+  end)
+  test.assert(get(app, "/peer").body == "none", "App:test requests have no peer")
+  local server = app:listen_test()
+  defer server:close()
+  within(3000, "peer request", function ()
+    local connection = net.connect(server.host, server.port)
+    defer connection:close()
+    local expected = "127.0.0.1:" .. connection:local_address().port
+    connection:write("GET /peer HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+    local out = strings.writer()
+    for chunk in connection:read do out:write(chunk) end
+    local text = out:drain()
+    test.assert(strings.sub(text, -#expected) == expected, "handler sees the peer: " .. text)
+    while completed == "unset" do timer.yield() end
+    test.assert(completed == expected, "on_complete sees the peer: " .. completed)
+  end)
+end
+
 function test_shutdown_phases_and_guards(context: test.Context)
   context:run("initiate_from_handler_and_guarded_shutdown", function (_: test.Context)
     local order: {string} = {}
+    local listen_port = 0
     local app = mk.App()
     app:hooks():on_listen(function (data: mk.ListenData)
       order[#order + 1] = "listen:" .. data.host
+      listen_port = data.port
       do app:shutdown() catch order[#order + 1] = "listen-guard" end
     end)
     app:hooks():on_pre_shutdown(function ()
@@ -315,6 +426,8 @@ function test_shutdown_phases_and_guards(context: test.Context)
       ctx:send_string("guarded=" .. guarded .. " running=" .. bool_text(app:is_running()))
     end)
     local server = app:listen_test()
+    test.assert(listen_port ~= 0 and listen_port == server.port,
+      "ListenData reports the OS-assigned port: " .. listen_port .. " vs " .. server.port)
     local response = server:request("GET", "/stop")
     test.assert(response.body == "guarded=yes running=false", "handler response: " .. response.body)
     test.assert(response:header("Connection") == "close", "responses during shutdown close")
