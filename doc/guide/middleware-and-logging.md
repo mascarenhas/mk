@@ -78,7 +78,7 @@ Key design properties:
 
 `mk.middleware.logger` supports two phases via `Phase`:
 
-- **`PHASE_COMPLETION` (default):** Registers `ctx:on_complete` before `ctx:next()`. Logs `method` (standard HTTP method or `"OTHER"`), `route` (`ctx:matched_route()`, or `"<unmatched>"`), `status`, `latency_ms`, optional `aborted` (`true` when aborted), `error_code` (from `ctx:last_error()`), `request_id` (unless disabled), `worker_id` (on workers), and `path` (only when `include_path = true`, keeping URL parameters out of logs by default).
+- **`PHASE_COMPLETION` (default):** Registers `ctx:on_complete` before `ctx:next()`. Logs `method` (standard HTTP method or `"OTHER"`), `route` (`ctx:matched_route()`, falling back to `ctx:classified_route()` when `""` so requests rejected before the endpoint—such as early auth or session pre-dispatch `HttpError`s—still log their route, and `"<unmatched>"` only for genuine `404`/`405` requests), `status`, `latency_ms`, optional `aborted` (`true` when aborted), `error_code` (from `ctx:last_error()`), `request_id` (unless disabled), `worker_id` (on workers), and `path` (only when `include_path = true`, keeping URL parameters out of logs by default).
 - **`PHASE_ADMISSION`:** Writes the log line *before* calling `ctx:next()`, using `ctx:classified_route()` (the route pattern classified at dispatch, known before endpoint handlers execute) so even outer middleware sees the matched route pattern.
 
 Use `skip` (evaluated when a line would be written) to suppress noisy health-probe logs without skipping downstream work.
@@ -86,7 +86,7 @@ Use `skip` (evaluated when a line would be written) to suppress noisy health-pro
 ### Error Recovery and Deadlines
 
 - **`mk.middleware.recover`:** Catches unexpected non-`HttpError` exceptions while letting `mk.HttpError` and `async.CancellationReason` propagate untouched with their original tracebacks. Enable `enable_stack_trace = true` to log `"panic_recovered"` via `ctx:logger()` (or stderr) with the traceback, or supply custom `stack_trace_handler` / `exception_handler`.
-- **`mk.middleware.timeout`:** Wraps either one handler (`timeout.new(handler, 5000)`) or the rest of the chain (`timeout.middleware(5000)`) using `ctx:run_with_timeout(...)`. When the deadline expires, `mk` revokes `Context` ownership from the timed-out Task, aborts blocked socket I/O before joining, and runs `on_timeout` (default `HttpError(503, ..., "timeout")`).
+- **`mk.middleware.timeout`:** Wraps either one handler (`timeout.new(handler, 5000)`) or the rest of the chain (`timeout.middleware(5000)`) using `ctx:run_with_timeout(...)`. When the deadline expires, `mk` revokes `Context` ownership from the timed-out Task, aborts blocked socket I/O before joining, and—unless the response was already committed or aborted at expiry, in which case `run_with_timeout` returns without calling `on_timeout` or raising `503`—runs `on_timeout` (default `HttpError(503, ..., "timeout")`).
 
 ### Authentication, Security Headers, and Probes
 

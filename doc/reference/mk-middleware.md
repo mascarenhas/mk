@@ -163,7 +163,7 @@ function new(config: Config?): mk.Handler
 ```
 
 - `next` skips the middleware entirely at entry; `skip` suppresses emitting the log line when evaluated (on admission or inside `on_complete`). Neither mode catches or consumes exceptions.
-- **Logged fields:** `method` (standard HTTP method `GET`..`PATCH` or `"OTHER"`), `route` (`ctx:classified_route()` in admission mode, `done:matched_route()` in completion mode, or `"<unmatched>"`), optional `path` (when `include_path = true`), optional `request_id` (when `include_request_id = true` and non-empty), optional `worker_id` (when non-zero). Completion lines add `status`, `latency_ms`, `aborted` (when `true`), and `error_code` (from `done:last_error().code` when present). Built-in fields win over keys returned by `extra_fields`.
+- **Logged fields:** `method` (standard HTTP method `GET`..`PATCH` or `"OTHER"`), `route` (`ctx:classified_route()` in admission mode; in completion mode `done:matched_route()`, falling back to `done:classified_route()` when `""` so early pre-endpoint rejections still record their route, and `"<unmatched>"` only when both are `""`), optional `path` (when `include_path = true`), optional `request_id` (when `include_request_id = true` and non-empty), optional `worker_id` (when non-zero). Completion lines add `status`, `latency_ms`, `aborted` (when `true`), and `error_code` (from `done:last_error().code` when present). Built-in fields win over keys returned by `extra_fields`.
 - When `sink_sender` is set, encodes via `log.format_line` and sends non-blocking with `sink_sender:try_send(line)` (dropping lines `> log.MAX_LINE_BYTES + 1`, full/closed channels, or encoding errors without affecting the request).
 
 ---
@@ -271,5 +271,5 @@ function middleware(timeout_ms: integer, config: Config?): mk.Handler
 ```
 
 - Requires `timeout_ms >= 0`.
-- Delegates to `ctx:run_with_timeout(timeout_ms, action, config.on_timeout)` (owner-Task revocation + abort-before-join cleanup).
+- Delegates to `ctx:run_with_timeout(timeout_ms, action, config.on_timeout)` (owner-Task revocation + abort-before-join cleanup; if the response is already committed or aborted when the deadline expires, returns without calling `on_timeout` or raising `503`).
 - When `config.next(ctx)` returns `true`, `timeout.new` invokes `handler(ctx)` directly without a deadline, whereas `timeout.middleware` calls `ctx:next()`.

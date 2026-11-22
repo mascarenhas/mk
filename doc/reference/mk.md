@@ -109,7 +109,7 @@ function App:is_worker_alive(worker_id: integer): boolean
 function App:stop_worker(worker_id: integer): boolean
 ```
 
-- **`App:start(addr, listen_config?)`:** Freezes routes, binds `http.listen` (or `http.listen_tls` when `cert_file ~= nil`), sets `read_ahead(false)` and `header_limit`, spawns pool workers and supervision Tasks, and runs `on_listen` hooks. Raises if already started.
+- **`App:start(addr, listen_config?)`:** Freezes routes, binds `http.listen` (or `http.listen_tls` when `cert_file ~= nil`), resolves an ephemeral port `0` via `server:local_address().port` (so `ListenData.port` carries the OS-assigned port), sets `read_ahead(false)` and `header_limit`, spawns pool workers and supervision Tasks, and runs `on_listen` hooks. Raises if already started.
 - **`App:serve()`:** Runs the accept loop until shutdown closes the listener, joins shutdown retirement, and re-raises any fatal failure (such as a pool worker exit outside shutdown).
 - **`App:listen(addr, listen_config?)`:** Calls `start` then `serve`.
 - **`App:initiate_shutdown()`:** Begins shutdown asynchronously without waiting (safe inside handlers, lifecycle hooks, and monitors).
@@ -206,6 +206,7 @@ record RequestMeta
   const scheme: string
   const host: string
 end
+function RequestMeta:peer_address(): net.Address?
 function RequestMeta:param(name: string, default_val: string?): string
 function RequestMeta:param_opt(name: string): string?
 function RequestMeta:query(name: string, default_val: string?): string
@@ -216,7 +217,7 @@ function RequestMeta:get_headers(name: string): {string}
 function RequestMeta:cookie(name: string, default_val: string?): string
 ```
 
-`RequestMeta` also stores the classified `route_pattern` internally (populated at dispatch and updated by `Context:restart_routing()`), exposed publicly via `Context:classified_route()`. When `Config.trust_forwarded_headers = true`, the first comma-separated entry of `X-Forwarded-Proto` (`"http"`/`"https"`, ASCII case-insensitive) and non-empty `X-Forwarded-Host` override `scheme` and `host`.
+`RequestMeta` also stores the classified `route_pattern` internally (populated at dispatch and updated by `Context:restart_routing()`), exposed publicly via `Context:classified_route()`, and the direct socket `peer: net.Address?` captured via `http.Request:peer_address()` while the exchange was live (exposed via `RequestMeta:peer_address()` and `Context:peer_address()`, preserved across worker-thread `ExchangeEnvelope` handoff and `on_complete` hooks; `nil` in `App:test` or if the peer disconnected before capture; `X-Forwarded-For` / `trusted_proxies` are intentionally omitted). When `Config.trust_forwarded_headers = true`, the first comma-separated entry of `X-Forwarded-Proto` (`"http"`/`"https"`, ASCII case-insensitive) and non-empty `X-Forwarded-Host` override `scheme` and `host`.
 
 ### `Cookie`
 
@@ -258,6 +259,7 @@ function Context:is_upgrade_offer(): boolean
 function Context:is_preflight(): boolean
 function Context:matched_route(): string
 function Context:classified_route(): string
+function Context:peer_address(): net.Address?
 function Context:endpoint(): RouteInfo?
 function Context:route_name(): string
 function Context:mount_path(): string
@@ -350,6 +352,8 @@ function Context:retire_worker()
 ```
 
 - **`Context:classified_route()` vs. `Context:matched_route()`:** `classified_route()` returns the declared pattern of the endpoint route the request classified to at dispatch (or `""`), available even in outer admission middleware before endpoint execution. `matched_route()` returns the pattern of the endpoint route once `ctx:next()` reaches it (or `""` beforehand / if unmatched).
+- **`Context:peer_address(): net.Address?`:** Returns the captured client socket address (see [`RequestMeta`](#requestmeta)).
+- **Closing exchanges & `413` completion:** When a closing condition (such as uncommitted `413 Content Too Large`, shutdown, retiring/ephemeral session worker, or explicit `Connection: close`) or the client request announces `Connection: close`, `titan.http` closes the connection after the response finishes without reading the unread request body, so `mk` completes normally without calling `response:abort()`. If a response was already committed as persistent before a close decision or if bounded request-body drain fails, `mk` aborts the transport.
 - **`Context:type(extension_or_mime, charset?)` and MIME defaults (`src/mk/mime.titan`):** Accepts a full MIME type (containing `/`), dotted extension (`".json"`), or bare extension (`"json"`). Unknown extensions fall back to `"application/octet-stream"`. Text-like media types (`text/*`, `application/json`, `application/javascript`, `application/xml`, `image/svg+xml`, `application/yaml`) default to `; charset=utf-8` unless `charset` is supplied or a `;` parameter is already present. (`mime.titan` exports no public symbols of its own.)
 
 ### `Bind`
@@ -467,3 +471,5 @@ function TestServer:close()
 function App:test(req: TestRequest, config: TestConfig?): TestResponse
 function App:listen_test(host: string?, listen_config: ListenConfig?): TestServer
 ```
+
+`App:listen_test(host?, listen_config?)` binds an OS-assigned ephemeral loopback port (`port = 0`, defaulting `host` to `"127.0.0.1"`), starts serving in a background Task, and populates `TestServer.port` and `TestServer.base_url` from the bound listener address.

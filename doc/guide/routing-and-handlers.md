@@ -101,7 +101,7 @@ Segment parameters are percent-encoded (`/` becomes `%2F`), wildcard values pres
 
 ## Inspecting Requests: `Context` and `RequestMeta`
 
-Every handler receives `ctx: mk.Context`. Before dispatch (and inside `SessionExtractor` callbacks), read-only request metadata is exposed through `mk.RequestMeta` (`method`, `path`, `original_url`, `scheme`, `host`, plus `param`, `query`, `get`, and `cookie` accessors).
+Every handler receives `ctx: mk.Context`. Before dispatch (and inside `SessionExtractor` callbacks), read-only request metadata is exposed through `mk.RequestMeta` (`method`, `path`, `original_url`, `scheme`, `host`, plus `peer_address`, `param`, `query`, `get`, and `cookie` accessors).
 
 Key `Context` inspection patterns:
 
@@ -109,7 +109,8 @@ Key `Context` inspection patterns:
 - **Headers & negotiation:** `ctx:get("Accept")`, `ctx:header_opt("If-None-Match")`, `ctx:is_json()`, `ctx:bearer()`, `ctx:accepts({"application/json", "text/plain"})`.
 - **Cookies:** `ctx:cookie("sid")` to read; `ctx:set_cookie(mk.Cookie { name = "sid", value = tok, http_only = true, secure = true, same_site = "Lax" })` and `ctx:clear_cookie("sid")` to write.
 - **Route info:** `ctx:matched_route()` (pattern of the endpoint currently executing, or `""` before matching), `ctx:classified_route()` (pattern the request classified to at dispatch, available even in outer admission middleware), `ctx:endpoint()`, `ctx:route_name()`, `ctx:mount_path()`.
-- **Forwarded headers:** `Config.trust_forwarded_headers` defaults to `false`. Enable it **only** behind a trusted reverse proxy that strips client-supplied `X-Forwarded-Proto` and `X-Forwarded-Host` headers.
+- **Client socket address:** `ctx:peer_address()` (and `meta:peer_address()` on `RequestMeta`) returns the direct TCP/TLS peer `net.Address?` captured while the exchange was live (preserved across worker-thread handoff and `on_complete` hooks). It returns `nil` in in-memory `App:test` runs or if the peer disconnected before capture. `X-Forwarded-For` / `trusted_proxies` are intentionally omitted.
+- **Forwarded scheme/host headers:** `Config.trust_forwarded_headers` defaults to `false`. Enable it **only** behind a trusted reverse proxy that strips client-supplied `X-Forwarded-Proto` and `X-Forwarded-Host` headers.
 
 ## JSON-Only Request Binding (`ctx:bind()`)
 
@@ -130,7 +131,7 @@ end
 `Bind` enforces `Config.body_limit` (default 4 MiB) and `Config.json_max_depth` (default 64) and maps client errors cleanly to `mk.HttpError`:
 
 - **`415 Unsupported Media Type`** (`"unsupported_media_type"`): missing or non-JSON `Content-Type`.
-- **`413 Content Too Large`** (`"body_too_large"`): body exceeds `Config.body_limit` (also marks the connection non-reusable so unread body bytes are not drained).
+- **`413 Content Too Large`** (`"body_too_large"`): body exceeds `Config.body_limit`. Before headers commit, `mk` marks the response with `Connection: close` so `titan.http` closes the connection normally without draining unread request-body bytes or aborting the transport (the same skip-drain path applies when the client sent `Connection: close` or a closing response announced `Connection: close` before commit; only an already-committed persistent response whose close decision arrives later or a failed bounded drain aborts the transport).
 - **`400 Bad Request`**: empty body (`"empty_body"`) or malformed JSON syntax / depth / size error.
 - **`422 Unprocessable Content`**: valid JSON that violates the requested schema (`type_mismatch`, `missing_field`, `unknown_field`, `invalid_union`, `unknown_variant`, `non_integral`, plus `integer_range`/`number_range` when `schema ~= nil`).
 - **Programmer errors re-raise unchanged:** unknown type names, unavailable constructors, unsupported types, invalid options, or non-`json.Error` exceptions from custom `Record.new` are never turned into `4xx`.
@@ -151,7 +152,7 @@ Handlers return nothing and signal expected HTTP errors with `raise mk.HttpError
 
 ### Buffered Responses (Default)
 
-Methods like `ctx:status(200)`, `ctx:set(...)`, `ctx:type("json")`, `ctx:json(val)`, `ctx:send_string(text)`, `ctx:html(markup)`, `ctx:redirect(url)`, and `ctx:send_file(path)` stage the response in memory until the handler returns or you call `ctx:commit()`. Calling `ctx:commit()` flushes the response early so post-response work does not delay the client.
+Methods like `ctx:status(200)`, `ctx:set(...)`, `ctx:type("json")`, `ctx:json(val)`, `ctx:send_string(text)`, `ctx:html(markup)`, `ctx:redirect(url)`, and `ctx:send_file(path)` stage the response in memory until the handler returns or you call `ctx:commit()`. Buffered responses (and `flush_headers()` when staged body bytes are already pending) hand status and headers to `titan.http` without flushing separately, allowing headers and body to coalesce into a single transport write. Calling `ctx:commit()` flushes the response early so post-response work does not delay the client.
 
 ### Streaming Responses
 
@@ -178,9 +179,9 @@ local websocket = import "websocket"
 local function echo_ws(ctx: mk.Context)
   local ws = ctx:upgrade_websocket()
   while true do
-    local msg? = ws:read_message()
-    if msg == nil then break end
-    ws:write_text(msg.data)
+    local _kind?, data? = ws:read()
+    if data == nil then break end
+    ws:write(websocket.TEXT, data)
   end
 end
 ```

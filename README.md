@@ -69,14 +69,20 @@ titan-uninstall titan-mk
 
 ### Building and testing from a checkout
 
-The repository `Makefile` delegates incremental compilation and native tests to `titanc`:
+The repository `Makefile` delegates incremental compilation, native tests, and native line coverage to `titanc`:
 
 ```sh
 make build                              # build build/mk.so and build/mk.a
 make test                               # build and run tests/ via build/mk-tests
 make test TEST_ARGS='--filter=router'   # or TEST_ARGS='-f router'
+make coverage                           # instrumented build + run under build/coverage
+make coverage COVERAGE_FORMAT=lcov      # also write build/coverage/.coverage/report/coverage.info
 make clean
 ```
+
+`coverage-build` and `coverage-run` keep instrumented artifacts separate under `build/coverage` (unsetting `GCOV_PREFIX`, `GCOV_PREFIX_STRIP`, and `TITAN_FILTER`), accept `COVERAGE_FORMAT` (`html`, `lcov`, `cobertura`), `COVERAGE_GCOV`, `COVERAGE_GCOVR`, and `COVERAGE_FLAGS` (or `CC`/`GCOV`/`GCOVR` from the environment), and write reports to `build/coverage/.coverage/report/`.
+
+GitHub Actions CI (`.github/workflows/ci.yml`) builds and tests `titan-mk` across **Linux x64** (`ubuntu-24.04`, including `make coverage COVERAGE_FORMAT=lcov` with GCC 14 + `gcovr` and Codecov upload), **macOS arm64** (`macos-15`), and **Windows x64 CLANG64** (`windows-2025-vs2026`), running the full suite and a LuaRocks install/consume/uninstall smoke test (`.github/scripts/package-smoke.sh`) on each platform.
 
 ### Linking consumer applications (dynamic vs. `--static`)
 

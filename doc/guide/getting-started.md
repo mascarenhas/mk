@@ -20,14 +20,18 @@ To uninstall `titan-mk` cleanly later:
 titan-uninstall titan-mk
 ```
 
-To build and test the framework itself from a checkout:
+To build, test, and measure line coverage of the framework itself from a checkout:
 
 ```sh
 make build                              # compile build/mk.so and build/mk.a
 make test                               # build and run tests/ via build/mk-tests
 make test TEST_ARGS='--filter=router'   # or TEST_ARGS='-f router'
+make coverage                           # build + run instrumented suite under build/coverage
+make coverage COVERAGE_FORMAT=lcov      # also emit build/coverage/.coverage/report/coverage.info
 make clean
 ```
+
+The coverage targets (`coverage`, `coverage-build`, `coverage-run`) compile into `build/coverage` with `titanc --coverage` (unsetting `GCOV_PREFIX`, `GCOV_PREFIX_STRIP`, and `TITAN_FILTER`), writing `build/coverage/.coverage/report/coverage.gcov` plus any space-separated formats listed in `COVERAGE_FORMAT` (`html`, `lcov`, `cobertura`). Override tools with `COVERAGE_GCOV`, `COVERAGE_GCOVR`, or `COVERAGE_FLAGS` (or environment variables `CC`, `GCOV`, `GCOVR`; Titan's `gcc-gcov` backend requires GCC 14+ with matching `gcov`).
 
 ## Consumer Application Layout
 
@@ -142,7 +146,7 @@ end
 
 ### Real Loopback Server Tests (`App:listen_test`)
 
-Whenever you test `pool` or `session` workers, keep-alive framing, streaming, TLS, or WebSocket upgrades, use `App:listen_test(host?, listen_config?)` and always pair it with `defer ts:close()`:
+Whenever you test `pool` or `session` workers, keep-alive framing, streaming, TLS, or WebSocket upgrades, use `App:listen_test(host?, listen_config?)`—which binds an OS-assigned ephemeral loopback port (`port = 0`, defaulting `host` to `"127.0.0.1"`) and exposes `ts.port` and `ts.base_url`—and always pair it with `defer ts:close()`:
 
 ```titan
 function test_greet_over_loopback(_ctx: test.Context)

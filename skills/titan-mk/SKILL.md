@@ -77,11 +77,11 @@ end
 
 ### 2. `Context`, JSON-Only `Bind`, and `HttpError`
 - **JSON-only body binding:** `ctx:bind()` decodes JSON only (`json`, `named`, `object`, `array`). Never invent form/query struct binders—use `ctx:param*`, `ctx:query*`, `ctx:get`, `ctx:cookie*`.
-- **Exact `Bind` errors:** `415` (`not ctx:is_json()`), `413` (`> body_limit`), `400` (empty body or JSON syntax/limit error), `422` (schema/type mismatch). Programmer schema/option bugs (`unknown_type`, `constructor_unavailable`, `unsupported_type`, `invalid_option`) and non-`json.Error` constructor errors **re-raise unchanged**.
+- **Exact `Bind` errors:** `415` (`not ctx:is_json()`), `413` (`> body_limit`; sets `Connection: close` before commit so `titan.http` skips unread-body drain and closes normally without aborting), `400` (empty body or JSON syntax/limit error), `422` (schema/type mismatch). Programmer schema/option bugs (`unknown_type`, `constructor_unavailable`, `unsupported_type`, `invalid_option`) and non-`json.Error` constructor errors **re-raise unchanged**.
 - **Map literals to `ctx:json`:** `ctx:json` takes `value`, which gives no contextual Map type—annotate the local (`local body: {string: value} = { ... }`) or pass a nominal `record`.
 - **Errors:** Signal expected HTTP failures with `raise mk.HttpError(status, message?, code?, cause?)`. Out-of-range statuses normalize to `500` first (defaulting message to `"Internal Server Error"`). Never swallow `async.CancellationReason`.
-- **Observers:** Use `ctx:on_before_commit` (header mutation before wire write) and `ctx:on_complete` (LIFO post-response observation) instead of wrapping `ctx:next()` in `catch`.
-- **Forwarded headers:** `Config.trust_forwarded_headers` defaults to `false`; enable only behind a trusted reverse proxy stripping client `X-Forwarded-*`.
+- **Observers & route/peer metadata:** Use `ctx:on_before_commit` (header mutation before wire write) and `ctx:on_complete` (LIFO post-response observation) instead of wrapping `ctx:next()` in `catch`. `ctx:classified_route()` exposes the dispatched route pattern even before endpoint execution (for error/auth/session/logger middleware). `ctx:peer_address()` / `meta:peer_address()` returns the direct socket `net.Address?` (`nil` in `App:test` or if disconnected before capture; `X-Forwarded-For` / `trusted_proxies` are intentionally omitted).
+- **Forwarded scheme/host headers:** `Config.trust_forwarded_headers` defaults to `false`; enable only behind a trusted reverse proxy stripping client `X-Forwarded-Proto` and `X-Forwarded-Host`.
 
 ### 3. Worker Threads (`WorkerMode`) and Transfer Constraints
 - **Modes:** `WorkerMode.parent()` (default), `WorkerMode.pool(PoolOptions { size?, queue_capacity?, on_start? })`, `WorkerMode.session(SessionOptions { session_id, queue_capacity?, max_sessions?, ephemeral?, on_start?, on_exit? })`.
@@ -102,17 +102,17 @@ end
 | `healthcheck` | `LIVENESS_ENDPOINT` (`"/livez"`), `READINESS_ENDPOINT`, `STARTUP_ENDPOINT`; `FORMAT_TEXT` / `FORMAT_JSON`; `Cache-Control: no-store`. |
 | `helmet` | Security headers; `""` omits a header; HSTS (`hsts_max_age > 0`) emitted on `ctx:secure()` only. |
 | `keyauth` | `Extractor.{auth_header, header, single_header, query, cookie, chain, custom}`; delegates check to your `validator` (use `keyauth.constant_time_equal` inside `validator`); `token_from_context(ctx)`. |
-| `logger` | `PHASE_COMPLETION` (`on_complete`, `matched_route()`) or `PHASE_ADMISSION` (`classified_route()`); `include_path` defaults `false`; built-in fields win over `extra_fields`. |
+| `logger` | `PHASE_COMPLETION` (`on_complete`, `matched_route()` with `classified_route()` fallback before `"<unmatched>"`) or `PHASE_ADMISSION` (`classified_route()`); `include_path` defaults `false`; built-in fields win over `extra_fields`. |
 | `recover` | Converts non-`HttpError` exceptions to `500` (`"internal_error"`); preserves `HttpError` and `async.CancellationReason`. |
 | `requestid` | Validates VCHAR `0x21..0x7E` (`1..256`), 3 generator retries, 16-byte CSPRNG fallback; `from_context(ctx)` / `ctx:request_id()`. |
 | `responsetime` | Sets `X-Response-Time` (`%.3fms`) via `on_before_commit`. |
 | `static` | Path served: matched `*`/`+` wildcard first (`app:get("/assets/*", static.new(root))`), else below `ctx:mount_path()`, else full request path (`use_path` does **not** strip prefix). Strict `lstat` + `realpath` confinement. |
-| `timeout` | `timeout.new(handler, ms, cfg?)` (when `next(ctx)` is `true`, calls `handler(ctx)` without deadline) vs `timeout.middleware(ms, cfg?)` (when `next(ctx)` is `true`, calls `ctx:next()`). |
+| `timeout` | `timeout.new(handler, ms, cfg?)` (when `next(ctx)` is `true`, calls `handler(ctx)` without deadline) vs `timeout.middleware(ms, cfg?)` (when `next(ctx)` is `true`, calls `ctx:next()`). Already committed/aborted responses return at expiry without calling `on_timeout` or raising `503`. |
 
 ## Testing and Building Consumers
 
 - **In-memory (`parent` routes only):** `app:test(mk.TestRequest("GET", "/path"), mk.TestConfig?)` — rejects `pool`/`session` routes and `upgrade_websocket` (`501`).
-- **Real loopback (workers, TLS, keep-alive, WebSockets):** `local ts = app:listen_test(); defer ts:close(); ts:request("GET", "/path")`.
+- **Real loopback (workers, TLS, keep-alive, WebSockets):** `local ts = app:listen_test(); defer ts:close(); ts:request("GET", "/path")` (binds ephemeral `port = 0`; `App:start("127.0.0.1:0")` likewise populates `ListenData.port` with the OS-assigned port).
 - **Native test filter syntax:** `./build/my-tests --filter=pattern` or `-f pattern` (bare `--filter pattern` is rejected by `titan.test`).
 - **Dynamic consumer build:** `titanc --incremental --tree src -o build --exe build/app app.main`.
 - **Static consumer build (`--static` on Linux/macOS with system-OpenSSL SDK):**
