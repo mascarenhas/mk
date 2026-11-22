@@ -1581,6 +1581,10 @@ function Context:upgrade_websocket(options: websocket.AcceptOptions?): websocket
   catch
     if error is websocket.HandshakeError then
       local failure = error as websocket.HandshakeError
+      -- The rejection ended the exchange: nothing is left to drain.
+      self.response_headers:set("Content-Length", "0")
+      self.response_headers:set("Connection", "close")
+      self.body_done = true
       self.committed_flag = true
       self.finished = true
       self.status_value = failure.status or 400
@@ -1618,7 +1622,11 @@ function Context:reject_upgrade(code: integer)
     self.in_socket_io = true
     defer self.in_socket_io = outer_io
     response:reject_upgrade(request, code, self.response_headers)
+    -- The rejection ended the exchange: nothing is left to drain.
+    self.response_headers:set("Content-Length", "0")
+    self.response_headers:set("Connection", "close")
   end
+  self.body_done = true
   self.committed_flag = true
   self.finished = true
 end
@@ -1719,10 +1727,12 @@ local function Context:release_transport()
   if response ~= nil then response:abort() end
 end
 
--- Whether the committed response announced `Connection: close`; `http` then
--- ends the connection without reading the unread request body.
+-- Whether the exchange ends after this response: the committed response or
+-- the client announced `Connection: close`, so `http` closes the connection
+-- without reading the unread request body.
 local function Context:announced_close(): boolean
-  return headers_have_token(self.response_headers, "Connection", "close")
+  return headers_have_token(self.response_headers, "Connection", "close") or
+    headers_have_token(self.meta.headers, "Connection", "close")
 end
 
 -- Live-transport request lifecycle on the executing owner Task: chain,
@@ -1736,7 +1746,7 @@ local function Core:run_live(ctx: Context)
   do
     ctx:execute()
     if not ctx.aborted_flag and ctx.upgraded_ws == nil and not ctx:announced_close() then
-      if ctx.close_after_response or self.closing then
+      if ctx:closes_connection() then
         -- Committed as persistent before the close was decided: `http`
         -- would drain the unread body, so end the transport instead.
         ctx:release_transport()

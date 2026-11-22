@@ -45,8 +45,9 @@ coverage-build:
 
 # A passing full run prints the executable-line summary and writes
 # build/coverage/.coverage/report/coverage.gcov (plus any requested formats).
+# An ambient TITAN_FILTER would silently measure a partial run.
 coverage-run:
-	env -u GCOV_PREFIX -u GCOV_PREFIX_STRIP ./build/coverage/mk-tests
+	env -u TITAN_FILTER -u GCOV_PREFIX -u GCOV_PREFIX_STRIP ./build/coverage/mk-tests
 
 coverage: coverage-build
 	$(MAKE) coverage-run

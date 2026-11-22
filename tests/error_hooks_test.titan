@@ -207,16 +207,44 @@ function test_commit_and_complete_observers(context: test.Context)
 end
 
 function test_live_upgrade_rejection(_: test.Context)
-  local app = mk.App()
-  app:get("/ws", function (ctx: mk.Context) ctx:reject_upgrade(403) end)
+  local lines: {string} = {}
+  local logger = log.Logger.new("debug", function (text: string) lines[#lines + 1] = text end)
+  local app = mk.App(mk.Config { logger = logger })
+  local outcomes: {string} = {}
+  local observe = function (ctx: mk.Context)
+    ctx:on_complete(function (done: mk.Context)
+      outcomes[#outcomes + 1] = done:status_code() .. ":" .. bool_text(done:aborted())
+    end)
+  end
+  app:get("/reject", function (ctx: mk.Context)
+    observe(ctx)
+    ctx:reject_upgrade(403)
+  end)
+  app:get("/accept", function (ctx: mk.Context)
+    observe(ctx)
+    ctx:upgrade_websocket()
+  end)
   local server = app:listen_test()
   defer server:close()
-  within(3000, "rejected upgrade", function ()
-    local text = raw(server, "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ..
-      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
-    test.assert(strings.sub(text, 1, 12) == "HTTP/1.1 403" and contains(text, "Connection: close") and
-      strings.sub(text, -4) == "\r\n\r\n", "bodyless rejection: " .. text)
+  local offer = "Upgrade: websocket\r\nConnection: Upgrade\r\n" ..
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+  within(3000, "rejected upgrades", function ()
+    local offered = raw_until_end(server, "GET /reject HTTP/1.1\r\nHost: t\r\n" .. offer .. "\r\n")
+    test.assert(strings.sub(offered, 1, 12) == "HTTP/1.1 403" and contains(offered, "Connection: close") and
+      strings.sub(offered, -4) == "\r\n\r\n", "bodyless rejection: " .. offered)
+    -- Plain requests (no upgrade offer) also end their exchange this way.
+    local plain = raw_until_end(server, "GET /reject HTTP/1.1\r\nHost: t\r\n\r\n")
+    test.assert(strings.sub(plain, 1, 12) == "HTTP/1.1 403", "plain rejection: " .. plain)
+    local handshake = raw_until_end(server, "GET /accept HTTP/1.1\r\nHost: t\r\n\r\n")
+    test.assert(strings.sub(handshake, 1, 10) == "HTTP/1.1 4", "failed handshake: " .. handshake)
   end)
+  server:close()
+  logger:close()
+  test.assert(#outcomes == 3 and outcomes[1] == "403:false" and outcomes[2] == "403:false" and
+    strings.sub(outcomes[3], -6) == ":false", "completed without aborts: " .. joined(outcomes))
+  for index = 1, #lines do
+    test.assert(not contains(lines[index], "http_request_failed"), "spurious failure log: " .. lines[index])
+  end
 end
 
 function test_live_bodyless_framing(context: test.Context)
@@ -295,6 +323,16 @@ function test_live_body_limits(context: test.Context)
       local text = raw(server, "POST /ignore HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello" ..
         "GET /next HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
       test.assert(contains(text, "ignored") and contains(text, "second"), "both pipelined responses")
+    end)
+  end)
+  context:run("client_close_skips_the_drain", function (_: test.Context)
+    within(3000, "client close", function ()
+      -- The client announced close and withholds most of a small body; the
+      -- exchange must end without reading it.
+      local text = raw(server, "POST /ignore HTTP/1.1\r\nHost: t\r\nConnection: close\r\n" ..
+        "Content-Length: 100\r\n\r\nabc")
+      test.assert(strings.sub(text, 1, 12) == "HTTP/1.1 200" and contains(text, "ignored"),
+        "response without a drain: " .. text)
     end)
   end)
   context:run("unread_oversized_body_aborts_after_response", function (_: test.Context)

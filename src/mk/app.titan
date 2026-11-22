@@ -1026,14 +1026,14 @@ function App:start(addr: string, listen_config: ListenConfig?)
   end
   local listener = server as http.Server
   self.server = listener
-  if port == 0 then port = listener:local_address().port end
-  self.listen_host = host
-  self.listen_port = port
   local started = false
   defer if not started then
     self:begin_shutdown(nil)
     await_terminal(self.retirement as async.Task<|nil, value|>)
   end
+  if port == 0 then port = listener:local_address().port end
+  self.listen_host = host
+  self.listen_port = port
   listener:read_ahead(false)
   listener:header_limit(self.header_limit)
   self:start_supervision()
