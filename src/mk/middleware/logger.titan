@@ -1,0 +1,165 @@
+--- Structured JSON request logging (GoFiber logger, JSON lines only).
+-- @module mk.middleware.logger
+
+local async = import "async"
+local iteration = import "iteration"
+local log = import "mk.log"
+local mk = import "mk"
+local thread = import "thread"
+local uv = import "uv"
+
+--- When the request line is written.
+union Phase
+  --- After the response finished, failed, or aborted (final status).
+  completion()
+  --- When the request enters the middleware, before the chain runs.
+  admission()
+end
+
+const PHASE_COMPLETION: Phase = Phase.completion()
+const PHASE_ADMISSION: Phase = Phase.admission()
+
+--- Logger options.
+-- @field next Skip the middleware entirely (continue the chain) when true.
+-- @field skip Suppress the line for this request when true (evaluated when
+-- the line would be written).
+-- @field sink_sender Send encoded JSON lines here (non-blocking; a full or
+-- closed channel drops the line) instead of through `Context:logger()`.
+-- @field level Line severity (default "info").
+-- @field event Line event name (default "http_request").
+-- @field phase PHASE_COMPLETION (default) or PHASE_ADMISSION.
+-- @field include_path Also log the request path (default false: only the
+-- declared route pattern or "<unmatched>").
+-- @field include_request_id Log `Context:request_id()` when set (default true).
+-- @field extra_fields Extra fields per request; built-in fields win.
+record Config
+  const next: (function (mk.Context): boolean)?
+  const skip: (function (mk.Context): boolean)?
+  const sink_sender: thread.Sender<|string|>?
+  const level: string?
+  const event: string?
+  const phase: Phase?
+  const include_path: boolean?
+  const include_request_id: boolean?
+  const extra_fields: (function (mk.Context): {string: value}?)?
+end
+
+-- Methods outside this vocabulary are logged as "OTHER".
+local const KNOWN_METHODS: {string: boolean} = {
+  ["GET"] = true, ["HEAD"] = true, ["POST"] = true, ["PUT"] = true,
+  ["DELETE"] = true, ["CONNECT"] = true, ["OPTIONS"] = true, ["TRACE"] = true,
+  ["PATCH"] = true,
+}
+
+local function request_fields(ctx: mk.Context, route: string, include_path: boolean,
+                              include_request_id: boolean,
+                              extra: (function (mk.Context): {string: value}?)?): {string: value}
+  local fields: {string: value} = {}
+  if extra ~= nil then
+    local more? = extra(ctx)
+    if more ~= nil then
+      for key, item in iteration.pairs(more) do fields[key] = item end
+    end
+  end
+  local method = ctx:method()
+  fields["method"] = KNOWN_METHODS[method] and method or "OTHER"
+  fields["route"] = route ~= "" and route or "<unmatched>"
+  if include_path then fields["path"] = ctx:path() end
+  if include_request_id then
+    local id = ctx:request_id()
+    if id ~= "" then fields["request_id"] = id end
+  end
+  local worker = ctx:worker_id()
+  if worker ~= 0 then fields["worker_id"] = worker end
+  return fields
+end
+
+-- Logging never changes the request outcome: unencodable records and a
+-- closed sink channel drop the line.
+local function write_line(ctx: mk.Context, sink: thread.Sender<|string|>?, level: string,
+                          event: string, fields: {string: value})
+  if sink == nil then
+    ctx:log(level, event, fields)
+    return
+  end
+  do
+    local line = log.format_line(level, event, fields)
+    if #line <= log.MAX_LINE_BYTES + 1 then sink:try_send(line) end
+  catch
+    if error is async.CancellationReason then raise end
+  end
+end
+
+--- Build the logger middleware. Completion mode registers an `on_complete`
+-- observer before continuing, so the line carries the final status written
+-- by the app's error handler; admission mode writes the line first. Neither
+-- mode catches or consumes failures.
+--
+-- Every line has `method` (GET, POST, ... or "OTHER"), `route` (the declared
+-- pattern, or "<unmatched>"; admission uses the route the request classified
+-- to), optional `path`, `request_id`, and `worker_id` (on workers).
+-- Completion lines add `status`, `latency_ms`, `aborted` (when true), and
+-- `error_code` (from `Context:last_error()`).
+function new(config: Config?): mk.Handler
+  local skip_all: (function (mk.Context): boolean)? = nil
+  local skip_line: (function (mk.Context): boolean)? = nil
+  local sink: thread.Sender<|string|>? = nil
+  local level = "info"
+  local event = "http_request"
+  local admission = false
+  local include_path = false
+  local include_request_id = true
+  local extra: (function (mk.Context): {string: value}?)? = nil
+  if config ~= nil then
+    skip_all = config.next
+    skip_line = config.skip
+    sink = config.sink_sender
+    level = log.resolve_level(config.level, nil, "logger: level")
+    event = config.event or event
+    local phase? = config.phase
+    if phase ~= nil then
+      case phase
+      when admission() then admission = true
+      when completion() then
+      end
+    end
+    include_path = config.include_path or false
+    include_request_id = config.include_request_id ~= false
+    extra = config.extra_fields
+  end
+  if event == "" then raise "logger: event must not be empty" end
+  return function (ctx: mk.Context)
+    -- Without a sink or app logger (fixed per state) there is nothing to do.
+    if (skip_all ~= nil and skip_all(ctx)) or (sink == nil and ctx:logger() == nil) then
+      ctx:next()
+      return
+    end
+    if admission then
+      if skip_line == nil or not skip_line(ctx) then
+        write_line(ctx, sink, level, event,
+          request_fields(ctx, ctx:classified_route(), include_path, include_request_id, extra))
+      end
+      ctx:next()
+      return
+    end
+    local start = uv.hrtime()
+    ctx:on_complete(function (done: mk.Context)
+      if skip_line ~= nil and skip_line(done) then return end
+      -- The executed endpoint, else the classified route (requests rejected
+      -- before reaching it, session pre-dispatch failures).
+      local route = done:matched_route()
+      if route == "" then route = done:classified_route() end
+      local fields = request_fields(done, route, include_path, include_request_id, extra)
+      fields["status"] = done:status_code()
+      fields["latency_ms"] = (uv.hrtime() - start) / 1000000.0
+      if done:aborted() then fields["aborted"] = true end
+      local failure? = done:last_error()
+      if failure ~= nil then
+        local code? = failure.code
+        if code ~= nil then fields["error_code"] = code end
+      end
+      write_line(done, sink, level, event, fields)
+    end)
+    ctx:next()
+  end
+end

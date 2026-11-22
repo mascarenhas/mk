@@ -1,0 +1,643 @@
+-- Context accessors, cookies, response builders, framing, streaming, commit,
+-- run_with_timeout, and JSON Bind error classification (in-memory).
+local test = import "test"
+local async = import "async"
+local fs = import "fs"
+local http = import "http"
+local json = import "json"
+local os = import "os"
+local reflect = import "reflect"
+local strings = import "string"
+local timer = import "timer"
+local mk = import "mk"
+
+record User
+  const name: string
+  const age: integer
+end
+
+local function headers(pairs: {string}): http.Headers
+  local result = http.headers(nil)
+  for index = 1, #pairs, 2 do result:add(pairs[index] as string, pairs[index + 1] as string) end
+  return result
+end
+
+local function call(app: mk.App, method: string, target: string, pairs: {string}?,
+                    body: string?): mk.TestResponse
+  local supplied: http.Headers? = nil
+  if pairs ~= nil then supplied = headers(pairs) end
+  return app:test(mk.TestRequest(method, target, supplied, body))
+end
+
+local function expect_status(response: mk.TestResponse, status: integer, what: string)
+  test.assert(response.status == status,
+    what .. ": expected " .. status .. ", got " .. response.status .. " (" .. response.body .. ")")
+end
+
+local function tostring_bool(flag: boolean): string
+  if flag then return "true" end
+  return "false"
+end
+
+local function string_ends(subject: string, suffix: string): boolean
+  return #subject >= #suffix and strings.sub(subject, #subject - #suffix + 1) == suffix
+end
+
+function test_typed_params_and_queries(context: test.Context)
+  local app = mk.App()
+  app:get("/n/:id", function (ctx: mk.Context)
+    ctx:send_string("id=" .. ctx:param_int("id") .. " page=" .. ctx:query_int("page", 1) ..
+      " ratio=" .. ctx:query_float("ratio", 0.5) .. " on=" .. tostring_bool(ctx:query_bool("on", false)))
+  end)
+  app:get("/tags", function (ctx: mk.Context)
+    local values = ctx:query_values("t")
+    local out = ""
+    for index = 1, #values do out = out .. values[index] .. ";" end
+    local optional? = ctx:query_opt("missing")
+    if optional == nil then out = out .. "nil" end
+    ctx:send_string(out)
+  end)
+  context:run("typed_values", function (_: test.Context)
+    local response = call(app, "GET", "/n/12?page=3&ratio=1.5&on=yes")
+    test.assert(response.body == "id=12 page=3 ratio=1.5 on=true", "typed values: " .. response.body)
+    local defaults = call(app, "GET", "/n/1")
+    test.assert(defaults.body == "id=1 page=1 ratio=0.5 on=false", "defaults: " .. defaults.body)
+  end)
+  context:run("malformed_values_are_400", function (_: test.Context)
+    expect_status(call(app, "GET", "/n/abc"), 400, "non-integer param")
+    expect_status(call(app, "GET", "/n/1?page=x"), 400, "non-integer query")
+    expect_status(call(app, "GET", "/n/1?on=maybe"), 400, "non-boolean query")
+  end)
+  context:run("repeated_query_values", function (_: test.Context)
+    test.assert(call(app, "GET", "/tags?t=a&t=b+c&t=%2F").body == "a;b c;/;nil", "query_values order")
+  end)
+end
+
+function test_headers_and_content_negotiation(context: test.Context)
+  local app = mk.App()
+  app:get("/h", function (ctx: mk.Context)
+    local accepted = ctx:accepts({"json", "text/html"}) or "none"
+    ctx:send_string(ctx:get("X-One", "?") .. "|" .. #ctx:get_headers("X-Many") .. "|" ..
+      tostring_bool(ctx:has_header("x-one")) .. "|" .. ctx:media_type() .. "|" ..
+      tostring_bool(ctx:is_json()) .. "|" .. accepted .. "|" .. (ctx:bearer() or "nobearer"))
+  end)
+  context:run("header_accessors", function (_: test.Context)
+    local response = call(app, "GET", "/h", {"X-One", "1", "X-Many", "a", "X-Many", "b",
+      "Content-Type", "Application/Problem+JSON; charset=utf-8", "Accept", "text/html;q=0.9, application/json",
+      "Authorization", "Bearer abc.def"})
+    test.assert(response.body == "1|2|true|application/problem+json|true|json|abc.def",
+      "header accessors: " .. response.body)
+  end)
+  context:run("accept_quality_and_wildcards", function (_: test.Context)
+    local html = call(app, "GET", "/h", {"Accept", "application/json;q=0.2, text/*;q=0.8"})
+    test.assert(string_ends(html.body, "|text/html|nobearer"), "q-values: " .. html.body)
+    local none = call(app, "GET", "/h", {"Accept", "image/png"})
+    test.assert(string_ends(none.body, "|none|nobearer"), "no acceptable offer: " .. none.body)
+    local absent = call(app, "GET", "/h")
+    test.assert(string_ends(absent.body, "|json|nobearer"), "missing Accept picks the first offer")
+  end)
+end
+
+function test_cookies(context: test.Context)
+  local app = mk.App()
+  app:get("/c", function (ctx: mk.Context)
+    ctx:set_cookie(mk.Cookie { name = "session", value = "abc", max_age = 60, secure = true,
+      http_only = true, same_site = "Lax", domain = "example.com" })
+    ctx:clear_cookie("old")
+    ctx:send_string(ctx:cookie("a") .. "|" .. ctx:cookie("b", "dflt") .. "|" .. (ctx:cookie_opt("c") or "nil"))
+  end)
+  app:get("/bad", function (ctx: mk.Context)
+    ctx:set_cookie(mk.Cookie { name = "bad name", value = "x" })
+  end)
+  context:run("request_cookies_and_set_cookie", function (_: test.Context)
+    local response = call(app, "GET", "/c", {"Cookie", "a=1; c=\"quoted\""})
+    test.assert(response.body == "1|dflt|quoted", "request cookies: " .. response.body)
+    local set = response.headers:values("Set-Cookie")
+    test.assert(#set == 2, "two Set-Cookie headers")
+    test.assert(set[1] == "session=abc; Path=/; Domain=example.com; Max-Age=60; Secure; HttpOnly; SameSite=Lax",
+      "rendered cookie: " .. set[1])
+    test.assert(set[2] == "old=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+      "cleared cookie: " .. set[2])
+  end)
+  context:run("invalid_cookie_name_raises", function (_: test.Context)
+    local rejected = false
+    do
+      call(app, "GET", "/bad")
+    catch
+      rejected = true
+    end
+    test.assert(rejected, "an invalid cookie name must raise")
+  end)
+end
+
+function test_response_builders(context: test.Context)
+  local app = mk.App(mk.Config { server_header = "mk-test" })
+  app:get("/json", function (ctx: mk.Context)
+    local payload: {string: value} = {["ok"] = true}
+    ctx:status(202):json(payload)
+  end)
+  app:get("/html", function (ctx: mk.Context) ctx:html("<b>x</b>") end)
+  app:get("/type", function (ctx: mk.Context) ctx:type("css"):send("a{}") end)
+  app:get("/attach", function (ctx: mk.Context) ctx:attachment("dir/report.pdf"):send("%PDF") end)
+  app:get("/redirect", function (ctx: mk.Context) ctx:redirect("/elsewhere") end)
+  app:get("/vary", function (ctx: mk.Context)
+    ctx:vary("Origin"):vary("accept-encoding", "Origin"):append("X-Multi", "1"):append("X-Multi", "2")
+    ctx:send_status(418)
+  end)
+  app:get("/default", function (ctx: mk.Context) ctx:send("raw") end)
+  context:run("json", function (_: test.Context)
+    local response = call(app, "GET", "/json")
+    expect_status(response, 202, "json status")
+    test.assert(response.body == "{\"ok\":true}", "json body " .. response.body)
+    test.assert(response:header("Content-Type") == "application/json", "json content type")
+    test.assert(response:header("Content-Length") == "11", "buffered Content-Length")
+    test.assert(response:header("Server") == "mk-test", "server header")
+  end)
+  context:run("html_type_attachment", function (_: test.Context)
+    test.assert(call(app, "GET", "/html"):header("Content-Type") == "text/html; charset=utf-8", "html")
+    test.assert(call(app, "GET", "/type"):header("Content-Type") == "text/css; charset=utf-8", "type")
+    local attach = call(app, "GET", "/attach")
+    test.assert(attach:header("Content-Disposition") == "attachment; filename=\"report.pdf\"", "disposition")
+    test.assert(attach:header("Content-Type") == "application/pdf", "attachment type")
+  end)
+  context:run("redirect_vary_status", function (_: test.Context)
+    local redirect = call(app, "GET", "/redirect")
+    expect_status(redirect, 303, "redirect")
+    test.assert(redirect:header("Location") == "/elsewhere", "location")
+    local vary = call(app, "GET", "/vary")
+    expect_status(vary, 418, "send_status")
+    test.assert(vary.body == "I'm a teapot", "send_status body")
+    test.assert(vary:header("Vary") == "Origin, accept-encoding", "vary dedup: " .. (vary:header("Vary") or ""))
+    test.assert(#vary.headers:values("X-Multi") == 2, "append keeps both values")
+  end)
+  context:run("default_content_type", function (_: test.Context)
+    test.assert(call(app, "GET", "/default"):header("Content-Type") == "text/plain; charset=utf-8",
+      "default text/plain")
+  end)
+end
+
+function test_bodyless_status_framing(context: test.Context)
+  local app = mk.App()
+  app:get("/s/:code", function (ctx: mk.Context)
+    ctx:status(ctx:param_int("code")):send_string("should not be sent")
+  end)
+  context:run("head_has_length_but_no_body", function (_: test.Context)
+    local response = call(app, "HEAD", "/s/200")
+    test.assert(response.body == "" and response:header("Content-Length") == "18", "HEAD framing")
+  end)
+  context:run("no_content_204", function (_: test.Context)
+    local response = call(app, "GET", "/s/204")
+    test.assert(response.status == 204 and response.body == "", "204 body")
+    test.assert(response:header("Content-Length") == nil, "204 has no Content-Length")
+  end)
+  context:run("reset_content_205", function (_: test.Context)
+    local response = call(app, "GET", "/s/205")
+    test.assert(response.body == "" and response:header("Content-Length") == "0", "205 framing")
+  end)
+  context:run("not_modified_304", function (_: test.Context)
+    local response = call(app, "GET", "/s/304")
+    test.assert(response.body == "" and response:header("Content-Length") == nil, "304 framing")
+  end)
+end
+
+function test_streaming_and_commit(context: test.Context)
+  local app = mk.App()
+  app:get("/stream", function (ctx: mk.Context)
+    ctx:status(201)
+    ctx:write_chunk("one,")
+    test.assert(ctx:committed(), "write_chunk commits")
+    ctx:write_chunk("two")
+  end)
+  app:get("/commit", function (ctx: mk.Context)
+    ctx:send_string("early"):commit()
+    local rejected = false
+    do ctx:send_string("late") catch rejected = true end
+    test.assert(rejected, "mutating a committed response must raise")
+  end)
+  app:get("/reader", function (ctx: mk.Context)
+    ctx:send_stream(strings.reader("from reader"), 11)
+  end)
+  context:run("chunks", function (_: test.Context)
+    local response = call(app, "GET", "/stream")
+    test.assert(response.status == 201 and response.body == "one,two", "stream body " .. response.body)
+  end)
+  context:run("commit_is_final", function (_: test.Context)
+    test.assert(call(app, "GET", "/commit").body == "early", "commit flushed the buffered body")
+  end)
+  context:run("send_stream", function (_: test.Context)
+    local response = call(app, "GET", "/reader")
+    test.assert(response.body == "from reader" and response:header("Content-Length") == "11", "send_stream")
+  end)
+end
+
+function test_request_body(context: test.Context)
+  local app = mk.App(mk.Config { body_limit = 16 })
+  app:post("/echo", function (ctx: mk.Context) ctx:send_string(ctx:body()) end)
+  app:post("/chunks", function (ctx: mk.Context)
+    local total = 0
+    for chunk in ctx:read_body_chunk do total = total + #chunk end
+    ctx:send_string("read " .. total)
+  end)
+  context:run("body_within_limit", function (_: test.Context)
+    test.assert(call(app, "POST", "/echo", nil, "hello").body == "hello", "echo")
+    test.assert(call(app, "POST", "/chunks", nil, "abc").body == "read 3", "chunked reads")
+  end)
+  context:run("body_over_limit_is_413", function (_: test.Context)
+    local response = call(app, "POST", "/echo", nil, "0123456789abcdefXYZ")
+    expect_status(response, 413, "oversized body")
+    test.assert(response:header("Connection") == "close", "413 closes the connection")
+  end)
+  context:run("upgrade_offer_body_is_empty", function (_: test.Context)
+    local response = call(app, "POST", "/echo", {"Connection", "Upgrade", "Upgrade", "websocket"}, "ignored")
+    test.assert(response.body == "", "upgrade offers never read the body")
+  end)
+end
+
+function test_bind_classification(context: test.Context)
+  local app = mk.App(mk.Config { body_limit = 64 })
+  app:post("/any", function (ctx: mk.Context)
+    ctx:json(ctx:bind():json())
+  end)
+  app:post("/user", function (ctx: mk.Context)
+    local user: User = ctx:bind():named("context_bind_test.User")
+    ctx:send_string(user.name .. ":" .. user.age)
+  end)
+  app:post("/object", function (ctx: mk.Context)
+    local object = ctx:bind():object()
+    ctx:send_string(object["k"] as string)
+  end)
+  app:post("/array", function (ctx: mk.Context)
+    ctx:send_string("n=" .. #ctx:bind():array())
+  end)
+  app:post("/limits", function (ctx: mk.Context)
+    ctx:bind():json(nil, json.DecodeOption.max_depth(1))
+    ctx:send_string("ok")
+  end)
+  app:post("/typed_int", function (ctx: mk.Context)
+    local value: integer = ctx:bind():json(reflect.Type.is_integer())
+    ctx:send_string("int " .. value)
+  end)
+  app:post("/broken_schema", function (ctx: mk.Context)
+    ctx:bind():named("context_bind_test.NoSuchType")
+  end)
+  local json_type = {"Content-Type", "application/json"}
+  context:run("success_paths", function (_: test.Context)
+    test.assert(call(app, "POST", "/any", json_type, "{\"a\":[1,2]}").body == "{\"a\":[1,2]}", "dynamic")
+    test.assert(call(app, "POST", "/user", json_type, "{\"name\":\"Ada\",\"age\":36}").body == "Ada:36", "named")
+    test.assert(call(app, "POST", "/object", json_type, "{\"k\":\"v\"}").body == "v", "object")
+    test.assert(call(app, "POST", "/array", json_type, "[1,2,3]").body == "n=3", "array")
+  end)
+  context:run("unsupported_media_type_415", function (_: test.Context)
+    expect_status(call(app, "POST", "/any", {"Content-Type", "text/plain"}, "{}"), 415, "text/plain")
+    expect_status(call(app, "POST", "/any", nil, "{}"), 415, "missing content type")
+  end)
+  context:run("too_large_413", function (_: test.Context)
+    local big = "[" .. strings.rep("1,", 40) .. "1]"
+    expect_status(call(app, "POST", "/any", json_type, big), 413, "oversized JSON")
+  end)
+  context:run("empty_and_malformed_400", function (_: test.Context)
+    local empty = call(app, "POST", "/any", json_type, "")
+    expect_status(empty, 400, "empty body")
+    test.assert(empty.body == "empty JSON request body", "empty body message")
+    expect_status(call(app, "POST", "/any", json_type, "{\"a\":"), 400, "truncated JSON")
+    expect_status(call(app, "POST", "/any", json_type, "[1] x"), 400, "trailing input")
+    expect_status(call(app, "POST", "/any", json_type, "{\"a\":1,\"a\":2}"), 400, "duplicate key")
+    expect_status(call(app, "POST", "/limits", json_type, "[[1]]"), 400, "depth limit")
+  end)
+  context:run("schema_mismatch_422", function (_: test.Context)
+    expect_status(call(app, "POST", "/user", json_type, "{\"name\":\"Ada\"}"), 422, "missing field")
+    expect_status(call(app, "POST", "/user", json_type, "{\"name\":1,\"age\":2}"), 422, "type mismatch")
+    expect_status(call(app, "POST", "/user", json_type, "{\"name\":\"A\",\"age\":1.5}"), 422, "non integral")
+    expect_status(call(app, "POST", "/object", json_type, "[1]"), 422, "array for object")
+    expect_status(call(app, "POST", "/typed_int", json_type, "99999999999999999999"), 422,
+      "typed integer range")
+  end)
+  context:run("programmer_errors_reraise", function (_: test.Context)
+    local raised = false
+    do
+      call(app, "POST", "/broken_schema", json_type, "{}")
+    catch
+      raised = true
+      test.assert(error is json.Error, "the json.Error itself must propagate")
+      local failure = error as json.Error
+      test.assert(failure.code == "unknown_type", "unexpected code " .. failure.code)
+    end
+    test.assert(raised, "unknown_type must not become an HTTP error")
+  end)
+end
+
+function test_locals_and_overrides(_: test.Context)
+  local app = mk.App()
+  app:use(function (ctx: mk.Context)
+    ctx:set_local("requestid", "rid-1")
+    ctx:next()
+  end)
+  app:get("/p/:a", function (ctx: mk.Context)
+    ctx:override_param("a", "changed")
+    ctx:override_param("absent", "ignored")
+    local params = ctx:params()
+    ctx:send_string(ctx:param("a") .. "|" .. (ctx:param_opt("absent") or "nil") .. "|" ..
+      ctx:request_id() .. "|" .. (params["a"] as string))
+  end)
+  test.assert(call(app, "GET", "/p/x").body == "changed|nil|rid-1|changed", "locals and overrides")
+end
+
+function test_run_with_timeout(context: test.Context)
+  local app = mk.App()
+  app:get("/slow", function (ctx: mk.Context)
+    ctx:run_with_timeout(20, function (inner: mk.Context)
+      timer.sleep(2000)
+      inner:send_string("too late")
+    end)
+  end)
+  app:get("/custom", function (ctx: mk.Context)
+    ctx:run_with_timeout(20, function (_: mk.Context)
+      timer.sleep(2000)
+    end, function (inner: mk.Context)
+      inner:status(504):send_string("custom timeout")
+    end)
+  end)
+  app:get("/fast", function (ctx: mk.Context)
+    ctx:run_with_timeout(500, function (inner: mk.Context)
+      test.assert(inner:deadline_ns() ~= nil, "deadline visible inside the action")
+      inner:send_string("fast")
+    end)
+    test.assert(ctx:deadline_ns() == nil, "deadline restored afterwards")
+  end)
+  app:get("/error", function (ctx: mk.Context)
+    ctx:run_with_timeout(500, function (_: mk.Context)
+      raise mk.HttpError(409, "conflict inside timeout")
+    end)
+  end)
+  app:get("/nested", function (ctx: mk.Context)
+    ctx:run_with_timeout(30, function (outer: mk.Context)
+      outer:run_with_timeout(5000, function (inner: mk.Context)
+        timer.sleep(2000)
+        inner:send_string("never")
+      end)
+    end)
+  end)
+  context:run("expiry_is_503", function (_: test.Context)
+    local response = call(app, "GET", "/slow")
+    expect_status(response, 503, "timeout")
+    test.assert(response.body == "Service Unavailable", "default timeout body " .. response.body)
+  end)
+  context:run("custom_on_timeout", function (_: test.Context)
+    local response = call(app, "GET", "/custom")
+    test.assert(response.status == 504 and response.body == "custom timeout", "on_timeout")
+  end)
+  context:run("completes_in_time", function (_: test.Context)
+    test.assert(call(app, "GET", "/fast").body == "fast", "fast action")
+  end)
+  context:run("errors_propagate", function (_: test.Context)
+    local response = call(app, "GET", "/error")
+    test.assert(response.status == 409 and response.body == "conflict inside timeout", "inner HttpError")
+  end)
+  context:run("enclosing_deadline_bounds_inner", function (_: test.Context)
+    expect_status(call(app, "GET", "/nested"), 503, "outer deadline wins")
+  end)
+end
+
+function test_in_memory_test_timeout(context: test.Context)
+  local app = mk.App()
+  app:get("/hang", function (_: mk.Context) timer.sleep(5000) end)
+  context:run("fail_on_timeout", function (_: test.Context)
+    local raised = false
+    do
+      app:test(mk.TestRequest("GET", "/hang"), mk.TestConfig(30, nil))
+    catch
+      raised = true
+      test.assert(error == "mk: App:test timed out after 30 ms", "timeout message")
+    end
+    test.assert(raised, "App:test must raise on timeout")
+  end)
+  context:run("return_partial_response", function (_: test.Context)
+    local response = app:test(mk.TestRequest("GET", "/hang"), mk.TestConfig(30, false))
+    test.assert(response.status == 0, "no response was committed")
+  end)
+end
+
+local function raises(action: function (): ()): string
+  do
+    action()
+  catch
+    return strings.tostring(error)
+  end
+  return ""
+end
+
+function test_head_keeps_declared_length(_: test.Context)
+  local app = mk.App()
+  app:head("/size", function (ctx: mk.Context) ctx:set("Content-Length", "42") end)
+  local response = call(app, "HEAD", "/size")
+  test.assert(response.body == "" and response:header("Content-Length") == "42",
+    "an explicit HEAD Content-Length is kept: " .. (response:header("Content-Length") or "nil"))
+end
+
+function test_accepts_quality_rules(context: test.Context)
+  local app = mk.App()
+  app:get("/a", function (ctx: mk.Context)
+    ctx:send_string(ctx:accepts({"json", "text/plain"}) or "none")
+  end)
+  local accept = function (header: string): string
+    return call(app, "GET", "/a", {"Accept", header}).body
+  end
+  context:run("zero_quality_excludes", function (_: test.Context)
+    test.assert(accept("application/json;q=0, */*;q=0.5") == "text/plain", "q=0 excludes json")
+    test.assert(accept("application/json;Q=0, text/plain;q=0") == "none", "uppercase Q and no offer left")
+  end)
+  context:run("most_specific_range_wins", function (_: test.Context)
+    test.assert(accept("*/*;q=0.8, application/json;q=0.1") == "text/plain",
+      "the specific json range lowers json below the wildcard")
+    test.assert(accept("text/*;q=0.3, application/*;q=0.9") == "json", "type wildcards")
+  end)
+end
+
+function test_cookie_attributes_reject_injection(_: test.Context)
+  local app = mk.App()
+  app:get("/path", function (ctx: mk.Context)
+    ctx:set_cookie(mk.Cookie { name = "a", value = "b", path = "/; Secure" })
+  end)
+  app:get("/domain", function (ctx: mk.Context)
+    ctx:set_cookie(mk.Cookie { name = "a", value = "b", domain = "example.com\r\nX: y" })
+  end)
+  test.assert(raises(function () call(app, "GET", "/path") end) == "mk: invalid cookie path",
+    "a path cannot inject attributes")
+  test.assert(raises(function () call(app, "GET", "/domain") end) == "mk: invalid cookie domain",
+    "a domain cannot inject attributes")
+end
+
+function test_body_limit_is_sticky(_: test.Context)
+  local app = mk.App(mk.Config { body_limit = 4 })
+  app:post("/twice", function (ctx: mk.Context)
+    local first = "ok"
+    do ctx:body() catch first = "413" end
+    test.assert(first == "413", "the first read overflows")
+    ctx:send_string("second read " .. ctx:body())
+  end)
+  local response = call(app, "POST", "/twice", nil, "123456")
+  test.assert(response.status == 413, "a repeated read after a caught 413 raises 413 again")
+end
+
+function test_misc_accessor_rules(context: test.Context)
+  local app = mk.App()
+  app:get("/float", function (ctx: mk.Context) ctx:send_string("" .. ctx:query_float("r", 0.0)) end)
+  app:get("/vary", function (ctx: mk.Context)
+    ctx:append("Vary", "A"):append("Vary", "B, C"):vary("c", "D")
+  end)
+  app:get("/stream", function (ctx: mk.Context) ctx:send_stream(strings.reader("x"), -1) end)
+  context:run("non_finite_float_is_400", function (_: test.Context)
+    expect_status(call(app, "GET", "/float?r=1e999"), 400, "infinite float")
+    test.assert(call(app, "GET", "/float?r=2.5").body == "2.5", "finite float")
+  end)
+  context:run("vary_merges_every_line", function (_: test.Context)
+    test.assert(call(app, "GET", "/vary"):header("Vary") == "A, B, C, D", "merged Vary")
+  end)
+  context:run("negative_stream_length_raises", function (_: test.Context)
+    test.assert(raises(function () call(app, "GET", "/stream") end) ==
+      "mk: send_stream content_length must be non-negative", "negative length rejected")
+  end)
+end
+
+function test_send_file(context: test.Context)
+  local file_path = fs.tmpdir() .. "/mk-send-file-" .. os.pid() .. ".json"
+  fs.write_file(file_path, "{\"a\":1}")
+  context:cleanup(function () fs.unlink(file_path) end)
+  local app = mk.App()
+  app:get("/file", function (ctx: mk.Context) ctx:send_file(file_path) end)
+  app:get("/download", function (ctx: mk.Context) ctx:send_file(file_path, true) end)
+  app:get("/missing", function (ctx: mk.Context) ctx:send_file(file_path .. ".absent") end)
+  context:run("content_and_type", function (_: test.Context)
+    local response = call(app, "GET", "/file")
+    test.assert(response.body == "{\"a\":1}", "file body")
+    test.assert(response:header("Content-Type") == "application/json; charset=utf-8", "json type")
+    test.assert(response:header("Content-Length") == "7", "declared file size")
+  end)
+  context:run("download_attachment", function (_: test.Context)
+    local disposition = call(app, "GET", "/download"):header("Content-Disposition") or ""
+    test.assert(disposition == "attachment; filename=\"mk-send-file-" .. os.pid() .. ".json\"",
+      "attachment disposition: " .. disposition)
+  end)
+  context:run("missing_is_404", function (_: test.Context)
+    expect_status(call(app, "GET", "/missing"), 404, "missing file")
+  end)
+end
+
+function test_run_with_timeout_revokes_ownership(_: test.Context)
+  local rogues: {async.Task<|string, value|>} = {}
+  local app = mk.App()
+  app:get("/revoke", function (ctx: mk.Context)
+    ctx:run_with_timeout(20, function (inner: mk.Context)
+      -- A Task the action leaked tries to write after the deadline.
+      rogues[1] = async.run<|string, value|>(function (): string
+        timer.sleep(80)
+        do inner:send_string("late") catch return strings.tostring(error) end
+        return "wrote"
+      end)
+      timer.sleep(2000)
+    end, function (inner: mk.Context)
+      inner:status(504):send_string("timed out")
+    end)
+  end)
+  local response = call(app, "GET", "/revoke")
+  test.assert(response.status == 504 and response.body == "timed out", "on_timeout owns the Context")
+  local rogue = rogues[1]
+  local outcome = ""
+  case async.join(rogue)
+  when succeeded(text) then outcome = text
+  else
+  end
+  test.assert(outcome == "context ownership revoked", "late write rejected: " .. outcome)
+end
+
+function test_host_upgrade_and_preflight_accessors(context: test.Context)
+  local app = mk.App()
+  app:get("/where", function (ctx: mk.Context)
+    ctx:send_string(ctx:hostname() .. "|" .. ctx:port() .. "|" .. ctx:protocol() .. "|" ..
+      tostring_bool(ctx:is_websocket()) .. "|" .. tostring_bool(ctx:is_upgrade_offer()))
+  end)
+  app:options("/where", function (ctx: mk.Context) ctx:send_string(tostring_bool(ctx:is_preflight())) end)
+  context:run("ipv6_hosts_and_default_ports", function (_: test.Context)
+    test.assert(call(app, "GET", "/where", {"Host", "[::1]:8080"}).body == "[::1]|8080|HTTP/1.1|false|false",
+      "bracketed IPv6 host with a port")
+    test.assert(call(app, "GET", "/where", {"Host", "[::1]"}).body == "[::1]|80|HTTP/1.1|false|false",
+      "bracketed IPv6 host without a port")
+    local secure = app:test(mk.TestRequest("GET", "/where", headers({"Host", "example.com"}), nil, true))
+    test.assert(secure.body == "example.com|443|HTTP/1.1|false|false", "https default port: " .. secure.body)
+  end)
+  context:run("upgrade_offers", function (_: test.Context)
+    test.assert(call(app, "GET", "/where", {"Upgrade", "websocket", "Connection", "keep-alive, Upgrade"}).body ==
+      "example.com|80|HTTP/1.1|true|true", "WebSocket offer")
+    test.assert(call(app, "GET", "/where", {"Upgrade", "h2c", "Connection", "Upgrade"}).body ==
+      "example.com|80|HTTP/1.1|false|true", "other upgrade offer")
+  end)
+  context:run("cors_preflight", function (_: test.Context)
+    test.assert(call(app, "OPTIONS", "/where",
+      {"Origin", "https://a.example", "Access-Control-Request-Method", "PUT"}).body == "true", "preflight")
+    test.assert(call(app, "OPTIONS", "/where", {"Origin", "https://a.example"}).body == "false",
+      "plain OPTIONS with Origin")
+  end)
+end
+
+function test_request_meta_accessors_in_selectors(_: test.Context)
+  local seen = ""
+  local app = mk.App()
+  app:get("/m/:id", function (ctx: mk.Context) ctx:send_string(seen) end)
+    :workers(mk.WorkerMode.session(mk.SessionOptions {
+      session_id = function (meta: mk.RequestMeta): string?
+        seen = meta:param("id") .. "|" .. (meta:param_opt("missing") or "nil") .. "|" ..
+          meta:param("missing", "fallback") .. "|" .. #meta:get_headers("X-Multi")
+        return nil
+      end,
+    }))
+  local response = call(app, "GET", "/m/42", {"X-Multi", "a", "X-Multi", "b"})
+  test.assert(response.body == "42|nil|fallback|2", "selector metadata: " .. response.body)
+end
+
+function test_response_header_copies_and_cookie_rules(context: test.Context)
+  local app = mk.App()
+  app:get("/headers", function (ctx: mk.Context)
+    ctx:set("X-Remove", "1"):set("X-Keep", "2"):remove_header("X-Remove")
+    ctx:resp_headers():set("X-Copy-Only", "3")
+    ctx:req_headers():set("X-In", "changed")
+    ctx:attachment():send_string(ctx:get("X-In", "none"))
+  end)
+  app:get("/bad-value", function (ctx: mk.Context) ctx:set_cookie(mk.Cookie { name = "a", value = "x;y" }) end)
+  app:get("/bad-same-site", function (ctx: mk.Context)
+    ctx:set_cookie(mk.Cookie { name = "a", value = "x", same_site = "Sometimes" })
+  end)
+  context:run("header_copies_do_not_alias", function (_: test.Context)
+    local response = call(app, "GET", "/headers", {"X-In", "original"})
+    test.assert(response:header("X-Remove") == nil and response:header("X-Keep") == "2", "remove_header")
+    test.assert(response:header("X-Copy-Only") == nil and response.body == "original",
+      "resp_headers and req_headers return copies")
+    test.assert(response:header("Content-Disposition") == "attachment", "attachment without a filename")
+  end)
+  context:run("invalid_cookies_raise", function (_: test.Context)
+    test.assert(raises(function () call(app, "GET", "/bad-value") end) == "mk: invalid cookie value",
+      "separator in a cookie value")
+    test.assert(raises(function () call(app, "GET", "/bad-same-site") end) ==
+      "mk: cookie same_site must be Lax, Strict, or None", "unknown SameSite")
+  end)
+end
+
+function test_in_memory_upgrades(context: test.Context)
+  local app = mk.App()
+  app:get("/ws", function (ctx: mk.Context) ctx:upgrade_websocket() end)
+  app:get("/reject", function (ctx: mk.Context) ctx:reject_upgrade(403) end)
+  app:get("/reject-bad", function (ctx: mk.Context) ctx:reject_upgrade(200) end)
+  local offer: {string} = {"Upgrade", "websocket", "Connection", "Upgrade",
+    "Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version", "13"}
+  context:run("accept_needs_a_live_server", function (_: test.Context)
+    expect_status(call(app, "GET", "/ws", offer), 501, "in-memory WebSocket upgrade")
+  end)
+  context:run("rejection_is_bodyless_and_closes", function (_: test.Context)
+    local response = call(app, "GET", "/reject", offer)
+    test.assert(response.status == 403 and response.body == "" and response:header("Content-Length") == "0" and
+      response:header("Connection") == "close", "rejected upgrade")
+  end)
+  context:run("rejection_status_range", function (_: test.Context)
+    test.assert(raises(function () call(app, "GET", "/reject-bad", offer) end) ==
+      "mk: upgrade rejection status must be 400..599", "2xx rejection")
+  end)
+end

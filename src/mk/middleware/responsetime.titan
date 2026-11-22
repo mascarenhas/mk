@@ -1,0 +1,43 @@
+--- Response-time header (GoFiber responsetime).
+-- @module mk.middleware.responsetime
+
+local mk = import "mk"
+local strings = import "string"
+local uv = import "uv"
+
+local const TOKEN_PATTERN = "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+
+--- Response-time options.
+-- @field next Skip the middleware (continue the chain) when it returns true.
+-- @field header Response header (default "X-Response-Time").
+record Config
+  const next: (function (mk.Context): boolean)?
+  const header: string?
+end
+
+--- Set `header` to the milliseconds elapsed since this middleware ran
+-- (e.g. `1.250ms`). The value is written by an `on_before_commit` hook, so
+-- buffered, streamed, and error-handler responses all carry it; errors
+-- propagate untouched.
+function new(config: Config?): mk.Handler
+  local skip: (function (mk.Context): boolean)? = nil
+  local header = "X-Response-Time"
+  if config ~= nil then
+    skip = config.next
+    header = config.header or header
+  end
+  if strings.match(header, TOKEN_PATTERN) == nil then
+    raise "responsetime: header must be an HTTP token"
+  end
+  return function (ctx: mk.Context)
+    if skip ~= nil and skip(ctx) then
+      ctx:next()
+      return
+    end
+    local start = uv.hrtime()
+    ctx:on_before_commit(function (committing: mk.Context)
+      committing:set(header, strings.format("%.3fms", (uv.hrtime() - start) / 1000000.0))
+    end)
+    ctx:next()
+  end
+end

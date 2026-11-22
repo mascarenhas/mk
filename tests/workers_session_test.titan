@@ -1,0 +1,478 @@
+-- Session workers: affinity, nil fallback, parent pre-dispatch errors,
+-- max_sessions, causal retire_worker with on_exit, ephemeral rerouting of
+-- unread queued exchanges, crashes, WebSocket takeover, and shutdown guards.
+local test = import "test"
+local async = import "async"
+local iteration = import "iteration"
+local net = import "net"
+local strings = import "string"
+local thread = import "thread"
+local timer = import "timer"
+local websocket = import "websocket"
+-- The source import exposes parent supervision state for queue oracles.
+local mk = import "mk.titan"
+
+-- Exchanges queued so far to the live worker of session `sid`.
+local function queued_for(app: mk.App, sid: string): integer
+  for index = 1, #app.dispatchers do
+    local slot? = app.dispatchers[index].sessions[sid]
+    if slot ~= nil then return slot.delivered_count end
+  end
+  return 0
+end
+
+local function within(ms: integer, what: string, action: function (): ())
+  local worker = async.run<|nil, value|>(function (): nil
+    action()
+    return nil
+  end)
+  local deadline = async.run<|nil, value|>(function (): nil
+    timer.sleep(ms)
+    return nil
+  end)
+  defer do
+    if not deadline:status():has_finished() then deadline:cancel() end
+    if not worker:status():has_finished() then worker:cancel() end
+  end
+  case async.race_two(worker, deadline)
+  when first(status) then
+    local failed, failure? = status:has_failed()
+    if failed then failure:raise() end
+  when second() then
+    test.assert(false, what .. " did not finish within " .. ms .. " ms")
+  end
+end
+
+local function fetch_once(host: string, port: integer, target: string): string
+  local connection = net.connect(host, port)
+  defer connection:close()
+  connection:write("GET " .. target .. " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+  local out = strings.writer()
+  do
+    for chunk in connection:read do out:write(chunk) end
+  catch
+  end
+  return out:drain()
+end
+
+local function status_of(text: string): string
+  return strings.sub(text, 10, 12)
+end
+
+local function body_of(text: string): string
+  local split? = strings.find(text, "\r\n\r\n")
+  if split == nil then return "" end
+  return strings.sub(text, split + 4)
+end
+
+local function header_of(text: string, name: string): string?
+  local lowered = strings.lower(name) .. ": "
+  for line in strings.split(text, "\r\n") do
+    if line == "" then break end
+    if strings.sub(strings.lower(line), 1, #lowered) == lowered then
+      return strings.sub(line, #lowered + 1)
+    end
+  end
+  return nil
+end
+
+local function spawn_fetch(host: string, port: integer, target: string): async.Task<|string, value|>
+  return async.run<|string, value|>(function (): string
+    return fetch_once(host, port, target)
+  end)
+end
+
+local function finished_text(task: async.Task<|string, value|>): string
+  case async.join(task)
+  when succeeded(text) then return text
+  else return "<task did not succeed>"
+  end
+end
+
+local function query_sid(meta: mk.RequestMeta): string?
+  return meta:query_opt("sid")
+end
+
+local function required_sid(meta: mk.RequestMeta): string?
+  local sid? = meta:query_opt("sid")
+  if sid == nil or sid == "" then raise mk.HttpError(400, "sid is required", "missing_sid") end
+  return sid
+end
+
+local function whoami(ctx: mk.Context)
+  ctx:send_string(ctx:worker_id() .. ":" .. (ctx:session_id() or "nil"))
+end
+
+function test_session_affinity_and_fallback(context: test.Context)
+  local app = mk.App()
+  local sessions = app:group_with("/s", mk.GroupOptions {
+    workers = mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid }),
+  })
+  sessions:get("/", whoami)
+  local server = app:listen_test()
+  context:cleanup(function () server:close() end)
+  context:run("same_session_same_worker", function (_: test.Context)
+    within(5000, "session requests", function ()
+      local a1 = body_of(fetch_once(server.host, server.port, "/s?sid=a"))
+      local b1 = body_of(fetch_once(server.host, server.port, "/s?sid=b"))
+      local a2 = body_of(fetch_once(server.host, server.port, "/s?sid=a"))
+      test.assert(a1 == a2 and a1 ~= b1, "affinity: " .. a1 .. " " .. b1 .. " " .. a2)
+      test.assert(strings.sub(a1, -2) == ":a" and strings.sub(b1, -2) == ":b", "session ids visible")
+      local info = sessions:session_worker("a") as mk.WorkerInfo
+      test.assert(a1 == info.id .. ":a" and info.alive, "session_worker reports the live worker")
+      test.assert(app:session_worker("b") ~= nil, "App:session_worker searches session dispatchers")
+      test.assert(#app:active_session_ids() == 2 and #sessions:active_session_ids() == 2,
+        "two active sessions")
+    end)
+  end)
+  context:run("nil_session_falls_back_to_root", function (_: test.Context)
+    within(5000, "fallback request", function ()
+      test.assert(body_of(fetch_once(server.host, server.port, "/s")) == "0:nil",
+        "nil selector runs on Config.workers (parent)")
+    end)
+  end)
+end
+
+function test_selector_errors_run_parent_pipeline(_: test.Context)
+  local app = mk.App(mk.Config { error_handler = function (ctx: mk.Context, err: mk.HttpError)
+    ctx:status(err.status):send_string("handled " .. err.message)
+  end })
+  app:use(function (ctx: mk.Context)
+    ctx:set("X-Global", "yes")
+    ctx:next()
+  end)
+  app:get("/relay", whoami):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = required_sid }))
+  local server = app:listen_test()
+  defer server:close()
+  within(5000, "rejected selector", function ()
+    local text = fetch_once(server.host, server.port, "/relay")
+    test.assert(status_of(text) == "400" and body_of(text) == "handled sid is required",
+      "selector error response: " .. text)
+    test.assert(header_of(text, "X-Global") == "yes", "global middleware ran around the failure")
+    test.assert(#app:active_session_ids() == 0, "no session worker was spawned")
+  end)
+end
+
+function test_max_sessions(_: test.Context)
+  local exited = 0
+  local app = mk.App()
+  app:get("/s", whoami):workers(mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid, max_sessions = 1,
+    on_exit = function (_: string, _worker: integer, _failed: boolean) exited = exited + 1 end,
+  }))
+  app:get("/retire", function (ctx: mk.Context)
+    ctx:retire_worker()
+    ctx:send_string("retired")
+  end):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid }))
+  local server = app:listen_test()
+  defer server:close()
+  within(5000, "max sessions", function ()
+    test.assert(status_of(fetch_once(server.host, server.port, "/s?sid=a")) == "200", "first session")
+    local full = fetch_once(server.host, server.port, "/s?sid=b")
+    test.assert(status_of(full) == "503", "second session rejected: " .. full)
+    test.assert(status_of(fetch_once(server.host, server.port, "/s?sid=a")) == "200",
+      "the existing session keeps working")
+  end)
+end
+
+function test_retire_worker_is_causal_and_reports_exit(_: test.Context)
+  local exits: {string} = {}
+  local app = mk.App()
+  local mode = mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid,
+    on_exit = function (session_id: string, worker_id: integer, failed: boolean)
+      local outcome = "ok"
+      if failed then outcome = "failed" end
+      exits[#exits + 1] = session_id .. ":" .. worker_id .. ":" .. outcome
+    end,
+  })
+  app:get("/who", whoami):workers(mode)
+  app:get("/retire", function (ctx: mk.Context)
+    ctx:retire_worker()
+    ctx:retire_worker()
+    ctx:send_string("retired " .. ctx:worker_id())
+  end):workers(mode)
+  local server = app:listen_test()
+  defer server:close()
+  within(5000, "retirement", function ()
+    local first = body_of(fetch_once(server.host, server.port, "/who?sid=r"))
+    local retired = body_of(fetch_once(server.host, server.port, "/retire?sid=r"))
+    local first_id = strings.sub(first, 1, (strings.find(first, ":") or 1) - 1)
+    test.assert(retired == "retired " .. first_id, "retire ran on the session worker")
+    test.assert(app:session_worker("r") == nil, "the session is detached before the response")
+    local next_one = body_of(fetch_once(server.host, server.port, "/who?sid=r"))
+    test.assert(next_one ~= first, "a fresh worker serves the session: " .. next_one)
+    while #exits == 0 do timer.yield() end
+    test.assert(exits[1] == "r:" .. first_id .. ":ok", "on_exit after join: " .. exits[1])
+  end)
+end
+
+function test_ephemeral_reroutes_unread_queued_exchanges(_: test.Context)
+  local gate_tx, gate_rx = thread.channel<|string|>(8)
+  local entered_tx, entered_rx = thread.channel<|integer|>(8)
+  local exits = 0
+  local app = mk.App()
+  app:get("/e", whoami):workers(mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid, ephemeral = true,
+    on_start = function (wctx: mk.WorkerContext)
+      entered_tx:send(wctx.id)
+      gate_rx:receive()
+    end,
+    on_exit = function (_: string, _worker: integer, _failed: boolean) exits = exits + 1 end,
+  }))
+  local server = app:listen_test()
+  defer server:close()
+  local clients: {async.Task<|string, value|>} = {}
+  for index = 1, 3 do clients[index] = spawn_fetch(server.host, server.port, "/e?sid=x") end
+  within(10000, "ephemeral rerouting", function ()
+    entered_rx:receive()
+    -- All three requests queue behind the first worker's blocked on_start.
+    while queued_for(app, "x") < 3 do timer.yield() end
+    for _ = 1, 3 do gate_tx:send("go") end
+    local seen: {string: boolean} = {}
+    for index = 1, 3 do
+      local text = finished_text(clients[index] as async.Task<|string, value|>)
+      test.assert(status_of(text) == "200", "client " .. index .. " served: " .. text)
+      seen[body_of(text)] = true
+    end
+    local distinct = 0
+    for _, _ in iteration.pairs(seen) do distinct = distinct + 1 end
+    test.assert(distinct == 3, "each queued exchange ran on its own ephemeral worker")
+    while exits < 3 do timer.yield() end
+  end)
+end
+
+function test_session_crash_discards_unread_exchanges(_: test.Context)
+  local gate_tx, gate_rx = thread.channel<|string|>(8)
+  local entered_tx, entered_rx = thread.channel<|integer|>(8)
+  local exits: {string} = {}
+  local app = mk.App()
+  app:get("/c", whoami):workers(mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid,
+    on_start = function (wctx: mk.WorkerContext)
+      entered_tx:send(wctx.id)
+      if gate_rx:receive() == "crash" then raise "session init crashed" end
+    end,
+    on_exit = function (_: string, worker_id: integer, failed: boolean)
+      local outcome = "ok"
+      if failed then outcome = "failed" end
+      exits[#exits + 1] = worker_id .. ":" .. outcome
+    end,
+  }))
+  local server = app:listen_test()
+  defer server:close()
+  local first = spawn_fetch(server.host, server.port, "/c?sid=k")
+  local second = spawn_fetch(server.host, server.port, "/c?sid=k")
+  within(10000, "crash with queued exchanges", function ()
+    local crashed_worker = entered_rx:receive()
+    while queued_for(app, "k") < 2 do timer.yield() end
+    gate_tx:send("crash")
+    test.assert(finished_text(first) == "", "first queued exchange disposed")
+    test.assert(finished_text(second) == "", "second queued exchange disposed")
+    while #exits == 0 do timer.yield() end
+    test.assert(exits[1] == crashed_worker .. ":failed", "on_exit reports the failure: " .. exits[1])
+    test.assert(not app:is_worker_alive(crashed_worker), "crashed worker is not alive")
+    gate_tx:send("ok")
+    local again = fetch_once(server.host, server.port, "/c?sid=k")
+    test.assert(status_of(again) == "200", "the session respawns on demand: " .. again)
+  end)
+end
+
+function test_websocket_takeover_abort_and_retire(context: test.Context)
+  local app = mk.App()
+  app:get("/ws", function (ctx: mk.Context)
+    local connection = ctx:upgrade_websocket()
+    while true do
+      local _kind?, data? = connection:read()
+      if data == nil then return end
+      if data == "abort" then
+        ctx:abort()
+        return
+      elseif data == "retire" then
+        ctx:retire_worker()
+        connection:write(websocket.TEXT, "retired " .. ctx:worker_id())
+      else
+        connection:write(websocket.TEXT, "echo " .. data .. " from " .. ctx:worker_id())
+      end
+    end
+  end):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid }))
+  app:get("/plain", function (ctx: mk.Context) ctx:send_string("plain") end)
+  local server = app:listen_test()
+  context:cleanup(function () server:close() end)
+  local url = "ws://127.0.0.1:" .. server.port .. "/ws?sid="
+  context:run("echo_and_retire", function (_: test.Context)
+    within(5000, "websocket session", function ()
+      local client = websocket.connect(url .. "w")
+      defer client:close()
+      client:write(websocket.TEXT, "hi")
+      local _kind?, echoed? = client:read()
+      local info = app:session_worker("w") as mk.WorkerInfo
+      test.assert(echoed == "echo hi from " .. info.id, "echo from the session worker")
+      client:write(websocket.TEXT, "retire")
+      local _kind2?, retired? = client:read()
+      test.assert(retired == "retired " .. info.id, "retire acknowledged inside the session")
+      test.assert(app:session_worker("w") == nil, "retirement detached the session immediately")
+    end)
+  end)
+  context:run("abort_tears_down_the_connection", function (_: test.Context)
+    within(5000, "websocket abort", function ()
+      local client = websocket.connect(url .. "a")
+      defer client:close()
+      client:write(websocket.TEXT, "abort")
+      local closed = false
+      do
+        local _kind?, data? = client:read()
+        closed = data == nil
+      catch
+        closed = true
+      end
+      test.assert(closed, "the aborted connection ends")
+      test.assert(body_of(fetch_once(server.host, server.port, "/plain")) == "plain", "server keeps serving")
+    end)
+  end)
+end
+
+function test_on_exit_cannot_deadlock_shutdown(_: test.Context)
+  local guarded = false
+  local app_box: {mk.App} = {}
+  local app = mk.App()
+  app_box[1] = app
+  app:get("/s", whoami):workers(mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid,
+    on_exit = function (_: string, _worker: integer, _failed: boolean)
+      do (app_box[1] as mk.App):shutdown() catch guarded = true end
+    end,
+  }))
+  local server = app:listen_test()
+  within(5000, "session request", function ()
+    test.assert(status_of(fetch_once(server.host, server.port, "/s?sid=z")) == "200", "session served")
+  end)
+  within(5000, "shutdown with live sessions", function () server:close() end)
+  test.assert(guarded, "App:shutdown() inside on_exit raised instead of deadlocking")
+  test.assert(#app:active_session_ids() == 0, "sessions retired at shutdown")
+end
+
+function test_app_test_session_routes(context: test.Context)
+  local app = mk.App()
+  app:use(function (ctx: mk.Context)
+    ctx:set("X-Global", "yes")
+    ctx:next()
+  end)
+  app:get("/relay", whoami):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = required_sid }))
+  app:get("/optional", whoami):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid }))
+  context:run("selector_error_runs_in_memory", function (_: test.Context)
+    local response = app:test(mk.TestRequest("GET", "/relay"))
+    test.assert(response.status == 400 and response.body == "sid is required" and
+      response:header("X-Global") == "yes", "parent pre-dispatch pipeline in memory")
+  end)
+  context:run("nil_session_falls_back_to_parent_root", function (_: test.Context)
+    test.assert(app:test(mk.TestRequest("GET", "/optional")).body == "0:nil", "fallback runs in memory")
+  end)
+  context:run("session_execution_is_rejected", function (_: test.Context)
+    local rejected = false
+    do app:test(mk.TestRequest("GET", "/relay?sid=a")) catch rejected = true end
+    test.assert(rejected, "a selected session worker cannot run in memory")
+  end)
+end
+
+-- Sessions keyed by the client's port, read from the pre-dispatch metadata.
+local function peer_sid(meta: mk.RequestMeta): string?
+  local peer? = meta:peer_address()
+  if peer == nil then return nil end
+  return "port-" .. peer.port
+end
+
+local function report_peer(ctx: mk.Context)
+  local peer? = ctx:peer_address()
+  local text = "none"
+  if peer ~= nil then text = peer.ip .. ":" .. peer.port end
+  ctx:send_string((ctx:session_id() or "nil") .. " " .. text)
+end
+
+function test_peer_address_on_session_workers(context: test.Context)
+  local app = mk.App()
+  app:get("/who", report_peer):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = peer_sid }))
+  context:run("live_selector_and_worker_see_the_peer", function (_: test.Context)
+    local server = app:listen_test()
+    defer server:close()
+    within(5000, "session peer request", function ()
+      local connection = net.connect(server.host, server.port)
+      defer connection:close()
+      local port = connection:local_address().port
+      connection:write("GET /who HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+      local out = strings.writer()
+      for chunk in connection:read do out:write(chunk) end
+      local text = out:drain()
+      test.assert(status_of(text) == "200" and body_of(text) == "port-" .. port .. " 127.0.0.1:" .. port,
+        "session selected by and reporting the peer: " .. text)
+    end)
+  end)
+  context:run("in_memory_requests_have_no_peer", function (_: test.Context)
+    -- No peer: the selector returns nil and the parent root serves it.
+    test.assert(app:test(mk.TestRequest("GET", "/who")).body == "nil none", "App:test has no peer")
+  end)
+end
+
+function test_pooled_client_survives_retirement(context: test.Context)
+  local app = mk.App()
+  local persistent = mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid })
+  app:get("/retire", function (ctx: mk.Context)
+    ctx:retire_worker()
+    ctx:send_string("retired " .. ctx:worker_id())
+  end):workers(persistent)
+  app:get("/once", whoami):workers(mk.WorkerMode.session(mk.SessionOptions {
+    session_id = query_sid, ephemeral = true,
+  }))
+  local server = app:listen_test()
+  context:cleanup(function () server:close() end)
+  -- TestServer:request reuses pooled keep-alive connections, so a retiring
+  -- or ephemeral worker must announce Connection: close.
+  context:run("retire_worker", function (_: test.Context)
+    within(5000, "retiring requests", function ()
+      local first = server:request("GET", "/retire?sid=p")
+      test.assert(first.status == 200 and first:header("Connection") == "close",
+        "retiring response closes its connection")
+      local second = server:request("GET", "/retire?sid=p")
+      test.assert(second.status == 200 and second.body ~= first.body,
+        "the next request reaches a fresh worker: " .. first.body .. " / " .. second.body)
+    end)
+  end)
+  context:run("ephemeral", function (_: test.Context)
+    within(5000, "ephemeral requests", function ()
+      local first = server:request("GET", "/once?sid=e")
+      test.assert(first.status == 200 and first:header("Connection") == "close",
+        "ephemeral response closes its connection")
+      local second = server:request("GET", "/once?sid=e")
+      test.assert(second.status == 200 and second.body ~= first.body,
+        "each ephemeral request has its own worker")
+    end)
+  end)
+end
+
+function test_concurrent_retire_worker_is_causal(_: test.Context)
+  local entered_tx, entered_rx = thread.channel<|boolean|>(4)
+  local gate_tx, gate_rx = thread.channel<|boolean|>(4)
+  local app = mk.App()
+  app:get("/both", function (ctx: mk.Context)
+    entered_tx:send(true)
+    gate_rx:receive()
+    ctx:retire_worker()
+    ctx:send_string("retired")
+  end):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid }))
+  local server = app:listen_test()
+  defer server:close()
+  local left = spawn_fetch(server.host, server.port, "/both?sid=c")
+  local right = spawn_fetch(server.host, server.port, "/both?sid=c")
+  within(5000, "concurrent retirement", function ()
+    entered_rx:receive()
+    entered_rx:receive()
+    gate_tx:send(true)
+    gate_tx:send(true)
+    -- Whichever handler retires second also waits for the shared
+    -- acknowledgment, so the session is gone once either response arrives.
+    test.assert(body_of(finished_text(left)) == "retired", "first concurrent retirement")
+    test.assert(app:session_worker("c") == nil, "detached before the first response")
+    test.assert(body_of(finished_text(right)) == "retired", "second concurrent retirement")
+    test.assert(app:session_worker("c") == nil, "still detached")
+  end)
+end

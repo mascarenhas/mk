@@ -1,0 +1,270 @@
+--- API key authentication (GoFiber keyauth) with transferable extractors.
+-- @module mk.middleware.keyauth
+
+local mk = import "mk"
+local protobuf = import "protobuf"
+local strings = import "string"
+local transfer = import "transfer"
+
+-- Context local holding the validated key for token_from_context.
+local const TOKEN_LOCAL = "keyauth.token"
+
+--- Cross-thread wrapper for a custom key extractor closure.
+record CustomExtractor
+  local const fn: function (mk.Context): (string?)
+end
+
+function CustomExtractor.new(fn: function (mk.Context): (string?)): CustomExtractor
+  return { fn = fn }
+end
+
+function CustomExtractor:to_transfer_payload(): string
+  return protobuf.serialize(transfer.TransferValue.from_value(self.fn))
+end
+
+function CustomExtractor.from_transfer_payload(payload: string): CustomExtractor
+  local policy: transfer.TransferValue =
+    protobuf.deserialize_nominal(payload, "titan.transfer.TransferValue", true)
+  local restored: function (mk.Context): (string?) = policy:to_value()
+  return CustomExtractor(restored)
+end
+
+--- Where the key comes from.
+-- @field auth_header `Authorization: <scheme> <key>` (scheme matched case-insensitively).
+-- @field header First value of a request header.
+-- @field single_header A header present exactly once (duplicates count as missing).
+-- @field query First value of a query parameter.
+-- @field cookie A request cookie.
+-- @field chain The first extractor yielding a key.
+-- @field custom A transferable custom extractor.
+union Extractor
+  auth_header(scheme: string)
+  header(name: string)
+  single_header(name: string)
+  query(name: string)
+  cookie(name: string)
+  chain(items: {Extractor})
+  custom(extractor: CustomExtractor)
+end
+
+--- keyauth options; `validator` is required.
+-- @field error_code RFC 6750 error ("", "invalid_request", "invalid_token", "insufficient_scope").
+-- @field error_handler Builds the 401 response; by default the 401 HttpError propagates
+-- with a WWW-Authenticate challenge already set.
+record Config
+  const next: (function (mk.Context): boolean)?
+  const extractor: Extractor?
+  const validator: function (mk.Context, string): boolean
+  const realm: string?
+  const challenge: string?
+  const error_code: string?
+  const error_description: string?
+  const error_uri: string?
+  const scope: string?
+  const success_handler: mk.Handler?
+  const error_handler: mk.ErrorHandler?
+end
+
+--- Compare two secrets in time independent of where they differ.
+function constant_time_equal(left: string, right: string): boolean
+  local different = #left ~ #right
+  local longest = #left
+  if #right > longest then longest = #right end
+  for index = 1, longest do
+    local a = strings.byte(left, index) or 0
+    local b = strings.byte(right, index) or 0
+    different = different | (a ~ b)
+  end
+  return different == 0
+end
+
+--- The key validated by keyauth for this request, or "".
+function token_from_context(ctx: mk.Context): string
+  local stored = ctx:get_local(TOKEN_LOCAL)
+  if stored is string then return stored as string end
+  return ""
+end
+
+local function trim(text: string): string
+  local first = 1
+  local last = #text
+  while first <= last and (strings.byte(text, first) == 32 or strings.byte(text, first) == 9) do
+    first = first + 1
+  end
+  while last >= first and (strings.byte(text, last) == 32 or strings.byte(text, last) == 9) do
+    last = last - 1
+  end
+  return strings.sub(text, first, last)
+end
+
+local function nonempty(text: string?): string?
+  if text == nil or text == "" then return nil end
+  return text
+end
+
+-- Whether `header` starts with `scheme` (ASCII case-insensitive) and one
+-- space, compared byte by byte without allocating.
+local function has_scheme_prefix(header: string, scheme: string): boolean
+  local length = #scheme
+  if #header <= length + 1 or strings.byte(header, length + 1) ~= 32 then return false end
+  for index = 1, length do
+    local left = strings.byte(header, index)
+    local right = strings.byte(scheme, index)
+    if left >= 65 and left <= 90 then left = left + 32 end
+    if right >= 65 and right <= 90 then right = right + 32 end
+    if left ~= right then return false end
+  end
+  return true
+end
+
+local function extract(extractor: Extractor, ctx: mk.Context): string?
+  case extractor
+  when auth_header(scheme) then
+    local authorization? = ctx:header_opt("Authorization")
+    if authorization == nil or not has_scheme_prefix(authorization, scheme) then return nil end
+    return nonempty(trim(strings.sub(authorization, #scheme + 2)))
+  when header(name) then
+    return nonempty(ctx:header_opt(name))
+  when single_header(name) then
+    local values = ctx:get_headers(name)
+    if #values ~= 1 then return nil end
+    return nonempty(values[1])
+  when query(name) then
+    return nonempty(ctx:query_opt(name))
+  when cookie(name) then
+    return nonempty(ctx:cookie_opt(name))
+  when chain(items) then
+    for index = 1, #items do
+      local found? = extract(items[index], ctx)
+      if found ~= nil then return found end
+    end
+    return nil
+  when custom(wrapper) then
+    return nonempty(wrapper.fn(ctx))
+  end
+  return nil
+end
+
+local function quoted(text: string): string
+  local escaped = strings.gsub(text, "[\"\\\\]", function (piece: string): string
+    return "\\" .. piece
+  end, nil)
+  return "\"" .. escaped .. "\""
+end
+
+local const ERROR_CODES: {string: boolean} = {
+  [""] = true, ["invalid_request"] = true, ["invalid_token"] = true,
+  ["insufficient_scope"] = true,
+}
+
+local const TOKEN_PATTERN = "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+local const FORBIDDEN_FIELD_BYTE = "[\0-\8\10-\31\127]"
+
+local function validate_extractor(extractor: Extractor)
+  case extractor
+  when auth_header(scheme) then
+    if strings.match(scheme, TOKEN_PATTERN) == nil then
+      raise "keyauth: auth_header scheme must be an HTTP token"
+    end
+  when header(name) then
+    if strings.match(name, TOKEN_PATTERN) == nil then raise "keyauth: header name must be an HTTP token" end
+  when single_header(name) then
+    if strings.match(name, TOKEN_PATTERN) == nil then raise "keyauth: header name must be an HTTP token" end
+  when query(name) then
+    if name == "" then raise "keyauth: query name must not be empty" end
+  when cookie(name) then
+    if name == "" then raise "keyauth: cookie name must not be empty" end
+  when chain(items) then
+    if #items == 0 then raise "keyauth: chain needs at least one extractor" end
+    for index = 1, #items do validate_extractor(items[index]) end
+  when custom() then
+  end
+end
+
+-- An optional challenge component: nil when absent or empty; raises when it
+-- cannot appear in a header value.
+local function challenge_text(subject: string, text: string?): string?
+  if text == nil or text == "" then return nil end
+  if strings.match(text, FORBIDDEN_FIELD_BYTE) ~= nil then
+    raise "keyauth: " .. subject .. " contains a forbidden byte"
+  end
+  return text
+end
+
+-- The first Authorization scheme an extractor (or chain) reads, if any.
+local function auth_scheme(extractor: Extractor): string?
+  case extractor
+  when auth_header(scheme) then return scheme
+  when chain(items) then
+    for index = 1, #items do
+      local found? = auth_scheme(items[index])
+      if found ~= nil then return found end
+    end
+    return nil
+  else
+    return nil
+  end
+end
+
+--- Build the keyauth middleware. On a missing or rejected key it sets
+-- WWW-Authenticate and either calls `error_handler` or raises a 401
+-- HttpError; on success it stores the key and continues the chain (or calls
+-- `success_handler`). Configuration is validated eagerly and captured as
+-- transferable snapshots so the handler can run on worker threads.
+function new(config: Config): mk.Handler
+  local skip? = config.next
+  local extractor = config.extractor or Extractor.auth_header("Bearer")
+  validate_extractor(extractor)
+  local validator = config.validator
+  local error_code = config.error_code or ""
+  if not ERROR_CODES[error_code] then
+    raise "keyauth: error_code must be empty, invalid_request, invalid_token, or insufficient_scope"
+  end
+  local realm = challenge_text("realm", config.realm) or "Restricted"
+  local explicit? = challenge_text("challenge", config.challenge)
+  local description? = challenge_text("error_description", config.error_description)
+  local uri? = challenge_text("error_uri", config.error_uri)
+  local scope? = challenge_text("scope", config.scope)
+  local success? = config.success_handler
+  local failure_handler? = config.error_handler
+  -- RFC 6750 challenges apply to an Authorization scheme (also inside a
+  -- chain); other extractors use the configured (or ApiKey) challenge.
+  local challenge = "ApiKey realm=" .. quoted(realm)
+  local scheme? = auth_scheme(extractor)
+  if explicit ~= nil then
+    challenge = explicit
+  elseif scheme ~= nil then
+    challenge = scheme .. " realm=" .. quoted(realm)
+    if error_code ~= "" then challenge = challenge .. ", error=" .. quoted(error_code) end
+    if description ~= nil then challenge = challenge .. ", error_description=" .. quoted(description) end
+    if uri ~= nil then challenge = challenge .. ", error_uri=" .. quoted(uri) end
+    if scope ~= nil then challenge = challenge .. ", scope=" .. quoted(scope) end
+  end
+  return function (ctx: mk.Context)
+    if skip ~= nil and skip(ctx) then
+      ctx:next()
+      return
+    end
+    local key? = extract(extractor, ctx)
+    local rejection: mk.HttpError? = nil
+    if key == nil then
+      rejection = mk.HttpError(401, "missing or malformed API key", "missing_api_key")
+    elseif not validator(ctx, key) then
+      rejection = mk.HttpError(401, "invalid API key", "invalid_api_key")
+    end
+    if rejection ~= nil then
+      ctx:set("WWW-Authenticate", challenge)
+      if failure_handler ~= nil then
+        failure_handler(ctx, rejection)
+        return
+      end
+      raise rejection
+    end
+    ctx:set_local(TOKEN_LOCAL, key)
+    if success ~= nil then
+      success(ctx)
+      return
+    end
+    ctx:next()
+  end
+end

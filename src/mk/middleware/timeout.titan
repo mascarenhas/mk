@@ -1,0 +1,55 @@
+--- Request deadlines built on `Context:run_with_timeout`.
+-- Ownership revocation, abort-before-join of blocked transports, and
+-- cancellation propagation live in mk's Context; this module only selects
+-- what runs under the deadline.
+-- @module mk.middleware.timeout
+
+local mk = import "mk"
+
+--- Timeout options.
+-- @field next Skip the deadline when it returns true.
+-- @field on_timeout Builds the response on expiry (default: HttpError 503 "timeout").
+record Config
+  const next: (function (mk.Context): boolean)?
+  const on_timeout: mk.Handler?
+end
+
+--- Wrap `handler` so it runs under a `timeout_ms` deadline.
+function new(handler: mk.Handler, timeout_ms: integer, config: Config?): mk.Handler
+  if timeout_ms < 0 then raise "timeout: timeout_ms must be non-negative" end
+  local skip: (function (mk.Context): boolean)? = nil
+  local on_timeout: mk.Handler? = nil
+  if config ~= nil then
+    skip = config.next
+    on_timeout = config.on_timeout
+  end
+  return function (ctx: mk.Context)
+    if skip ~= nil and skip(ctx) then
+      handler(ctx)
+      return
+    end
+    ctx:run_with_timeout(timeout_ms, handler, on_timeout)
+  end
+end
+
+local function continue_chain(ctx: mk.Context)
+  ctx:next()
+end
+
+--- Middleware running the rest of the chain under a `timeout_ms` deadline.
+function middleware(timeout_ms: integer, config: Config?): mk.Handler
+  if timeout_ms < 0 then raise "timeout: timeout_ms must be non-negative" end
+  local skip: (function (mk.Context): boolean)? = nil
+  local on_timeout: mk.Handler? = nil
+  if config ~= nil then
+    skip = config.next
+    on_timeout = config.on_timeout
+  end
+  return function (ctx: mk.Context)
+    if skip ~= nil and skip(ctx) then
+      ctx:next()
+      return
+    end
+    ctx:run_with_timeout(timeout_ms, continue_chain, on_timeout)
+  end
+end

@@ -1,0 +1,1776 @@
+-- Per-request Context, read-only RequestMeta, cookies, body I/O, buffered
+-- responses, streaming, timeouts, and the shared routing core.
+
+-- Immutable per-state routing and policy core shared by every Context.
+-- The parent App owns one; each worker thread rebuilds its own from its
+-- WorkerBootstrap.
+local record Core
+  app_name: string
+  server_header: string?
+  case_sensitive: boolean
+  strict_routing: boolean
+  unescape_path: boolean
+  auto_head: boolean
+  trust_forwarded: boolean
+  body_limit: integer
+  json_max_depth: integer
+  idle_timeout_ms: integer
+  error_handler: ErrorHandler
+  logger: log.Logger?
+  entries: {Entry}
+  routes: {Entry}
+  closing: boolean
+  worker_id: integer
+  session_id: string?
+  worker: WorkerState?
+  root_dispatcher_id: integer
+end
+
+-- One registered middleware (prefix matcher) or endpoint route (exact matcher)
+-- in declaration order.
+local record Entry
+  is_route: boolean
+  methods: {string}
+  pattern: string
+  matcher: router.CompiledPattern
+  handlers: {Handler}
+  name: string
+  group_prefix: string
+  mount_path: string
+  mode: WorkerMode?
+  dispatcher_id: integer
+  route_id: integer
+end
+
+local function Entry:accepts(method: string, head_fallback: boolean): boolean
+  local methods = self.methods
+  for index = 1, #methods do
+    local candidate = methods[index]
+    if candidate == method or candidate == "*" or
+        (head_fallback and candidate == "GET") then
+      return true
+    end
+  end
+  return false
+end
+
+local function Entry:info(): RouteInfo
+  local method = self.methods[1] or "USE"
+  if method == "*" then method = "ALL" end
+  return RouteInfo(method, self.pattern, self.name, self.group_prefix, self.matcher.param_names)
+end
+
+-- First matching endpoint route for (method, raw path), its match, and
+-- whether HEAD may fall back to GET routes.
+local function Core:classify(method: string, path: string): (Entry?, router.MatchResult?, boolean)
+  local routes = self.routes
+  local head_fallback = false
+  if method == "HEAD" and self.auto_head then
+    head_fallback = true
+    for index = 1, #routes do
+      local route = routes[index]
+      if route:accepts("HEAD", false) and route.matcher:match(path) ~= nil then
+        head_fallback = false
+        break
+      end
+    end
+  end
+  for index = 1, #routes do
+    local route = routes[index]
+    if route:accepts(method, head_fallback) then
+      local found? = route.matcher:match(path)
+      if found ~= nil then return route, found, head_fallback end
+    end
+  end
+  return nil, nil, head_fallback
+end
+
+-- Concrete methods of routes matching `path`, in first-occurrence order.
+local function Core:allowed_methods(path: string): {string}
+  local result: {string} = {}
+  local seen: {string: boolean} = {}
+  local routes = self.routes
+  for index = 1, #routes do
+    local route = routes[index]
+    if route.matcher:match(path) ~= nil then
+      for method_index = 1, #route.methods do
+        local method = route.methods[method_index]
+        if method ~= "*" and not seen[method] then
+          seen[method] = true
+          result[#result + 1] = method
+          if method == "GET" and self.auto_head and not seen["HEAD"] then
+            seen["HEAD"] = true
+            result[#result + 1] = "HEAD"
+          end
+        end
+      end
+    end
+  end
+  return result
+end
+
+local function trim_ows(text: string): string
+  local first = 1
+  local last = #text
+  while first <= last do
+    local byte = strings.byte(text, first)
+    if byte ~= 32 and byte ~= 9 then break end
+    first = first + 1
+  end
+  while last >= first do
+    local byte = strings.byte(text, last)
+    if byte ~= 32 and byte ~= 9 then break end
+    last = last - 1
+  end
+  return strings.sub(text, first, last)
+end
+
+local function headers_have_token(headers: http.Headers, name: string, token: string): boolean
+  local found = headers:values(name)
+  for index = 1, #found do
+    for item in strings.split(found[index], ",") do
+      if ascii_lower(trim_ows(item)) == token then return true end
+    end
+  end
+  return false
+end
+
+local function parse_cookie_header(headers: http.Headers): {string: string}
+  local result: {string: string} = {}
+  local lines = headers:values("Cookie")
+  for index = 1, #lines do
+    for pair in strings.split(lines[index], ";") do
+      local item = trim_ows(pair)
+      local eq? = strings.find(item, "=")
+      if eq and eq > 1 then
+        local name = strings.sub(item, 1, eq - 1)
+        local contents = strings.sub(item, eq + 1)
+        if #contents >= 2 and strings.sub(contents, 1, 1) == "\"" and
+            strings.sub(contents, -1) == "\"" then
+          contents = strings.sub(contents, 2, #contents - 1)
+        end
+        if result[name] == nil then result[name] = contents end
+      end
+    end
+  end
+  return result
+end
+
+--- Read-only request metadata visible to session selectors and the Context.
+-- @field method Request method.
+-- @field path Request path (percent-decoded when `unescape_path` is enabled).
+-- @field original_url Received request target including the query.
+-- @field scheme "http" or "https" (or a trusted X-Forwarded-Proto).
+-- @field host Host header (or a trusted X-Forwarded-Host).
+record RequestMeta
+  const method: string
+  const path: string
+  const original_url: string
+  const scheme: string
+  const host: string
+  local params_map: {string: string}
+  local route_pattern: string
+  local target: router.Target
+  local headers: http.Headers
+  local cookie_map: {string: string}?
+  local peer: net.Address?
+end
+
+--- Socket address of the client connection, captured while the exchange
+-- was live; nil in `App:test` or when the peer disconnected first.
+function RequestMeta:peer_address(): net.Address?
+  return self.peer
+end
+
+--- Matched route parameter, or `default_val` (or "") when absent.
+function RequestMeta:param(name: string, default_val: string?): string
+  return self.params_map[name] or default_val or ""
+end
+
+--- Matched route parameter, or nil when absent.
+function RequestMeta:param_opt(name: string): string?
+  return self.params_map[name]
+end
+
+--- First decoded query value, or `default_val` (or "") when absent.
+function RequestMeta:query(name: string, default_val: string?): string
+  return self.target.query[name] or default_val or ""
+end
+
+--- First decoded query value, or nil when absent.
+function RequestMeta:query_opt(name: string): string?
+  return self.target.query[name]
+end
+
+--- Every decoded value of a repeated query field, in order.
+function RequestMeta:query_values(name: string): {string}
+  local found? = self.target.query_values[name]
+  local result: {string} = {}
+  if found then
+    for index = 1, #found do result[index] = found[index] end
+  end
+  return result
+end
+
+--- First request header value, or `default_val` (or "") when absent.
+function RequestMeta:get(name: string, default_val: string?): string
+  return self.headers:get(name) or default_val or ""
+end
+
+--- Every value of a request header, in order.
+function RequestMeta:get_headers(name: string): {string}
+  return self.headers:values(name)
+end
+
+local function RequestMeta:cookies_view(): {string: string}
+  local cached? = self.cookie_map
+  if cached then return cached end
+  local parsed = parse_cookie_header(self.headers)
+  self.cookie_map = parsed
+  return parsed
+end
+
+--- Request cookie value, or `default_val` (or "") when absent.
+function RequestMeta:cookie(name: string, default_val: string?): string
+  return self:cookies_view()[name] or default_val or ""
+end
+
+--- A response cookie for `Context:set_cookie`.
+record Cookie
+  const name: string
+  const value: string
+  const path: string?
+  const domain: string?
+  const max_age: integer?
+  const expires_unix: integer?
+  const secure: boolean?
+  const http_only: boolean?
+  const same_site: string?
+end
+
+local const COOKIE_NAME_PATTERN = "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+local const COOKIE_VALUE_FORBIDDEN = "[\0-\32\34\44\59\127\\\\]"
+-- Attribute values must not end the attribute (`;`) or carry controls.
+local const COOKIE_ATTRIBUTE_FORBIDDEN = "[\0-\31\59\127]"
+
+local function http_date(unix: integer): string
+  local formatted: string = os.date("!%a, %d %b %Y %H:%M:%S GMT", unix)
+  return formatted
+end
+
+local function cookie_attribute(subject: string, text: string): string
+  if strings.match(text, COOKIE_ATTRIBUTE_FORBIDDEN) then
+    raise "mk: invalid cookie " .. subject
+  end
+  return text
+end
+
+local function Cookie:render(): string
+  if not strings.match(self.name, COOKIE_NAME_PATTERN) then
+    raise "mk: invalid cookie name"
+  end
+  if strings.match(self.value, COOKIE_VALUE_FORBIDDEN) then
+    raise "mk: invalid cookie value"
+  end
+  local out = strings.writer()
+  out:write(self.name .. "=" .. self.value)
+  out:write("; Path=" .. cookie_attribute("path", self.path or "/"))
+  local domain? = self.domain
+  if domain ~= nil then out:write("; Domain=" .. cookie_attribute("domain", domain)) end
+  local max_age? = self.max_age
+  if max_age ~= nil then
+    if max_age < 0 then
+      out:write("; Max-Age=0")
+    else
+      out:write("; Max-Age=" .. max_age)
+    end
+  end
+  local expires? = self.expires_unix
+  if expires ~= nil then out:write("; Expires=" .. http_date(expires)) end
+  if self.secure then out:write("; Secure") end
+  if self.http_only then out:write("; HttpOnly") end
+  local same_site? = self.same_site
+  if same_site ~= nil then
+    if same_site ~= "Lax" and same_site ~= "Strict" and same_site ~= "None" then
+      raise "mk: cookie same_site must be Lax, Strict, or None"
+    end
+    out:write("; SameSite=" .. same_site)
+  end
+  return out:drain()
+end
+
+-- In-memory response capture used by App:test.
+local record TestCapture
+  status: integer
+  headers: http.Headers
+  body: strings.StringWriter
+  committed: boolean
+  closed: boolean
+end
+
+--- The per-request handler context.
+record Context
+  local core: Core
+  local raw_request: http.Request?
+  local raw_response: http.Response?
+  local test_body: string?
+  local capture: TestCapture?
+  local meta: RequestMeta
+  local raw_path: string
+  local target_error_text: string?
+  local params_map: {string: string}
+  local locals_map: {string: value}
+  local entry_index: integer
+  local handler_index: integer
+  local current_entry: Entry?
+  local endpoint_entry: Entry?
+  local dispatcher_id: integer
+  local head_fallback: boolean
+  local status_value: integer
+  local response_headers: http.Headers
+  local response_body: string
+  local committed_flag: boolean
+  local finished: boolean
+  local aborted_flag: boolean
+  local upgraded_ws: websocket.Connection?
+  local before_commit_hooks: {function (Context): ()}
+  local complete_hooks: {function (Context): ()}
+  local last_err: HttpError?
+  local start_ns: integer
+  local deadline: integer?
+  local owner_task: async.Task<|value, value|>?
+  local in_socket_io: boolean
+  local close_after_response: boolean
+  local body_cache: string?
+  local body_read: integer
+  local body_done: boolean
+  local body_overflow: boolean
+  local terminal_error: HttpError?
+  local upgrade_offer: boolean
+end
+
+-- Build request metadata, tolerating malformed targets (exposed through
+-- `Context:target_error()`).
+local function Core:meta(method: string, target: string, headers: http.Headers,
+                         scheme: string): (RequestMeta, string, string?)
+  local parsed: router.Target? = nil
+  local failure: string? = nil
+  do
+    parsed = router.parse_target(target, router.MAX_TARGET_BYTES, router.MAX_QUERY_FIELDS)
+  catch
+    if error is router.RouteError then
+      local route_error = error as router.RouteError
+      failure = route_error.message
+    elseif error is string then
+      failure = error as string
+    else
+      failure = "malformed request target"
+    end
+  end
+  if parsed == nil then
+    local question? = strings.find(target, "?")
+    local bare = target
+    if question then bare = strings.sub(target, 1, question - 1) end
+    local segments: const {string} = {}
+    parsed = router.Target(bare, "", segments, {}, {})
+  end
+  local target_value = parsed as router.Target
+  local raw_path = target_value.path
+  local path = raw_path
+  if self.unescape_path and failure == nil then
+    do path = router.percent_decode(raw_path, false) catch path = raw_path end
+  end
+  local actual_scheme = scheme
+  local host = headers:get("Host") or ""
+  if self.trust_forwarded then
+    local proto? = headers:get("X-Forwarded-Proto")
+    if proto ~= nil then
+      local first = ascii_lower(trim_ows(proto))
+      local comma? = strings.find(first, ",")
+      if comma then first = trim_ows(strings.sub(first, 1, comma - 1)) end
+      if first == "http" or first == "https" then actual_scheme = first end
+    end
+    local forwarded_host? = headers:get("X-Forwarded-Host")
+    if forwarded_host ~= nil then
+      local first = trim_ows(forwarded_host)
+      local comma? = strings.find(first, ",")
+      if comma then first = trim_ows(strings.sub(first, 1, comma - 1)) end
+      if first ~= "" then host = first end
+    end
+  end
+  local meta = RequestMeta {
+    method = method, path = path, original_url = target, scheme = actual_scheme,
+    host = host, params_map = {}, route_pattern = "", target = target_value, headers = headers,
+    cookie_map = nil, peer = nil,
+  }
+  return meta, raw_path, failure
+end
+
+local function Context.create(core: Core, meta: RequestMeta, raw_path: string,
+                              target_error: string?, dispatcher_id: integer,
+                              head_fallback: boolean): Context
+  return {
+    core = core, raw_request = nil, raw_response = nil, test_body = nil,
+    capture = nil, meta = meta, raw_path = raw_path,
+    target_error_text = target_error, params_map = meta.params_map,
+    locals_map = {}, entry_index = 0, handler_index = 0, current_entry = nil,
+    endpoint_entry = nil, dispatcher_id = dispatcher_id,
+    head_fallback = head_fallback, status_value = 200,
+    response_headers = http.headers(nil), response_body = "",
+    committed_flag = false, finished = false, aborted_flag = false,
+    upgraded_ws = nil, before_commit_hooks = {}, complete_hooks = {},
+    last_err = nil, start_ns = uv.hrtime(), deadline = nil,
+    owner_task = nil, in_socket_io = false, close_after_response = false,
+    body_cache = nil, body_read = 0, body_done = false, body_overflow = false,
+    terminal_error = nil,
+    -- llhttp also treats CONNECT as an upgrade: its body is never readable.
+    upgrade_offer = meta.headers:get("Upgrade") ~= nil or meta.method == "CONNECT" or
+      (meta.headers:get("Connection") ~= nil and
+       headers_have_token(meta.headers, "Connection", "upgrade")),
+  }
+end
+
+local function Context:own()
+  if self.owner_task ~= async.running() then
+    async.checkpoint()
+    raise "context ownership revoked"
+  end
+end
+
+------------------------------------------------------------------------------
+-- Navigation and lifecycle
+
+local function Context:entry_match(entry: Entry): router.MatchResult?
+  if entry.is_route then
+    if entry.dispatcher_id ~= self.dispatcher_id then return nil end
+    if not entry:accepts(self.meta.method, self.head_fallback) then return nil end
+  end
+  return entry.matcher:match(self.raw_path)
+end
+
+--- Run the next matching handler; raises 404/405 when the chain is exhausted.
+function Context:next()
+  self:own()
+  local current? = self.current_entry
+  if current ~= nil and self.handler_index < #current.handlers then
+    self.handler_index = self.handler_index + 1
+    local handler = current.handlers[self.handler_index]
+    handler(self)
+    return
+  end
+  local entries = self.core.entries
+  local index = self.entry_index + 1
+  while index <= #entries do
+    local entry = entries[index]
+    local found? = self:entry_match(entry)
+    if found ~= nil then
+      self.entry_index = index
+      self.current_entry = entry
+      self.handler_index = 1
+      self.params_map = found.params
+      if entry.is_route then self.endpoint_entry = entry end
+      local handler = entry.handlers[1]
+      handler(self)
+      return
+    end
+    index = index + 1
+  end
+  self.entry_index = #entries + 1
+  self.current_entry = nil
+  local terminal? = self.terminal_error
+  if terminal ~= nil then raise terminal end
+  if self.endpoint_entry == nil then
+    local allowed = self.core:allowed_methods(self.raw_path)
+    if #allowed > 0 then
+      self.response_headers:set("Allow", router.allow_header(allowed))
+      raise HttpError(405, "Method Not Allowed", nil, nil)
+    end
+  end
+  raise HttpError(404, "Cannot " .. self.meta.method .. " " .. self.meta.path, nil, nil)
+end
+
+--- Restart matching from the first entry for the current request.
+function Context:restart_routing()
+  self:own()
+  local route?, found?, head_fallback = self.core:classify(self.meta.method, self.raw_path)
+  if route ~= nil and route.dispatcher_id ~= self.dispatcher_id then
+    raise HttpError(500, "cannot restart routing across worker dispatchers", nil, nil)
+  end
+  local params: {string: string} = {}
+  if found ~= nil then params = found.params end
+  self.params_map = params
+  self.meta.route_pattern = route ~= nil and route.pattern or ""
+  self.head_fallback = head_fallback
+  self.entry_index = 0
+  self.current_entry = nil
+  self.handler_index = 0
+  self.endpoint_entry = nil
+  self:next()
+end
+
+function Context:method(): string return self.meta.method end
+function Context:path(): string return self.meta.path end
+function Context:original_url(): string return self.meta.original_url end
+function Context:scheme(): string return self.meta.scheme end
+function Context:secure(): boolean return self.meta.scheme == "https" end
+function Context:host(): string return self.meta.host end
+function Context:protocol(): string return "HTTP/1.1" end
+
+--- "scheme://host" of the request.
+function Context:base_url(): string
+  return self.meta.scheme .. "://" .. self.meta.host
+end
+
+--- Absolute request URL including the query.
+function Context:full_url(): string
+  return self:base_url() .. self.meta.original_url
+end
+
+--- Host without its port (IPv6 literals keep their brackets).
+function Context:hostname(): string
+  local host = self.meta.host
+  if strings.sub(host, 1, 1) == "[" then
+    local close? = strings.find(host, "]")
+    if close then return strings.sub(host, 1, close) end
+    return host
+  end
+  local colon? = strings.find(host, ":")
+  if colon then return strings.sub(host, 1, colon - 1) end
+  return host
+end
+
+--- Port from the Host header, else 443 for https and 80 for http.
+function Context:port(): integer
+  local host = self.meta.host
+  local start = 1
+  if strings.sub(host, 1, 1) == "[" then
+    local close? = strings.find(host, "]")
+    if close then start = close + 1 end
+  end
+  local colon? = strings.find(host, ":", start)
+  if colon then
+    local parsed? = math.tointeger(strings.sub(host, colon + 1))
+    if parsed ~= nil then return parsed end
+  end
+  if self.meta.scheme == "https" then return 443 end
+  return 80
+end
+
+--- True for a WebSocket upgrade offer (Upgrade: websocket, Connection: upgrade).
+function Context:is_websocket(): boolean
+  return headers_have_token(self.meta.headers, "Upgrade", "websocket") and
+    headers_have_token(self.meta.headers, "Connection", "upgrade")
+end
+
+--- True when the request offers any HTTP Upgrade; its body is never readable.
+function Context:is_upgrade_offer(): boolean
+  return self.upgrade_offer
+end
+
+--- True for a CORS preflight (OPTIONS with Origin and Access-Control-Request-Method).
+function Context:is_preflight(): boolean
+  return self.meta.method == "OPTIONS" and self.meta.headers:get("Origin") ~= nil and
+    self.meta.headers:get("Access-Control-Request-Method") ~= nil
+end
+
+--- Declared pattern of the matched endpoint route, or "".
+function Context:matched_route(): string
+  local entry? = self.endpoint_entry
+  if entry == nil then return "" end
+  return entry.pattern
+end
+
+--- Declared pattern of the endpoint route this request classified to at
+-- dispatch (known before any handler runs), or "".
+function Context:classified_route(): string
+  return self.meta.route_pattern
+end
+
+--- Socket address of the client connection (see `RequestMeta:peer_address`).
+function Context:peer_address(): net.Address?
+  return self.meta.peer
+end
+
+--- Info for the matched endpoint route, or nil before/without a match.
+function Context:endpoint(): RouteInfo?
+  local entry? = self.endpoint_entry
+  if entry == nil then return nil end
+  return entry:info()
+end
+
+--- Name of the matched endpoint route, or "".
+function Context:route_name(): string
+  local entry? = self.endpoint_entry
+  if entry == nil then return "" end
+  return entry.name
+end
+
+--- Mount prefix of the currently executing entry, or "".
+function Context:mount_path(): string
+  local entry? = self.current_entry or self.endpoint_entry
+  if entry == nil then return "" end
+  return entry.mount_path
+end
+
+--- Why the request target could not be parsed, or nil.
+function Context:target_error(): string?
+  return self.target_error_text
+end
+
+function Context:start_time_ns(): integer return self.start_ns end
+
+--- Milliseconds since the request entered `mk`.
+function Context:elapsed_ms(): float
+  return (uv.hrtime() - self.start_ns) / 1000000.0
+end
+
+--- Monotonic deadline of the innermost `run_with_timeout`, or nil.
+function Context:deadline_ns(): integer?
+  return self.deadline
+end
+
+--- The HttpError handled at the top-level dispatch boundary, if any.
+function Context:last_error(): HttpError?
+  return self.last_err
+end
+
+--- Run `hook` (LIFO) immediately before the response headers are committed.
+function Context:on_before_commit(hook: function (Context): ())
+  self:own()
+  self.before_commit_hooks[#self.before_commit_hooks + 1] = hook
+end
+
+--- Run `hook` (LIFO) after the response finished, failed, or aborted.
+function Context:on_complete(hook: function (Context): ())
+  self:own()
+  self.complete_hooks[#self.complete_hooks + 1] = hook
+end
+
+local record TimeoutOutcome
+  failure: async.Error?
+end
+
+-- Cancellation-insensitive wait for a Task's terminal status.
+local function await_terminal<|A, B|>(task: async.Task<|A, B|>)
+  if task:status():has_finished() then return end
+  local remove: (function (): ())? = nil
+  defer do
+    local remover? = remove
+    remove = nil
+    if remover ~= nil then remover() end
+  end
+  async.await_cleanup<|nil, nil|>(function (resolve: function (nil): (),
+                                           _reject: function (nil): (),
+                                           _fatal: function (value, string): ())
+    remove = task:add_terminal_listener(function (_: async.TaskStatus<|A, B|>)
+      resolve(nil)
+    end)
+  end)
+end
+
+--- Run `action` with a deadline; on expiry run `on_timeout` or raise 503.
+-- The action runs in a child Task owning the Context; on expiry Context
+-- ownership is revoked, a committed or socket-blocked transport is aborted,
+-- and the child is cancelled and joined before `on_timeout` runs.
+function Context:run_with_timeout(timeout_ms: integer, action: Handler, on_timeout: Handler?)
+  self:own()
+  if timeout_ms <= 0 then
+    action(self)
+    return
+  end
+  local new_deadline = uv.hrtime() + timeout_ms * 1000000
+  local enclosing? = self.deadline
+  if enclosing ~= nil and enclosing <= new_deadline then
+    action(self)
+    return
+  end
+  local supervisor = self.owner_task
+  local timed_out = false
+  local outcome: TimeoutOutcome? = nil
+  do
+    self.deadline = new_deadline
+    local worker_task = async.run<|TimeoutOutcome, value|>(function (): TimeoutOutcome
+      self.owner_task = async.running()
+      action(self)
+      return TimeoutOutcome(nil)
+    catch
+      if error is async.CancellationReason then raise end
+      return TimeoutOutcome(async.Error(error, traceback))
+    end)
+    local timer_task = async.run<|nil, value|>(function (): nil
+      timer.sleep(timeout_ms)
+      return nil
+    end)
+    defer do
+      self.owner_task = supervisor
+      self.deadline = enclosing
+      if not timer_task:status():has_finished() then
+        timer_task:cancel(async.CancellationReason.simple("request timer stopped"))
+      end
+      if not worker_task:status():has_finished() then
+        if self.committed_flag or self.in_socket_io then self:force_abort() end
+        worker_task:cancel(async.CancellationReason.simple("request timeout"))
+      end
+      await_terminal(timer_task)
+      await_terminal(worker_task)
+    end
+    case async.race_two(worker_task, timer_task)
+    when first(status) then
+      case status
+      when succeeded(result) then outcome = result
+      when failed(failure) then failure:raise()
+      when cancelled(reason) then raise reason
+      else
+      end
+    when second() then
+      timed_out = true
+    end
+  end
+  if outcome ~= nil then
+    local failure? = outcome.failure
+    if failure ~= nil then failure:raise() end
+    return
+  end
+  if not timed_out then return end
+  if self.aborted_flag or self.committed_flag then return end
+  self:reset_body()
+  if on_timeout ~= nil then
+    on_timeout(self)
+    return
+  end
+  raise HttpError(503, "Service Unavailable", "timeout", nil)
+end
+
+------------------------------------------------------------------------------
+-- Params, query, headers, cookies, locals
+
+function Context:param(name: string, default_val: string?): string
+  return self.params_map[name] or default_val or ""
+end
+
+function Context:param_opt(name: string): string?
+  return self.params_map[name]
+end
+
+local function integer_or_400(text: string?, default_val: integer?, subject: string): integer
+  if text == nil or text == "" then
+    if default_val ~= nil then return default_val end
+    raise HttpError(400, subject .. " is required", "invalid_parameter", nil)
+  end
+  local parsed? = math.tointeger(text)
+  if parsed == nil then
+    raise HttpError(400, subject .. " must be an integer", "invalid_parameter", nil)
+  end
+  return parsed
+end
+
+--- Integer route parameter; raises HttpError(400) when missing (without default) or malformed.
+function Context:param_int(name: string, default_val: integer?): integer
+  return integer_or_400(self.params_map[name], default_val, "parameter " .. name)
+end
+
+--- Copy of the matched route parameters.
+function Context:params(): {string: string}
+  local result: {string: string} = {}
+  for key, item in iteration.pairs(self.params_map) do result[key] = item end
+  return result
+end
+
+--- Replace a matched route parameter for the remaining chain.
+function Context:override_param(name: string, val: string)
+  self:own()
+  if self.params_map[name] ~= nil then self.params_map[name] = val end
+end
+
+function Context:query(name: string, default_val: string?): string
+  return self.meta:query(name, default_val)
+end
+
+function Context:query_opt(name: string): string?
+  return self.meta:query_opt(name)
+end
+
+function Context:query_values(name: string): {string}
+  return self.meta:query_values(name)
+end
+
+--- Copy of the first decoded value of every query field.
+function Context:queries(): {string: string}
+  local result: {string: string} = {}
+  for key, item in iteration.pairs(self.meta.target.query) do result[key] = item end
+  return result
+end
+
+--- Integer query value; raises HttpError(400) when missing (without default) or malformed.
+function Context:query_int(name: string, default_val: integer?): integer
+  return integer_or_400(self.meta.target.query[name], default_val, "query " .. name)
+end
+
+--- Finite float query value; raises HttpError(400) when missing (without
+-- default), malformed, or not finite.
+function Context:query_float(name: string, default_val: float?): float
+  local text? = self.meta.target.query[name]
+  if text == nil or text == "" then
+    if default_val ~= nil then return default_val end
+    raise HttpError(400, "query " .. name .. " is required", "invalid_parameter", nil)
+  end
+  local parsed? = math.tonumber(text)
+  local number = 0.0
+  if parsed ~= nil then number = parsed as float end
+  if parsed == nil or number ~= number or number == math.huge or number == -math.huge then
+    raise HttpError(400, "query " .. name .. " must be a finite number", "invalid_parameter", nil)
+  end
+  return number
+end
+
+--- Boolean query value ("true"/"1"/"yes"/"on" or "false"/"0"/"no"/"off").
+function Context:query_bool(name: string, default_val: boolean?): boolean
+  local text? = self.meta.target.query[name]
+  if text == nil or text == "" then
+    if default_val ~= nil then return default_val end
+    raise HttpError(400, "query " .. name .. " is required", "invalid_parameter", nil)
+  end
+  local lowered = ascii_lower(text)
+  if lowered == "true" or lowered == "1" or lowered == "yes" or lowered == "on" then return true end
+  if lowered == "false" or lowered == "0" or lowered == "no" or lowered == "off" then return false end
+  raise HttpError(400, "query " .. name .. " must be a boolean", "invalid_parameter", nil)
+end
+
+function Context:get(name: string, default_val: string?): string
+  return self.meta:get(name, default_val)
+end
+
+function Context:header_opt(name: string): string?
+  return self.meta.headers:get(name)
+end
+
+function Context:get_headers(name: string): {string}
+  return self.meta.headers:values(name)
+end
+
+function Context:has_header(name: string): boolean
+  return self.meta.headers:get(name) ~= nil
+end
+
+--- Copy of the request headers.
+function Context:req_headers(): http.Headers
+  return http.headers(self.meta.headers:all())
+end
+
+--- Raw Content-Type request header, or "".
+function Context:content_type(): string
+  return self.meta.headers:get("Content-Type") or ""
+end
+
+--- Lowercased media type of Content-Type without parameters, or "".
+function Context:media_type(): string
+  local raw = self:content_type()
+  local semicolon? = strings.find(raw, ";")
+  if semicolon then raw = strings.sub(raw, 1, semicolon - 1) end
+  return ascii_lower(trim_ows(raw))
+end
+
+--- True for application/json or any +json media type.
+function Context:is_json(): boolean
+  local media = self:media_type()
+  return media == "application/json" or
+    (strings.find(media, "/") ~= nil and #media > 5 and strings.sub(media, -5) == "+json")
+end
+
+local function offer_media(offer: string): string
+  if strings.find(offer, "/") then return ascii_lower(offer) end
+  local extension = ascii_lower(offer)
+  if strings.sub(extension, 1, 1) == "." then extension = strings.sub(extension, 2) end
+  return MIME_TYPES[extension] or extension
+end
+
+-- One parsed Accept media range: specificity 0 for */*, 1 for type/*, and
+-- 2 for type/subtype.
+local record MediaRange
+  range: string
+  quality: float
+  specificity: integer
+end
+
+local function MediaRange:matches(media: string): boolean
+  if self.specificity == 0 then return true end
+  if self.specificity == 1 then
+    local prefix = strings.sub(self.range, 1, #self.range - 1)
+    return strings.sub(media, 1, #prefix) == prefix
+  end
+  return media == self.range
+end
+
+local function parse_accept(lines: {string}): {MediaRange}
+  local ranges: {MediaRange} = {}
+  for line_index = 1, #lines do
+    for item in strings.split(lines[line_index], ",") do
+      local spec = trim_ows(item)
+      local quality = 1.0
+      local semicolon? = strings.find(spec, ";")
+      if semicolon ~= nil then
+        local params = strings.sub(spec, semicolon + 1)
+        spec = trim_ows(strings.sub(spec, 1, semicolon - 1))
+        for param in strings.split(params, ";") do
+          local pair = ascii_lower(trim_ows(param))
+          if strings.sub(pair, 1, 2) == "q=" then
+            local parsed? = math.tonumber(strings.sub(pair, 3))
+            if parsed ~= nil then
+              quality = parsed as float
+              if not (quality >= 0.0) then quality = 0.0 end
+              if quality > 1.0 then quality = 1.0 end
+            end
+          end
+        end
+      end
+      spec = ascii_lower(spec)
+      if spec ~= "" then
+        local specificity = 2
+        if spec == "*/*" or spec == "*" then specificity = 0
+        elseif strings.sub(spec, -2) == "/*" then specificity = 1 end
+        ranges[#ranges + 1] = MediaRange(spec, quality, specificity)
+      end
+    end
+  end
+  return ranges
+end
+
+-- RFC 9110 §12.5.1: an offer takes the quality of its most specific matching
+-- range (the highest q among equally specific ones); 0 excludes it.
+local function offer_quality(ranges: {MediaRange}, media: string): float
+  local best_specificity = -1
+  local quality = 0.0
+  for index = 1, #ranges do
+    local candidate = ranges[index]
+    if candidate:matches(media) then
+      if candidate.specificity > best_specificity then
+        best_specificity = candidate.specificity
+        quality = candidate.quality
+      elseif candidate.specificity == best_specificity and candidate.quality > quality then
+        quality = candidate.quality
+      end
+    end
+  end
+  return quality
+end
+
+--- The first offer with the highest positive Accept quality (the first offer
+-- when Accept is absent), or nil when every offer is unacceptable.
+function Context:accepts(offers: {string}): string?
+  if #offers == 0 then return nil end
+  local lines = self.meta.headers:values("Accept")
+  if #lines == 0 then return offers[1] end
+  local ranges = parse_accept(lines)
+  if #ranges == 0 then return offers[1] end
+  local best: string? = nil
+  local best_quality = 0.0
+  for index = 1, #offers do
+    local offer = offers[index]
+    local quality = offer_quality(ranges, offer_media(offer))
+    if quality > best_quality then
+      best = offer
+      best_quality = quality
+    end
+  end
+  return best
+end
+
+--- Bearer token from the Authorization header, or nil.
+function Context:bearer(): string?
+  local authorization? = self.meta.headers:get("Authorization")
+  if authorization == nil or #authorization < 7 then return nil end
+  if ascii_lower(strings.sub(authorization, 1, 7)) ~= "bearer " then return nil end
+  local token = trim_ows(strings.sub(authorization, 8))
+  if token == "" then return nil end
+  return token
+end
+
+function Context:cookie(name: string, default_val: string?): string
+  return self.meta:cookie(name, default_val)
+end
+
+function Context:cookie_opt(name: string): string?
+  return self.meta:cookies_view()[name]
+end
+
+--- Copy of every request cookie.
+function Context:cookies(): {string: string}
+  local result: {string: string} = {}
+  for key, item in iteration.pairs(self.meta:cookies_view()) do result[key] = item end
+  return result
+end
+
+--- Append a Set-Cookie response header.
+function Context:set_cookie(cookie: Cookie)
+  self:own()
+  self:writable()
+  self.response_headers:add("Set-Cookie", cookie:render())
+end
+
+--- Expire a cookie on the client.
+function Context:clear_cookie(name: string, cookie_path: string?, domain: string?)
+  self:own()
+  self:writable()
+  local expired = Cookie {
+    name = name, value = "", path = cookie_path, domain = domain, max_age = -1,
+    expires_unix = 0,
+  }
+  self.response_headers:add("Set-Cookie", expired:render())
+end
+
+--- Store a per-request local value.
+function Context:set_local(key: string, item: value)
+  self:own()
+  self.locals_map[key] = item
+end
+
+--- Read a per-request local value (nil when absent).
+function Context:get_local(key: string): value
+  return self.locals_map[key]
+end
+
+--- Request id stored by `mk.middleware.requestid` under local "requestid", or "".
+function Context:request_id(): string
+  local stored = self.locals_map["requestid"]
+  if stored is string then return stored as string end
+  return ""
+end
+
+------------------------------------------------------------------------------
+-- Request body
+
+-- Sticky: once the limit is exceeded, later body reads raise 413 again.
+local function Context:body_too_large()
+  self.close_after_response = true
+  self.body_done = true
+  self.body_overflow = true
+  raise HttpError(413, "Content Too Large", "body_too_large", nil)
+end
+
+local function Context:check_declared_length()
+  local declared? = self.meta.headers:get("Content-Length")
+  if declared ~= nil then
+    local length? = math.tointeger(trim_ows(declared))
+    if length ~= nil and length > self.core.body_limit then self:body_too_large() end
+  end
+end
+
+local function Context:read_raw_chunk(): string?
+  local capture? = self.capture
+  if capture ~= nil then
+    local pending? = self.test_body
+    self.test_body = nil
+    if pending == nil or pending == "" then return nil end
+    return pending
+  end
+  local request = self.raw_request as http.Request
+  local outer_io = self.in_socket_io
+  self.in_socket_io = true
+  defer self.in_socket_io = outer_io
+  return request:read()
+end
+
+--- Read the next request-body chunk (nil at EOF), enforcing `body_limit`.
+function Context:read_body_chunk(): string?
+  self:own()
+  if self.body_overflow then self:body_too_large() end
+  if self.body_done or self.upgrade_offer then return nil end
+  self:check_declared_length()
+  local chunk? = self:read_raw_chunk()
+  if chunk == nil then
+    self.body_done = true
+    return nil
+  end
+  self.body_read = self.body_read + #chunk
+  if self.body_read > self.core.body_limit then self:body_too_large() end
+  return chunk
+end
+
+--- The complete (remaining) request body, read once and cached.
+function Context:body(): string
+  self:own()
+  local cached? = self.body_cache
+  if cached ~= nil then return cached end
+  if self.upgrade_offer then return "" end
+  local out = strings.writer()
+  for chunk in self:read_body_chunk do out:write(chunk) end
+  local result = out:drain()
+  self.body_cache = result
+  return result
+end
+
+--- JSON body binder.
+function Context:bind(): Bind
+  self:own()
+  return Bind(self)
+end
+
+-- Drain the unread request body after the response, bounded by body_limit.
+-- Returns false when the remainder is too large and the transport must abort.
+local function Context:drain_request(): boolean
+  if self.capture ~= nil or self.body_done or self.aborted_flag or
+      self.upgraded_ws ~= nil or self.upgrade_offer then
+    return true
+  end
+  local declared? = self.meta.headers:get("Content-Length")
+  if declared ~= nil then
+    local length? = math.tointeger(trim_ows(declared))
+    if length ~= nil and length > self.core.body_limit then return false end
+  end
+  local request = self.raw_request as http.Request
+  local outer_io = self.in_socket_io
+  self.in_socket_io = true
+  defer self.in_socket_io = outer_io
+  while true do
+    local chunk? = request:read()
+    if chunk == nil then break end
+    self.body_read = self.body_read + #chunk
+    if self.body_read > self.core.body_limit then return false end
+  end
+  self.body_done = true
+  return true
+end
+
+------------------------------------------------------------------------------
+-- Buffered response building
+
+local function Context:writable()
+  if self.committed_flag then raise "mk: response headers have already been committed" end
+  if self.aborted_flag then raise "mk: response was aborted" end
+end
+
+--- Set the response status (200..999).
+function Context:status(code: integer): Context
+  self:own()
+  self:writable()
+  if code < 200 or code > 999 then raise "mk: HTTP status must be between 200 and 999" end
+  self.status_value = code
+  return self
+end
+
+function Context:status_code(): integer
+  return self.status_value
+end
+
+--- Replace a response header.
+function Context:set(name: string, contents: string): Context
+  self:own()
+  self:writable()
+  self.response_headers:set(name, contents)
+  return self
+end
+
+--- Append a response header value.
+function Context:append(name: string, contents: string): Context
+  self:own()
+  self:writable()
+  self.response_headers:add(name, contents)
+  return self
+end
+
+function Context:remove_header(name: string): Context
+  self:own()
+  self:writable()
+  self.response_headers:remove(name)
+  return self
+end
+
+--- First response header value, or nil.
+function Context:resp_header(name: string): string?
+  return self.response_headers:get(name)
+end
+
+--- Copy of the buffered response headers.
+function Context:resp_headers(): http.Headers
+  return http.headers(self.response_headers:all())
+end
+
+--- Add fields to the Vary header (merging every existing Vary line) without
+-- duplicates.
+function Context:vary(field: string, ...: string): Context
+  self:own()
+  self:writable()
+  local fields: {string} = {field, ...}
+  local present: {string: boolean} = {}
+  local combined = ""
+  local existing = self.response_headers:values("Vary")
+  for line = 1, #existing do
+    for item in strings.split(existing[line], ",") do
+      local name = trim_ows(item)
+      if name ~= "" and not present[ascii_lower(name)] then
+        present[ascii_lower(name)] = true
+        if combined == "" then combined = name else combined = combined .. ", " .. name end
+      end
+    end
+  end
+  for index = 1, #fields do
+    local name = trim_ows(fields[index])
+    if name ~= "" and not present[ascii_lower(name)] then
+      present[ascii_lower(name)] = true
+      if combined == "" then combined = name else combined = combined .. ", " .. name end
+    end
+  end
+  if combined ~= "" then self.response_headers:set("Vary", combined) end
+  return self
+end
+
+--- Set Content-Type from an extension ("json", ".html") or a full MIME type.
+function Context:type(extension_or_mime: string, charset: string?): Context
+  self:own()
+  self:writable()
+  self.response_headers:set("Content-Type", content_type_for(extension_or_mime, charset))
+  return self
+end
+
+function Context:location(target_url: string): Context
+  self:own()
+  self:writable()
+  self.response_headers:set("Location", target_url)
+  return self
+end
+
+--- Content-Disposition attachment (with filename and its type when given).
+function Context:attachment(filename: string?): Context
+  self:own()
+  self:writable()
+  if filename == nil then
+    self.response_headers:set("Content-Disposition", "attachment")
+    return self
+  end
+  local base = filename
+  for index = #filename, 1, -1 do
+    local byte = strings.byte(filename, index)
+    if byte == 47 or byte == 92 then
+      base = strings.sub(filename, index + 1)
+      break
+    end
+  end
+  local escaped = strings.gsub(base, "[\"\\\\]", function (piece: string): string
+    return "\\" .. piece
+  end, nil)
+  self.response_headers:set("Content-Disposition", "attachment; filename=\"" .. escaped .. "\"")
+  local extension = path_extension(base)
+  if extension ~= "" then
+    self.response_headers:set("Content-Type", content_type_for(extension, nil))
+  end
+  return self
+end
+
+--- Replace the buffered response body.
+function Context:send(data: string): Context
+  self:own()
+  self:writable()
+  self.response_body = data
+  return self
+end
+
+--- Body as text/plain (unless a Content-Type is already set).
+function Context:send_string(text: string): Context
+  self:own()
+  self:writable()
+  if self.response_headers:get("Content-Type") == nil then
+    self.response_headers:set("Content-Type", "text/plain; charset=utf-8")
+  end
+  self.response_body = text
+  return self
+end
+
+function Context:html(markup: string): Context
+  self:own()
+  self:writable()
+  self.response_headers:set("Content-Type", "text/html; charset=utf-8")
+  self.response_body = markup
+  return self
+end
+
+--- Status plus its reason phrase as the body (when no body was set).
+function Context:send_status(code: integer): Context
+  self:status(code)
+  if self.response_body == "" and code ~= 204 and code ~= 205 and code ~= 304 then
+    self:send_string(status_message(code))
+  end
+  return self
+end
+
+function Context:no_content(): Context
+  self:status(204)
+  self.response_body = ""
+  return self
+end
+
+--- Encode `payload` as the JSON body (depth bounded by `json_max_depth`).
+function Context:json(payload: value, ...: json.EncodeOption): Context
+  self:own()
+  self:writable()
+  local encoded = json.encode(payload, json.EncodeOption.max_depth(self.core.json_max_depth), ...)
+  self.response_headers:set("Content-Type", "application/json")
+  self.response_body = encoded
+  return self
+end
+
+--- Use already-encoded JSON as the body.
+function Context:json_raw(encoded_json: string): Context
+  self:own()
+  self:writable()
+  self.response_headers:set("Content-Type", "application/json")
+  self.response_body = encoded_json
+  return self
+end
+
+--- Redirect with `code` (default 303 See Other).
+function Context:redirect(target_url: string, code: integer?): Context
+  self:location(target_url)
+  self:status(code or 303)
+  return self
+end
+
+--- Stream a file with its extension's Content-Type; 404 when missing.
+function Context:send_file(file_path: string, download: boolean?)
+  self:own()
+  self:writable()
+  local info? = fs.stat(file_path)
+  if info == nil or info.kind ~= "file" then
+    raise HttpError(404, nil, "file_not_found", nil)
+  end
+  if download then
+    self:attachment(file_path)
+  elseif self.response_headers:get("Content-Type") == nil then
+    self.response_headers:set("Content-Type", content_type_for(path_extension(file_path), nil))
+  end
+  local file = fs.open(file_path, "rb")
+  defer file:close()
+  self:send_stream(file, info.size)
+end
+
+--- Clear the buffered body (headers and status are kept).
+function Context:reset_body()
+  self:own()
+  if self.committed_flag then return end
+  self.response_body = ""
+end
+
+------------------------------------------------------------------------------
+-- Commit, streaming, abort, and WebSocket takeover
+
+local function Context:body_allowed(): boolean
+  if self.meta.method == "HEAD" then return false end
+  local status = self.status_value
+  return status >= 200 and status ~= 204 and status ~= 205 and status ~= 304
+end
+
+local function Context:run_before_commit()
+  local hooks = self.before_commit_hooks
+  self.before_commit_hooks = {}
+  for index = #hooks, 1, -1 do
+    local hook = hooks[index]
+    hook(self)
+  end
+end
+
+local function Context:apply_server_header()
+  local server_header? = self.core.server_header
+  if server_header ~= nil and self.response_headers:get("Server") == nil then
+    self.response_headers:set("Server", server_header)
+  end
+end
+
+-- A response announces close when the transport ends after it: body-limit
+-- or explicit close, app shutdown, or a retiring/ephemeral session worker.
+local function Context:closes_connection(): boolean
+  if self.close_after_response or self.core.closing then return true end
+  local worker? = self.core.worker
+  return worker ~= nil and (worker.retiring or worker.boot.ephemeral)
+end
+
+local function Context:prepare_framing(buffered: boolean)
+  local headers = self.response_headers
+  self:apply_server_header()
+  if self:closes_connection() then headers:set("Connection", "close") end
+  local status = self.status_value
+  if status == 204 or status == 304 then
+    headers:remove("Content-Length")
+    headers:remove("Transfer-Encoding")
+  elseif status == 205 then
+    headers:remove("Transfer-Encoding")
+    headers:set("Content-Length", "0")
+  elseif buffered then
+    headers:remove("Transfer-Encoding")
+    -- A HEAD handler may declare the length of a representation it never
+    -- buffers; keep that explicit Content-Length.
+    local keep_declared = self.meta.method == "HEAD" and #self.response_body == 0 and
+      headers:get("Content-Length") ~= nil
+    if not keep_declared then headers:set("Content-Length", "" .. #self.response_body) end
+    if #self.response_body > 0 and headers:get("Content-Type") == nil then
+      headers:set("Content-Type", "text/plain; charset=utf-8")
+    end
+  end
+end
+
+-- Transfer status and headers to the transport; `flush` sends them now,
+-- otherwise the first body write (or close) sends them with its data.
+local function Context:io_send_headers(flush: boolean)
+  local capture? = self.capture
+  if capture ~= nil then
+    capture.status = self.status_value
+    capture.headers = http.headers(self.response_headers:all())
+    capture.committed = true
+    return
+  end
+  local response = self.raw_response as http.Response
+  response:set_status(self.status_value, nil)
+  local entries = self.response_headers:all()
+  for index = 1, #entries do
+    local entry = entries[index]
+    response:add_header(entry.name, entry.contents)
+  end
+  if not flush then return end
+  local outer_io = self.in_socket_io
+  self.in_socket_io = true
+  defer self.in_socket_io = outer_io
+  response:send_headers()
+end
+
+local function Context:io_write(data: string)
+  local capture? = self.capture
+  if capture ~= nil then
+    if not capture.closed then capture.body:write(data) end
+    return
+  end
+  local response = self.raw_response as http.Response
+  local outer_io = self.in_socket_io
+  self.in_socket_io = true
+  defer self.in_socket_io = outer_io
+  response:write(data)
+end
+
+local function Context:io_close()
+  self.finished = true
+  local capture? = self.capture
+  if capture ~= nil then
+    capture.closed = true
+    return
+  end
+  local response = self.raw_response as http.Response
+  local outer_io = self.in_socket_io
+  self.in_socket_io = true
+  defer self.in_socket_io = outer_io
+  response:close()
+end
+
+-- A buffered response leaves header transmission to its single body write
+-- or close, which coalesces headers and body into one transport write.
+local function Context:commit_buffered()
+  self:run_before_commit()
+  self:prepare_framing(true)
+  self.committed_flag = true
+  self:io_send_headers(false)
+  if #self.response_body > 0 and self:body_allowed() then
+    self:io_write(self.response_body)
+  end
+  self:io_close()
+end
+
+-- End-of-chain response completion.
+local function Context:finish_response()
+  if self.aborted_flag or self.upgraded_ws ~= nil then return end
+  if not self.committed_flag then
+    self:commit_buffered()
+  elseif not self.finished then
+    self:io_close()
+  end
+end
+
+--- Flush the buffered status, headers, and body to the wire immediately.
+function Context:commit()
+  self:own()
+  if self.aborted_flag then raise "mk: response was aborted" end
+  if self.committed_flag then
+    if not self.finished and self.upgraded_ws == nil then self:io_close() end
+    return
+  end
+  self:commit_buffered()
+end
+
+function Context:committed(): boolean return self.committed_flag end
+function Context:aborted(): boolean return self.aborted_flag end
+
+--- Commit status and headers for a streamed body.
+function Context:flush_headers()
+  self:own()
+  if self.committed_flag then return end
+  if self.aborted_flag then raise "mk: response was aborted" end
+  self:run_before_commit()
+  self:prepare_framing(false)
+  self.committed_flag = true
+  local pending = self.response_body
+  self.response_body = ""
+  local write_pending = #pending > 0 and self:body_allowed()
+  -- Pending body bytes carry the headers; otherwise send them now.
+  self:io_send_headers(not write_pending)
+  if write_pending then self:io_write(pending) end
+end
+
+--- Write one streamed body chunk (committing headers first).
+function Context:write_chunk(data: string)
+  self:own()
+  if not self.committed_flag then self:flush_headers() end
+  if self.finished then raise "mk: response is already complete" end
+  if self.aborted_flag then raise "mk: response was aborted" end
+  if #data == 0 or not self:body_allowed() then return end
+  self:io_write(data)
+end
+
+--- Stream `reader` as the body; `content_length` declares an exact length.
+function Context:send_stream(reader: io.Reader, content_length: integer?)
+  self:own()
+  if not self.committed_flag then
+    if content_length ~= nil then
+      if content_length < 0 then raise "mk: send_stream content_length must be non-negative" end
+      self.response_headers:set("Content-Length", "" .. content_length)
+    end
+    self:flush_headers()
+  end
+  if not self:body_allowed() then return end
+  for chunk in reader:read do self:write_chunk(chunk) end
+end
+
+-- Owner-exempt idempotent transport abort (timeouts, shutdown, worker exit).
+local function Context:force_abort()
+  if self.aborted_flag then return end
+  self.aborted_flag = true
+  local connection? = self.upgraded_ws
+  if connection ~= nil then
+    do connection:close() catch end
+    return
+  end
+  local response? = self.raw_response
+  if response ~= nil then response:abort() end
+end
+
+--- Abort the transport without completing the response.
+function Context:abort()
+  self:own()
+  self:force_abort()
+end
+
+--- Accept a WebSocket upgrade; the connection closes when the handler chain ends.
+function Context:upgrade_websocket(options: websocket.AcceptOptions?): websocket.Connection
+  self:own()
+  self:writable()
+  if self.capture ~= nil then
+    raise HttpError(501, "WebSocket upgrade requires a live server (App:listen_test)",
+                    "upgrade_unavailable", nil)
+  end
+  local request = self.raw_request as http.Request
+  local response = self.raw_response as http.Response
+  -- The 101 (or a handshake rejection) carries the buffered middleware
+  -- headers like any other response.
+  self:run_before_commit()
+  self:apply_server_header()
+  local entries = self.response_headers:all()
+  for index = 1, #entries do
+    local entry = entries[index]
+    response:add_header(entry.name, entry.contents)
+  end
+  local outer_io = self.in_socket_io
+  self.in_socket_io = true
+  defer self.in_socket_io = outer_io
+  local connection: websocket.Connection? = nil
+  do
+    connection = websocket.accept(request, response, options)
+  catch
+    if error is websocket.HandshakeError then
+      local failure = error as websocket.HandshakeError
+      -- The rejection ended the exchange: nothing is left to drain.
+      self.response_headers:set("Content-Length", "0")
+      self.response_headers:set("Connection", "close")
+      self.body_done = true
+      self.committed_flag = true
+      self.finished = true
+      self.status_value = failure.status or 400
+      raise HttpError(self.status_value, failure.message, "websocket_handshake", failure)
+    end
+    raise
+  end
+  self.upgraded_ws = connection
+  self.committed_flag = true
+  self.finished = true
+  self.status_value = 101
+  return connection as websocket.Connection
+end
+
+--- Reject an upgrade offer with a bodyless 4xx/5xx response.
+function Context:reject_upgrade(code: integer)
+  self:own()
+  self:writable()
+  if code < 400 or code > 599 then raise "mk: upgrade rejection status must be 400..599" end
+  self.status_value = code
+  self:run_before_commit()
+  self:apply_server_header()
+  local capture? = self.capture
+  if capture ~= nil then
+    self.response_headers:set("Content-Length", "0")
+    self.response_headers:set("Connection", "close")
+    capture.status = code
+    capture.headers = http.headers(self.response_headers:all())
+    capture.committed = true
+    capture.closed = true
+  else
+    local request = self.raw_request as http.Request
+    local response = self.raw_response as http.Response
+    local outer_io = self.in_socket_io
+    self.in_socket_io = true
+    defer self.in_socket_io = outer_io
+    response:reject_upgrade(request, code, self.response_headers)
+    -- The rejection ended the exchange: nothing is left to drain.
+    self.response_headers:set("Content-Length", "0")
+    self.response_headers:set("Connection", "close")
+  end
+  self.body_done = true
+  self.committed_flag = true
+  self.finished = true
+end
+
+------------------------------------------------------------------------------
+-- Worker context, logging, retirement
+
+--- Worker id (0 on the parent / in App:test).
+function Context:worker_id(): integer
+  return self.core.worker_id
+end
+
+--- Session id of a session worker, else nil.
+function Context:session_id(): string?
+  return self.core.session_id
+end
+
+--- The app logger (parent) or the forwarding worker logger.
+function Context:logger(): log.Logger?
+  return self.core.logger
+end
+
+--- Emit a structured log line through `Context:logger()`.
+function Context:log(level: string, event: string, fields: {string: value}?)
+  log.emit(self.core.logger, level, event, fields)
+end
+
+--- Retire the current session worker immediately (no-op for parent/pool).
+-- The response then closes its connection.
+function Context:retire_worker()
+  self:own()
+  local worker? = self.core.worker
+  if worker ~= nil and self.core.session_id ~= nil then
+    self.close_after_response = true
+    worker:retire()
+  end
+end
+
+------------------------------------------------------------------------------
+-- Top-level dispatch boundary
+
+local function Context:run_complete_hooks()
+  local hooks = self.complete_hooks
+  self.complete_hooks = {}
+  for index = #hooks, 1, -1 do
+    local hook = hooks[index]
+    do
+      hook(self)
+    catch
+      if error is async.CancellationReason then raise end
+      log.emit(self.core.logger, "error", "on_complete_failed",
+        {["error"] = strings.tostring(error)})
+    end
+  end
+end
+
+-- Run the chain plus HttpError handling and response completion. Unexpected
+-- (non-HttpError) failures and cancellation propagate to the caller.
+local function Context:execute()
+  do
+    self:next()
+  catch
+    if not (error is HttpError) then raise end
+    local failure = error as HttpError
+    self.last_err = failure
+    if self.committed_flag or self.aborted_flag then
+      -- A finished response (explicit commit, handshake rejection) stands;
+      -- an unfinished stream or a WebSocket session is torn down.
+      if not self.finished or self.upgraded_ws ~= nil then self:force_abort() end
+    else
+      self:reset_body()
+      do
+        self.core.error_handler(self, failure)
+      catch
+        if not (error is HttpError) then raise end
+        if self.committed_flag or self.aborted_flag then
+          if not self.finished or self.upgraded_ws ~= nil then self:force_abort() end
+        else
+          local second = error as HttpError
+          self:reset_body()
+          default_error_handler(self, second)
+        end
+      end
+    end
+  end
+  if self.upgraded_ws ~= nil then
+    local connection = self.upgraded_ws as websocket.Connection
+    connection:close()
+    return
+  end
+  self:finish_response()
+end
+
+-- Teardown of a completed exchange's transport without marking the response
+-- aborted (it was fully written): skips the unread-body drain.
+local function Context:release_transport()
+  local response? = self.raw_response
+  if response ~= nil then response:abort() end
+end
+
+-- Whether the exchange ends after this response: the committed response or
+-- the client announced `Connection: close`, so `http` closes the connection
+-- without reading the unread request body.
+local function Context:announced_close(): boolean
+  return headers_have_token(self.response_headers, "Connection", "close") or
+    headers_have_token(self.meta.headers, "Connection", "close")
+end
+
+-- Live-transport request lifecycle on the executing owner Task: chain,
+-- error handling, response completion, bounded drain, and on_complete.
+-- Unexpected failures abort the transport and are logged; cancellation is
+-- re-raised after the transport is aborted and observers ran.
+local function Core:run_live(ctx: Context)
+  local failed = false
+  local failure: value = nil
+  local trace = ""
+  do
+    ctx:execute()
+    if not ctx.aborted_flag and ctx.upgraded_ws == nil and not ctx:announced_close() then
+      if ctx:closes_connection() then
+        -- Committed as persistent before the close was decided: `http`
+        -- would drain the unread body, so end the transport instead.
+        ctx:release_transport()
+      elseif not ctx:drain_request() then
+        ctx:release_transport()
+      end
+    end
+  catch
+    failed = true
+    failure = error
+    trace = traceback
+  end
+  if failed then
+    ctx:force_abort()
+    ctx:run_complete_hooks()
+    if failure is async.CancellationReason then raise failure, trace end
+    log.emit(self.logger, "error", "http_request_failed", {
+      ["reason"] = "unhandled_exception",
+      ["method"] = ctx.meta.method,
+      ["path"] = ctx.meta.path,
+      ["error"] = strings.tostring(failure),
+      ["worker_id"] = self.worker_id,
+    })
+    return
+  end
+  ctx:run_complete_hooks()
+end

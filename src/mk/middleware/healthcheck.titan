@@ -1,0 +1,65 @@
+--- Liveness, readiness, and startup probe endpoints (GoFiber healthcheck).
+-- @module mk.middleware.healthcheck
+
+local mk = import "mk"
+
+--- Conventional Kubernetes probe paths.
+const LIVENESS_ENDPOINT: string = "/livez"
+const READINESS_ENDPOINT: string = "/readyz"
+const STARTUP_ENDPOINT: string = "/startupz"
+
+--- Probe response body format.
+union ResponseFormat
+  --- `OK` / `Service Unavailable` plain text.
+  text()
+  --- `{"status":"ok"}` / `{"status":"unavailable"}` JSON.
+  json()
+end
+
+const FORMAT_TEXT: ResponseFormat = ResponseFormat.text()
+const FORMAT_JSON: ResponseFormat = ResponseFormat.json()
+
+--- Probe options.
+-- @field next Skip the probe (continue the chain) when it returns true.
+-- @field probe Health predicate (default: always healthy).
+-- @field response_format Body format (default FORMAT_TEXT).
+record Config
+  const next: (function (mk.Context): boolean)?
+  const probe: (function (mk.Context): boolean)?
+  const response_format: ResponseFormat?
+end
+
+--- Build a probe handler, usually routed at one of the endpoint constants:
+-- GET/HEAD answer 200 when `probe` passes and 503 otherwise; other methods
+-- (and requests `next` skips) continue the chain.
+function new(config: Config?): mk.Handler
+  local skip: (function (mk.Context): boolean)? = nil
+  local probe: (function (mk.Context): boolean)? = nil
+  local as_json = false
+  if config ~= nil then
+    skip = config.next
+    probe = config.probe
+    local format? = config.response_format
+    if format ~= nil then
+      case format
+      when json() then as_json = true
+      when text() then
+      end
+    end
+  end
+  return function (ctx: mk.Context)
+    local method = ctx:method()
+    if (skip ~= nil and skip(ctx)) or (method ~= "GET" and method ~= "HEAD") then
+      ctx:next()
+      return
+    end
+    local healthy = probe == nil or probe(ctx)
+    ctx:set("Cache-Control", "no-store")
+    if as_json then
+      ctx:status(healthy and 200 or 503):json_raw(healthy and "{\"status\":\"ok\"}" or
+        "{\"status\":\"unavailable\"}")
+    else
+      ctx:send_status(healthy and 200 or 503)
+    end
+  end
+end

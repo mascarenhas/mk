@@ -1,0 +1,751 @@
+-- env, healthcheck, requestid, responsetime, recover, and logger, including
+-- pool and session worker use, cancellation, and admission/completion logs.
+local test = import "test"
+local async = import "async"
+local http = import "http"
+local iteration = import "iteration"
+local json = import "json"
+local net = import "net"
+local os = import "os"
+local strings = import "string"
+local thread = import "thread"
+local timer = import "timer"
+local mk = import "mk"
+local log = import "mk.log"
+local env = import "mk.middleware.env"
+local healthcheck = import "mk.middleware.healthcheck"
+local logger = import "mk.middleware.logger"
+local recover = import "mk.middleware.recover"
+local requestid = import "mk.middleware.requestid"
+local responsetime = import "mk.middleware.responsetime"
+local timeout = import "mk.middleware.timeout"
+
+local function within(ms: integer, what: string, action: function (): ())
+  local worker = async.run<|nil, value|>(function (): nil
+    action()
+    return nil
+  end)
+  local deadline = async.run<|nil, value|>(function (): nil
+    timer.sleep(ms)
+    return nil
+  end)
+  defer do
+    if not deadline:status():has_finished() then
+      deadline:cancel()
+      async.join(deadline)
+    end
+    if not worker:status():has_finished() then
+      worker:cancel()
+      async.join(worker)
+    end
+  end
+  case async.race_two(worker, deadline)
+  when first(status) then
+    local failed, failure? = status:has_failed()
+    if failed then failure:raise() end
+  when second() then
+    test.assert(false, what .. " did not finish within " .. ms .. " ms")
+  end
+end
+
+local function expect(check: boolean, what: string)
+  test.assert(check, what)
+end
+
+local function call(app: mk.App, method: string, target: string, pairs: {string}?): mk.TestResponse
+  local headers = http.headers(nil)
+  if pairs ~= nil then
+    for index = 1, #pairs, 2 do headers:add(pairs[index], pairs[index + 1]) end
+  end
+  return app:test(mk.TestRequest(method, target, headers, nil, nil))
+end
+
+local function raises(action: function (): ()): string
+  do
+    action()
+  catch
+    return strings.tostring(error)
+  end
+  return ""
+end
+
+local function fetch_once(host: string, port: integer, request_text: string): string
+  local connection = net.connect(host, port)
+  defer connection:close()
+  connection:write(request_text)
+  local out = strings.writer()
+  do
+    for chunk in connection:read do out:write(chunk) end
+  catch
+  end
+  return out:drain()
+end
+
+local function status_of(text: string): string
+  return strings.sub(text, 10, 12)
+end
+
+local function body_of(text: string): string
+  local split? = strings.find(text, "\r\n\r\n")
+  if split == nil then return "" end
+  return strings.sub(text, split + 4)
+end
+
+local function header_line(text: string, name: string): string?
+  local wanted = strings.lower(name) .. ": "
+  for line in strings.split(text, "\r\n") do
+    if line == "" then break end
+    if strings.sub(strings.lower(line), 1, #wanted) == wanted then return strings.sub(line, #wanted + 1) end
+  end
+  return nil
+end
+
+local function ok_handler(ctx: mk.Context)
+  ctx:send_string("ok")
+end
+
+local function whoami(ctx: mk.Context)
+  ctx:send_string("worker " .. ctx:worker_id() .. " id " .. ctx:request_id())
+end
+
+local function required_sid(meta: mk.RequestMeta): string?
+  local sid? = meta:query_opt("sid")
+  if sid == nil or sid == "" then raise mk.HttpError(400, "sid is required", "missing_sid") end
+  return sid
+end
+
+local function crash_handler(_: mk.Context)
+  raise "worker crash"
+end
+
+-- Every decoded line whose event is `event`.
+local function records(lines: {string}, event: string): {{string: value}}
+  local found: {{string: value}} = {}
+  for index = 1, #lines do
+    local fields = json.decode(lines[index]) as {string: value}
+    if fields["event"] == event then found[#found + 1] = fields end
+  end
+  return found
+end
+
+local function is_hex_id(text: string): boolean
+  return strings.match(text, "^[0-9a-f]+$") ~= nil and #text == 32
+end
+
+------------------------------------------------------------------------------
+-- env
+
+function test_env_exports(context: test.Context)
+  local app = mk.App()
+  app:all("/env", env.new(env.Config {
+    export_vars = {["PATH"] = "no path", ["MK_TEST_SURELY_UNSET_VARIABLE"] = "fallback"},
+  }))
+  app:get("/empty", env.new())
+  context:run("current_values_and_defaults", function (_: test.Context)
+    local response = call(app, "GET", "/env")
+    expect(response.status == 200 and response:header("Content-Type") == "application/json",
+      "json response: " .. (response:header("Content-Type") or "nil"))
+    local vars = (response:json() as {string: value})["vars"] as {string: value}
+    expect(vars["PATH"] == os.getenv("PATH"), "current PATH")
+    expect(vars["MK_TEST_SURELY_UNSET_VARIABLE"] == "fallback", "default for an unset variable")
+  end)
+  context:run("reads_at_request_time", function (_: test.Context)
+    os.setenv("MK_TEST_SURELY_UNSET_VARIABLE", "now set")
+    defer os.unsetenv("MK_TEST_SURELY_UNSET_VARIABLE")
+    local vars = (call(app, "GET", "/env"):json() as {string: value})["vars"] as {string: value}
+    expect(vars["MK_TEST_SURELY_UNSET_VARIABLE"] == "now set", "value read per request")
+  end)
+  context:run("no_config_exports_nothing", function (_: test.Context)
+    local vars = (call(app, "GET", "/empty"):json() as {string: value})["vars"] as {string: value}
+    local count = 0
+    for _, _ in iteration.pairs(vars) do count = count + 1 end
+    expect(count == 0, "empty vars object")
+  end)
+  context:run("head_and_other_methods", function (_: test.Context)
+    local head = call(app, "HEAD", "/env")
+    expect(head.status == 200 and head.body == "", "HEAD has no body")
+    local post = call(app, "POST", "/env")
+    expect(post.status == 405 and post:header("Allow") == "GET, HEAD", "POST is 405 with Allow")
+  end)
+  context:run("rejects_invalid_names_and_defaults", function (_: test.Context)
+    expect(raises(function () env.new(env.Config { export_vars = {[""] = "x"} }) end) ==
+      "env: variable names must be nonempty and contain no '=' or NUL", "empty name")
+    expect(raises(function () env.new(env.Config { export_vars = {["A=B"] = "x"} }) end) ==
+      "env: variable names must be nonempty and contain no '=' or NUL", "name with =")
+    expect(raises(function () env.new(env.Config { export_vars = {["A"] = "x\0y"} }) end) ==
+      "env: default values must not contain NUL", "default with NUL")
+  end)
+end
+
+------------------------------------------------------------------------------
+-- healthcheck
+
+function test_env_empty_values_and_workers(context: test.Context)
+  context:run("set_but_empty_is_reported", function (_: test.Context)
+    os.setenv("MK_TEST_EMPTY_VARIABLE", "")
+    defer os.unsetenv("MK_TEST_EMPTY_VARIABLE")
+    local app = mk.App()
+    app:get("/env", env.new(env.Config { export_vars = {["MK_TEST_EMPTY_VARIABLE"] = "fallback"} }))
+    local vars = (call(app, "GET", "/env"):json() as {string: value})["vars"] as {string: value}
+    expect(vars["MK_TEST_EMPTY_VARIABLE"] == "", "an empty value is not replaced by the default")
+  end)
+  context:run("pool_worker", function (_: test.Context)
+    os.setenv("MK_TEST_WORKER_VARIABLE", "from process")
+    defer os.unsetenv("MK_TEST_WORKER_VARIABLE")
+    local app = mk.App()
+    app:get("/env", env.new(env.Config { export_vars = {["MK_TEST_WORKER_VARIABLE"] = "x"} }))
+      :workers(mk.WorkerMode.pool())
+    local server = app:listen_test()
+    defer server:close()
+    within(5000, "worker env request", function ()
+      local text = fetch_once(server.host, server.port, "GET /env HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+      expect(status_of(text) == "200" and body_of(text) == "{\"vars\":{\"MK_TEST_WORKER_VARIABLE\":\"from process\"}}",
+        "worker reads the process environment: " .. text)
+    end)
+  end)
+end
+
+function test_healthcheck_probes(context: test.Context)
+  local ready = true
+  local app = mk.App()
+  app:get(healthcheck.LIVENESS_ENDPOINT, healthcheck.new())
+  app:get(healthcheck.READINESS_ENDPOINT, healthcheck.new(healthcheck.Config {
+    probe = function (_: mk.Context): boolean return ready end,
+  }))
+  app:all(healthcheck.STARTUP_ENDPOINT, healthcheck.new(healthcheck.Config {
+    response_format = healthcheck.FORMAT_JSON,
+    probe = function (ctx: mk.Context): boolean return ctx:query_opt("down") == nil end,
+    next = function (ctx: mk.Context): boolean return ctx:query_opt("skip") ~= nil end,
+  }), function (ctx: mk.Context) ctx:send_string("fallthrough " .. ctx:method()) end)
+  context:run("endpoint_constants", function (_: test.Context)
+    expect(healthcheck.LIVENESS_ENDPOINT == "/livez" and healthcheck.READINESS_ENDPOINT == "/readyz" and
+      healthcheck.STARTUP_ENDPOINT == "/startupz", "conventional paths")
+  end)
+  context:run("text_probe", function (_: test.Context)
+    local live = call(app, "GET", "/livez")
+    expect(live.status == 200 and live.body == "OK" and live:header("Cache-Control") == "no-store", "live")
+    ready = false
+    local unready = call(app, "GET", "/readyz")
+    expect(unready.status == 503 and unready.body == "Service Unavailable", "not ready")
+    ready = true
+    expect(call(app, "GET", "/readyz").status == 200, "ready again")
+    local head = call(app, "HEAD", "/livez")
+    expect(head.status == 200 and head.body == "", "HEAD probe")
+  end)
+  context:run("json_probe", function (_: test.Context)
+    local up = call(app, "GET", "/startupz")
+    expect(up.status == 200 and up.body == "{\"status\":\"ok\"}", "json ok: " .. up.body)
+    local down = call(app, "GET", "/startupz?down=1")
+    expect(down.status == 503 and down.body == "{\"status\":\"unavailable\"}", "json unavailable: " .. down.body)
+  end)
+  context:run("other_methods_and_next_continue", function (_: test.Context)
+    expect(call(app, "POST", "/startupz").body == "fallthrough POST", "POST continues the chain")
+    expect(call(app, "GET", "/startupz?skip=1").body == "fallthrough GET", "next continues the chain")
+  end)
+end
+
+------------------------------------------------------------------------------
+-- requestid
+
+function test_requestid_generation_and_propagation(context: test.Context)
+  local app = mk.App()
+  app:use(requestid.new())
+  app:get("/", function (ctx: mk.Context)
+    ctx:send_string(requestid.from_context(ctx) .. "|" .. ctx:request_id())
+  end)
+  app:get("/fail", function (_: mk.Context) raise mk.HttpError(409) end)
+  context:run("generates_random_hex", function (_: test.Context)
+    local first = call(app, "GET", "/")
+    local id = first:header("X-Request-ID") or ""
+    expect(is_hex_id(id), "32 lowercase hex digits: " .. id)
+    expect(first.body == id .. "|" .. id, "from_context and Context:request_id agree")
+    expect(call(app, "GET", "/"):header("X-Request-ID") ~= id, "ids differ per request")
+  end)
+  context:run("propagates_valid_incoming_ids", function (_: test.Context)
+    expect(call(app, "GET", "/", {"X-Request-ID", "abc-123_~!"}):header("X-Request-ID") == "abc-123_~!",
+      "visible ASCII id is kept")
+    local longest = strings.rep("a", 256)
+    expect(call(app, "GET", "/", {"X-Request-ID", longest}):header("X-Request-ID") == longest, "256 bytes kept")
+  end)
+  context:run("replaces_invalid_incoming_ids", function (_: test.Context)
+    -- Control bytes cannot be sent at all: the HTTP layer rejects them first.
+    local candidates: {string} = {"has space", "caf\xc3\xa9", strings.rep("a", 257), "a,b c"}
+    for index = 1, #candidates do
+      local id = call(app, "GET", "/", {"X-Request-ID", candidates[index]}):header("X-Request-ID") or ""
+      expect(is_hex_id(id), "invalid id " .. index .. " replaced: " .. id)
+    end
+  end)
+  context:run("error_responses_carry_the_id", function (_: test.Context)
+    local response = call(app, "GET", "/fail", {"X-Request-ID", "trace-1"})
+    expect(response.status == 409 and response:header("X-Request-ID") == "trace-1", "error response id")
+  end)
+end
+
+function test_requestid_configuration(context: test.Context)
+  context:run("custom_header_and_generator", function (_: test.Context)
+    local counter = 0
+    local app = mk.App()
+    app:use(requestid.new(requestid.Config {
+      header = "X-Trace", generator = function (): string
+        counter = counter + 1
+        return "trace-" .. counter
+      end,
+    }))
+    app:get("/", function (ctx: mk.Context) ctx:send_string(ctx:request_id()) end)
+    local response = call(app, "GET", "/")
+    expect(response:header("X-Trace") == "trace-1" and response.body == "trace-1", "generated id")
+    expect(response:header("X-Request-ID") == nil, "default header unused")
+  end)
+  context:run("invalid_generator_output_is_retried_then_replaced", function (_: test.Context)
+    local calls = 0
+    local outputs: {string} = {"", "bad id", "ok-id"}
+    local app = mk.App()
+    app:use(requestid.new(requestid.Config {
+      generator = function (): string
+        calls = calls + 1
+        if calls <= #outputs then return outputs[calls] end
+        return "never valid"
+      end,
+    }))
+    app:get("/", ok_handler)
+    expect(call(app, "GET", "/"):header("X-Request-ID") == "ok-id" and calls == 3, "third attempt accepted")
+    outputs = {}
+    calls = 0
+    local id = call(app, "GET", "/"):header("X-Request-ID") or ""
+    expect(calls == 3 and is_hex_id(id), "after three invalid ids the CSPRNG id is used: " .. id)
+  end)
+  context:run("next_skips", function (_: test.Context)
+    local app = mk.App()
+    app:use(requestid.new(requestid.Config {
+      next = function (ctx: mk.Context): boolean return ctx:path() == "/skip" end,
+    }))
+    app:get("/skip", function (ctx: mk.Context) ctx:send_string("[" .. ctx:request_id() .. "]") end)
+    local response = call(app, "GET", "/skip")
+    expect(response.body == "[]" and response:header("X-Request-ID") == nil, "skipped request has no id")
+  end)
+  context:run("rejects_invalid_header_names", function (_: test.Context)
+    expect(raises(function () requestid.new(requestid.Config { header = "X Trace" }) end) ==
+      "requestid: header must be an HTTP token", "header with a space")
+  end)
+end
+
+------------------------------------------------------------------------------
+-- responsetime
+
+local function valid_duration(text: string?): boolean
+  return text ~= nil and strings.match(text, "^[0-9]+[.][0-9][0-9][0-9]ms$") ~= nil
+end
+
+function test_responsetime_header(context: test.Context)
+  local app = mk.App()
+  app:use(responsetime.new(responsetime.Config {
+    next = function (ctx: mk.Context): boolean return ctx:query_opt("skip") ~= nil end,
+  }))
+  app:use_path("/custom", responsetime.new(responsetime.Config { header = "Server-Timing-Ms" }))
+  app:get("/buffered", function (ctx: mk.Context)
+    timer.sleep(5)
+    ctx:send_string("buffered")
+  end)
+  app:get("/error", function (_: mk.Context) raise mk.HttpError(418) end)
+  app:get("/stream", function (ctx: mk.Context)
+    ctx:write_chunk("one,")
+    ctx:write_chunk("two")
+  end)
+  app:get("/custom/x", ok_handler)
+  context:run("buffered", function (_: test.Context)
+    local response = call(app, "GET", "/buffered")
+    local header = response:header("X-Response-Time")
+    expect(valid_duration(header), "duration header: " .. (header or "nil"))
+    local elapsed = strings.sub(header as string, 1, -3)
+    expect((json.decode(elapsed) as float) >= 5.0, "measures the handler: " .. elapsed)
+  end)
+  context:run("error_handler_response", function (_: test.Context)
+    local response = call(app, "GET", "/error")
+    expect(response.status == 418 and valid_duration(response:header("X-Response-Time")), "error response")
+  end)
+  context:run("streamed_response", function (_: test.Context)
+    local response = call(app, "GET", "/stream")
+    expect(response.body == "one,two" and valid_duration(response:header("X-Response-Time")), "stream")
+  end)
+  context:run("custom_header_and_next", function (_: test.Context)
+    expect(valid_duration(call(app, "GET", "/custom/x"):header("Server-Timing-Ms")), "custom header")
+    local skipped = call(app, "GET", "/buffered?skip=1")
+    expect(skipped.body == "buffered" and skipped:header("X-Response-Time") == nil, "next skips the header")
+  end)
+  context:run("rejects_invalid_header_names", function (_: test.Context)
+    expect(raises(function () responsetime.new(responsetime.Config { header = "" }) end) ==
+      "responsetime: header must be an HTTP token", "empty header")
+  end)
+end
+
+------------------------------------------------------------------------------
+-- recover
+
+local function recovering_app(config: recover.Config?, seen: {mk.HttpError}): mk.App
+  local app = mk.App(mk.Config {
+    error_handler = function (ctx: mk.Context, failure: mk.HttpError)
+      seen[#seen + 1] = failure
+      ctx:status(failure.status):send_string((failure.code or "-") .. ": " .. failure.message)
+    end,
+  })
+  app:use(recover.new(config))
+  app:get("/crash", function (_: mk.Context) raise "boom" end)
+  app:get("/teapot", function (_: mk.Context) raise mk.HttpError(418, "short and stout", "teapot") end)
+  app:get("/slow", function (_: mk.Context) timer.sleep(5000) end)
+  return app
+end
+
+function test_recover_converts_failures(context: test.Context)
+  context:run("unexpected_failure_becomes_500", function (_: test.Context)
+    local seen: {mk.HttpError} = {}
+    local response = call(recovering_app(nil, seen), "GET", "/crash")
+    expect(response.status == 500 and response.body == "internal_error: Internal Server Error",
+      "500 response: " .. response.body)
+    expect(#seen == 1 and strings.find(strings.tostring(seen[1].cause), "boom") ~= nil, "cause kept")
+  end)
+  context:run("http_errors_pass_through", function (_: test.Context)
+    local seen: {mk.HttpError} = {}
+    local response = call(recovering_app(nil, seen), "GET", "/teapot")
+    expect(response.status == 418 and response.body == "teapot: short and stout", "HttpError unchanged")
+    expect(#seen == 1 and seen[1].cause == nil, "not wrapped")
+  end)
+  context:run("cancellation_propagates", function (_: test.Context)
+    local seen: {mk.HttpError} = {}
+    local app = recovering_app(nil, seen)
+    local timed_out = app:test(mk.TestRequest("GET", "/slow", nil, nil, nil),
+      mk.TestConfig { timeout_ms = 30, fail_on_timeout = false })
+    expect(timed_out.status == 0 and #seen == 0, "task cancellation leaves no 500 response")
+  end)
+  context:run("exception_handler_and_stack_trace_handler", function (_: test.Context)
+    local seen: {mk.HttpError} = {}
+    local traced = ""
+    local app = recovering_app(recover.Config {
+      enable_stack_trace = true,
+      stack_trace_handler = function (_: mk.Context, failure: value, trace: string)
+        traced = strings.tostring(failure) .. "\n" .. trace
+      end,
+      exception_handler = function (_: mk.Context, failure: value, trace: string): mk.HttpError
+        return mk.HttpError(503, "busy", "busy", failure)
+      end,
+    }, seen)
+    local response = call(app, "GET", "/crash")
+    expect(response.status == 503 and response.body == "busy: busy", "mapped error: " .. response.body)
+    expect(strings.find(traced, "boom") ~= nil and strings.find(traced, "middleware_core_test.titan") ~= nil,
+      "trace handler received failure and traceback: " .. traced)
+  end)
+  context:run("default_stack_trace_logs", function (_: test.Context)
+    local lines: {string} = {}
+    local sink = log.Logger.new("debug", function (text: string) lines[#lines + 1] = text end)
+    local app = mk.App(mk.Config { logger = sink })
+    app:use(recover.new(recover.Config { enable_stack_trace = true }))
+    app:get("/crash/:id", function (_: mk.Context) raise "logged boom" end)
+    expect(call(app, "GET", "/crash/7").status == 500, "converted")
+    sink:close()
+    local found = records(lines, "panic_recovered")
+    expect(#found == 1 and found[1]["route"] == "/crash/:id" and found[1]["level"] == "error" and
+      strings.find(found[1]["error"] as string, "logged boom") ~= nil and
+      #(found[1]["traceback"] as string) > 0, "panic_recovered line: " .. (lines[1] or "none"))
+  end)
+  context:run("next_skips_recovery", function (_: test.Context)
+    local app = mk.App()
+    app:use(recover.new(recover.Config { next = function (_: mk.Context): boolean return true end }))
+    app:get("/crash", function (_: mk.Context) raise "unrecovered" end)
+    expect(strings.find(raises(function () call(app, "GET", "/crash") end), "unrecovered") ~= nil,
+      "the failure escapes")
+  end)
+end
+
+function test_timeout_around_recover(_: test.Context)
+  local app = mk.App()
+  app:use(timeout.middleware(20))
+  app:use(recover.new())
+  app:get("/slow", function (_: mk.Context) timer.sleep(5000) end)
+  local response = call(app, "GET", "/slow")
+  expect(response.status == 503, "the deadline's cancellation passes through recover: " .. response.status)
+end
+
+function test_recover_live_and_on_workers(context: test.Context)
+  context:run("pool_worker_failure_becomes_500", function (_: test.Context)
+    local app = mk.App()
+    app:use(recover.new())
+    app:get("/crash", crash_handler):workers(mk.WorkerMode.pool())
+    local server = app:listen_test()
+    defer server:close()
+    within(5000, "worker crash", function ()
+      local text = fetch_once(server.host, server.port, "GET /crash HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+      expect(status_of(text) == "500", "worker 500: " .. text)
+    end)
+  end)
+  context:run("shutdown_cancellation_is_not_recovered", function (_: test.Context)
+    local entered = false
+    local app = mk.App(mk.Config { shutdown_timeout_ms = 30 })
+    app:use(recover.new())
+    app:get("/hang", function (_: mk.Context)
+      entered = true
+      timer.sleep(60000)
+    end)
+    local server = app:listen_test()
+    defer server:close()
+    local client = async.run<|string, value|>(function (): string
+      return fetch_once(server.host, server.port, "GET /hang HTTP/1.1\r\nHost: t\r\n\r\n")
+    end)
+    within(3000, "handler entry", function ()
+      while not entered do timer.yield() end
+    end)
+    within(5000, "shutdown", function () server:close() end)
+    within(3000, "client", function ()
+      local text = ""
+      case async.join(client)
+      when succeeded(result) then text = result
+      else
+      end
+      expect(text == "", "the cancelled request was aborted without a 500: " .. text)
+    end)
+  end)
+end
+
+------------------------------------------------------------------------------
+-- logger
+
+local function capture(level: string): (log.Logger, {string})
+  local lines: {string} = {}
+  return log.Logger.new(level, function (text: string) lines[#lines + 1] = text end), lines
+end
+
+function test_logger_completion(context: test.Context)
+  local sink, lines = capture("info")
+  local app = mk.App(mk.Config {
+    logger = sink,
+    error_handler = function (ctx: mk.Context, failure: mk.HttpError)
+      ctx:status(failure.status == 404 and 410 or failure.status):send_string("handled")
+    end,
+  })
+  app:use(requestid.new())
+  app:use(logger.new())
+  app:get("/users/:id", ok_handler)
+  app:get("/conflict", function (_: mk.Context) raise mk.HttpError(409, "taken", "duplicate") end)
+  local response = call(app, "GET", "/users/42?secret=LEAK", {"X-Request-ID", "req-1"})
+  expect(response.status == 200, "request served")
+  expect(call(app, "GET", "/LEAK_PATH").status == 410, "unmatched request handled")
+  expect(call(app, "GET", "/conflict").status == 409, "error request handled")
+  expect(call(app, "PROPFIND", "/users/1").status == 405, "unknown method handled")
+  sink:close()
+  local found = records(lines, "http_request")
+  context:run("one_line_per_request", function (_: test.Context)
+    expect(#found == 4, "four lines: " .. #found)
+  end)
+  context:run("route_status_and_request_id", function (_: test.Context)
+    local first = found[1]
+    expect(first["method"] == "GET" and first["route"] == "/users/:id" and first["status"] == 200 and
+      first["request_id"] == "req-1" and first["level"] == "info", "matched request line: " .. lines[1])
+    expect((first["latency_ms"] as float) >= 0.0 and first["path"] == nil, "latency, no path")
+  end)
+  context:run("final_status_after_the_error_handler", function (_: test.Context)
+    expect(found[2]["route"] == "<unmatched>" and found[2]["status"] == 410, "unmatched: " .. lines[2])
+    expect(found[3]["status"] == 409 and found[3]["error_code"] == "duplicate", "error code: " .. lines[3])
+  end)
+  context:run("unknown_methods_are_categorized", function (_: test.Context)
+    expect(found[4]["method"] == "OTHER", "PROPFIND logged as OTHER")
+  end)
+  context:run("no_request_contents", function (_: test.Context)
+    for index = 1, #lines do
+      expect(strings.find(lines[index], "LEAK") == nil and strings.find(lines[index], "PROPFIND") == nil,
+        "line leaks request contents: " .. lines[index])
+    end
+  end)
+end
+
+function test_logger_options(context: test.Context)
+  context:run("path_extra_fields_level_event_and_skip", function (_: test.Context)
+    local sink, lines = capture("debug")
+    local app = mk.App(mk.Config { logger = sink })
+    app:use(logger.new(logger.Config {
+      level = "debug", event = "access", include_path = true, include_request_id = false,
+      skip = function (ctx: mk.Context): boolean return ctx:query_opt("quiet") ~= nil end,
+      extra_fields = function (ctx: mk.Context): {string: value}?
+        return {["tenant"] = ctx:get("X-Tenant", "none"), ["method"] = "spoofed"}
+      end,
+    }))
+    app:get("/items/:id", ok_handler)
+    call(app, "GET", "/items/9", {"X-Tenant", "acme", "X-Request-ID", "ignored"})
+    call(app, "GET", "/items/9?quiet=1")
+    sink:close()
+    local found = records(lines, "access")
+    expect(#found == 1, "skip suppressed one line: " .. #found)
+    local line = found[1]
+    expect(line["level"] == "debug" and line["path"] == "/items/9" and line["tenant"] == "acme" and
+      line["method"] == "GET" and line["request_id"] == nil, "configured line: " .. lines[1])
+  end)
+  context:run("logger_level_filters_lines", function (_: test.Context)
+    local sink, lines = capture("info")
+    local app = mk.App(mk.Config { logger = sink })
+    app:use(logger.new(logger.Config { level = "debug" }))
+    app:get("/", ok_handler)
+    call(app, "GET", "/")
+    sink:close()
+    expect(#lines == 0, "debug lines are below the app logger level")
+  end)
+  context:run("next_skips_the_middleware", function (_: test.Context)
+    local sink, lines = capture("info")
+    local app = mk.App(mk.Config { logger = sink })
+    app:use(logger.new(logger.Config { next = function (_: mk.Context): boolean return true end }))
+    app:get("/", ok_handler)
+    call(app, "GET", "/")
+    sink:close()
+    expect(#lines == 0, "no line")
+  end)
+  context:run("invalid_configuration", function (_: test.Context)
+    expect(raises(function () logger.new(logger.Config { level = "loud" }) end) ==
+      "logger: level must be error, warn, info, or debug", "bad level")
+    expect(raises(function () logger.new(logger.Config { event = "" }) end) ==
+      "logger: event must not be empty", "empty event")
+  end)
+  context:run("failures_propagate_untouched", function (_: test.Context)
+    local sink, lines = capture("info")
+    local app = mk.App(mk.Config { logger = sink })
+    local observed = ""
+    app:use(function (ctx: mk.Context)
+      do
+        ctx:next()
+      catch
+        if error is mk.HttpError then observed = "http " .. (error as mk.HttpError).status end
+        raise
+      end
+    end)
+    app:use(logger.new())
+    app:get("/gone", function (_: mk.Context) raise mk.HttpError(410) end)
+    app:get("/crash", function (_: mk.Context) raise "plain failure" end)
+    expect(call(app, "GET", "/gone").status == 410 and observed == "http 410", "outer middleware saw the HttpError")
+    expect(strings.find(raises(function () call(app, "GET", "/crash") end), "plain failure") ~= nil,
+      "unexpected failures escape the logger")
+    sink:close()
+    local found = records(lines, "http_request")
+    expect(#found == 2 and found[1]["status"] == 410, "both requests logged: " .. #found)
+  end)
+end
+
+function test_logger_completion_early_failures(_: test.Context)
+  local sink, lines = capture("info")
+  local app = mk.App(mk.Config { logger = sink })
+  app:use(logger.new())
+  app:use(function (ctx: mk.Context)
+    if ctx:get("Origin", "") == "https://evil.invalid" then raise mk.HttpError(403) end
+    ctx:next()
+  end)
+  app:get("/clients/:id", ok_handler)
+  app:get("/crash", crash_handler)
+  app:get("/relay", whoami):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = required_sid }))
+  expect(call(app, "GET", "/clients/2", {"Origin", "https://evil.invalid"}).status == 403, "rejected early")
+  expect(call(app, "GET", "/relay").status == 400, "session pre-dispatch failure")
+  expect(strings.find(raises(function () call(app, "GET", "/crash") end), "worker crash") ~= nil, "crash escapes")
+  sink:close()
+  local found = records(lines, "http_request")
+  expect(#found == 3, "three lines: " .. #found)
+  expect(found[1]["route"] == "/clients/:id" and found[1]["status"] == 403, "early rejection: " .. lines[1])
+  expect(found[2]["route"] == "/relay" and found[2]["status"] == 400 and found[2]["error_code"] == "missing_sid",
+    "pre-dispatch failure: " .. lines[2])
+  expect(found[3]["route"] == "/crash" and found[3]["aborted"] == true, "crash: " .. lines[3])
+end
+
+function test_logger_sinks_never_fail_requests(context: test.Context)
+  context:run("full_or_closed_sink_channel", function (_: test.Context)
+    local tx, rx = thread.channel<|string|>(1)
+    local app = mk.App()
+    app:use(logger.new(logger.Config { sink_sender = tx }))
+    app:get("/", ok_handler)
+    expect(call(app, "GET", "/").status == 200, "first line fills the channel")
+    expect(call(app, "GET", "/").status == 200, "a full channel drops the line")
+    local ok, line? = rx:try_receive()
+    expect(ok and line ~= nil and strings.find(line as string, "\"event\":\"http_request\"") ~= nil, "buffered line")
+    local again, missing? = rx:try_receive()
+    expect(not again and missing == nil, "the second line was dropped")
+    rx:close()
+    expect(call(app, "GET", "/").status == 200, "a closed channel drops the line")
+  end)
+  context:run("no_logger_configured", function (_: test.Context)
+    local app = mk.App()
+    app:use(logger.new())
+    app:get("/", ok_handler)
+    expect(call(app, "GET", "/").body == "ok", "logging disabled passes through")
+  end)
+end
+
+function test_logger_admission(context: test.Context)
+  local sink, lines = capture("info")
+  local app = mk.App(mk.Config { logger = sink })
+  app:use(logger.new(logger.Config { phase = logger.PHASE_ADMISSION }))
+  app:use(function (ctx: mk.Context)
+    if ctx:get("Origin", "") == "https://evil.invalid" then raise mk.HttpError(403) end
+    ctx:next()
+  end)
+  local order: {string} = {}
+  app:get("/clients/:id", function (ctx: mk.Context)
+    order[#order + 1] = "handler"
+    ctx:send_string("ok")
+  end)
+  app:get("/relay", whoami):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = required_sid }))
+  call(app, "GET", "/clients/1")
+  expect(call(app, "GET", "/clients/2", {"Origin", "https://evil.invalid"}).status == 403, "rejected early")
+  expect(call(app, "GET", "/relay").status == 400, "session pre-dispatch failure")
+  call(app, "GET", "/nowhere")
+  sink:close()
+  local found = records(lines, "http_request")
+  context:run("one_line_per_request_with_the_classified_route", function (_: test.Context)
+    expect(#found == 4, "four admission lines: " .. #found)
+    expect(found[1]["route"] == "/clients/:id" and found[2]["route"] == "/clients/:id",
+      "routes known before the endpoint ran: " .. lines[2])
+    expect(found[3]["route"] == "/relay" and found[4]["route"] == "<unmatched>",
+      "pre-dispatch and unmatched routes")
+  end)
+  context:run("written_before_the_chain_without_status", function (_: test.Context)
+    expect(found[1]["status"] == nil and found[1]["latency_ms"] == nil, "no completion fields")
+    expect(#order == 1, "handler ran once")
+  end)
+end
+
+function test_logger_on_workers(context: test.Context)
+  context:run("forwarded_worker_logger", function (_: test.Context)
+    local sink, lines = capture("info")
+    local app = mk.App(mk.Config { logger = sink })
+    app:use(requestid.new())
+    app:use(logger.new())
+    app:get("/pool", whoami):workers(mk.WorkerMode.pool())
+    local server = app:listen_test()
+    defer server:close()
+    within(5000, "pool request", function ()
+      local text = fetch_once(server.host, server.port,
+        "GET /pool HTTP/1.1\r\nHost: t\r\nX-Request-ID: pool-1\r\nConnection: close\r\n\r\n")
+      expect(status_of(text) == "200" and body_of(text) ~= "worker 0 id pool-1" and
+        strings.sub(body_of(text), -9) == "id pool-1", "worker response: " .. text)
+      expect(header_line(text, "X-Request-ID") == "pool-1", "requestid ran on the worker")
+    end)
+    server:close()
+    sink:close()
+    local found = records(lines, "http_request")
+    expect(#found == 1 and found[1]["route"] == "/pool" and found[1]["request_id"] == "pool-1" and
+      (found[1]["worker_id"] as integer) > 0, "worker line forwarded: " .. (lines[1] or "none"))
+  end)
+  context:run("sink_sender_on_a_session_worker", function (_: test.Context)
+    local tx, rx = thread.channel<|string|>(16)
+    local app = mk.App()
+    app:use(logger.new(logger.Config { sink_sender = tx, phase = logger.PHASE_ADMISSION }))
+    app:use(responsetime.new())
+    app:get("/relay", whoami):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = required_sid }))
+    local server = app:listen_test()
+    defer server:close()
+    within(5000, "session request", function ()
+      local text = fetch_once(server.host, server.port,
+        "GET /relay?sid=a HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+      expect(status_of(text) == "200" and valid_duration(header_line(text, "X-Response-Time")),
+        "session response with responsetime: " .. text)
+      local line = ""
+      while line == "" do
+        local ok, received? = rx:try_receive()
+        if ok and received ~= nil then line = received else timer.sleep(5) end
+      end
+      local fields = json.decode(line) as {string: value}
+      expect(fields["event"] == "http_request" and fields["route"] == "/relay" and
+        (fields["worker_id"] as integer) > 0, "session worker sent its line: " .. line)
+    end)
+  end)
+end

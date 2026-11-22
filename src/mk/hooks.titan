@@ -1,0 +1,80 @@
+-- Registration and lifecycle hook observers.
+
+--- Data published to `on_listen` observers once the listener is bound.
+record ListenData
+  const host: string
+  const port: integer
+  const tls: boolean
+  const app_name: string
+  const handler_count: integer
+  const pid: integer
+end
+
+--- Snapshot of one registered endpoint route.
+record RouteInfo
+  const method: string
+  const path: string
+  const name: string
+  const group_prefix: string
+  const params: const {string}
+end
+
+--- Snapshot of one created Group.
+record GroupInfo
+  const prefix: string
+  const name: string
+end
+
+--- Supervision snapshot of one pool or session worker thread.
+record WorkerInfo
+  const id: integer
+  const session_id: string?
+  const alive: boolean
+end
+
+--- Ordered observers for registration and lifecycle events.
+record Hooks
+  local route_hooks: {function (RouteInfo): ()}
+  local name_hooks: {function (RouteInfo): ()}
+  local group_hooks: {function (GroupInfo): ()}
+  local listen_hooks: {function (ListenData): ()}
+  local pre_shutdown_hooks: {function (): ()}
+  local post_shutdown_hooks: {function (async.Error?): ()}
+end
+
+local function Hooks.new(): Hooks
+  return {
+    route_hooks = {}, name_hooks = {}, group_hooks = {}, listen_hooks = {},
+    pre_shutdown_hooks = {}, post_shutdown_hooks = {},
+  }
+end
+
+--- Observe each endpoint route as it is registered.
+function Hooks:on_route(fn: function (RouteInfo): ())
+  self.route_hooks[#self.route_hooks + 1] = fn
+end
+
+--- Observe each `RouteHandle:name(...)` assignment.
+function Hooks:on_name(fn: function (RouteInfo): ())
+  self.name_hooks[#self.name_hooks + 1] = fn
+end
+
+--- Observe each Group as it is created.
+function Hooks:on_group(fn: function (GroupInfo): ())
+  self.group_hooks[#self.group_hooks + 1] = fn
+end
+
+--- Observe the bound listener after `App:start`.
+function Hooks:on_listen(fn: function (ListenData): ())
+  self.listen_hooks[#self.listen_hooks + 1] = fn
+end
+
+--- Run after the listener closes and before active requests drain.
+function Hooks:on_pre_shutdown(fn: function (): ())
+  self.pre_shutdown_hooks[#self.pre_shutdown_hooks + 1] = fn
+end
+
+--- Run last during shutdown with the first recorded shutdown failure, if any.
+function Hooks:on_post_shutdown(fn: function (async.Error?): ())
+  self.post_shutdown_hooks[#self.post_shutdown_hooks + 1] = fn
+end

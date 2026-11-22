@@ -1,0 +1,350 @@
+local async = import "async"
+local json = import "json"
+local log = import "mk.log"
+local strings = import "string"
+local test = import "test"
+local thread = import "thread"
+
+local function decode_line(line: string): {string: value}
+  test.assert(strings.sub(line, -1) == "\n", "log line is not newline-terminated")
+  return json.decode(line) as {string: value}
+end
+
+local function expect_raise(action: function (): (), expected: string)
+  local raised = false
+  do
+    action()
+  catch
+    raised = true
+    test.assert(error == expected, "raised " .. strings.tostring(error) .. ", expected " .. expected)
+  end
+  test.assert(raised, "operation did not raise " .. expected)
+end
+
+-- A sink that records every delivered line.
+local function capture(lines: {string}): function (string): ()
+  return function (text: string) lines[#lines + 1] = text end
+end
+
+local function count_events(lines: {string}, event: string): integer
+  local count = 0
+  for index = 1, #lines do
+    if decode_line(lines[index])["event"] == event then count = count + 1 end
+  end
+  return count
+end
+
+local function dropped_total(lines: {string}): integer
+  local total = 0
+  for index = 1, #lines do
+    local entry = decode_line(lines[index])
+    if entry["event"] == "log_dropped" then
+      test.assert(entry["level"] == "error", "log_dropped must be an error record")
+      total = total + (entry["count"] as integer)
+    end
+  end
+  return total
+end
+
+-- Every line currently buffered in a channel, in order.
+local function drain_channel(rx: thread.Receiver<|string|>): {string}
+  local lines: {string} = {}
+  while true do
+    local ok, line? = rx:try_receive()
+    if not ok then return lines end
+    lines[#lines + 1] = line
+  end
+  return lines
+end
+
+-- Lets ready Tasks (such as a Logger's writer) run to their next suspension.
+local function settle()
+  for _ = 1, 10 do async.yield() end
+end
+
+function test_resolve_level(context: test.Context)
+  context:run("defaults_to_info", function(_child: test.Context)
+    test.assert(log.resolve_level(nil) == "info")
+    test.assert(log.resolve_level(nil, false) == "info")
+  end)
+  context:run("four_levels_by_default", function(_child: test.Context)
+    test.assert(log.resolve_level("error") == "error")
+    test.assert(log.resolve_level("warn") == "warn")
+    test.assert(log.resolve_level("info") == "info")
+    test.assert(log.resolve_level("debug") == "debug")
+    expect_raise(function() log.resolve_level("trace") end,
+      "log level must be error, warn, info, or debug")
+    expect_raise(function() log.resolve_level("verbose", true, "APP_LOG_LEVEL") end,
+      "APP_LOG_LEVEL must be error, warn, info, or debug")
+  end)
+  context:run("strict_three_levels", function(_child: test.Context)
+    test.assert(log.resolve_level("error", false, "RELAY_LOG_LEVEL") == "error")
+    test.assert(log.resolve_level("debug", false, "RELAY_LOG_LEVEL") == "debug")
+    expect_raise(function() log.resolve_level("warn", false, "RELAY_LOG_LEVEL") end,
+      "RELAY_LOG_LEVEL must be error, info, or debug")
+    expect_raise(function() log.resolve_level("loud", false) end,
+      "log level must be error, info, or debug")
+  end)
+end
+
+function test_format_line(context: test.Context)
+  context:run("fieldless_envelope", function(_child: test.Context)
+    local entry = decode_line(log.format_line("info", "started"))
+    test.assert(entry["event"] == "started" and entry["level"] == "info")
+    local timestamp = entry["timestamp"] as string
+    test.assert(#timestamp == 20 and strings.match(timestamp,
+      "^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$") ~= nil,
+      "timestamp is not ISO-8601 UTC: " .. timestamp)
+  end)
+  context:run("fields_cannot_replace_envelope", function(_child: test.Context)
+    local fields: {string: value} = {["event"] = "spoofed", ["level"] = "debug",
+      ["timestamp"] = "never", ["count"] = 3}
+    local entry = decode_line(log.format_line("warn", "real", fields))
+    test.assert(entry["event"] == "real" and entry["level"] == "warn")
+    test.assert(entry["timestamp"] ~= "never" and entry["count"] == 3)
+    test.assert(fields["event"] == "spoofed", "format_line mutated the caller's fields")
+  end)
+  context:run("json_escaping", function(_child: test.Context)
+    local text = "quote\" backslash\\ newline\n tab\t caf\xC3\xA9"
+    local line = log.format_line("info", "escaped", {["text"] = text})
+    test.assert(strings.find(line, "\n") == #line, "an embedded newline was not escaped")
+    test.assert(decode_line(line)["text"] == text)
+  end)
+  context:run("line_cap", function(_child: test.Context)
+    local limit = log.MAX_LINE_BYTES
+    test.assert(limit == 16384)
+    local fits = log.format_line("info", "e", {["pad"] = strings.rep("a", 16000)})
+    test.assert(#fits <= limit + 1)
+    local raised = false
+    do
+      log.format_line("info", "e", {["pad"] = strings.rep("a", limit)})
+    catch
+      raised = true
+      test.assert(error is json.Error, "oversized line raised a non-json.Error")
+    end
+    test.assert(raised, "oversized line was encoded")
+  end)
+end
+
+function test_logger_levels_and_close(_context: test.Context)
+  local lines: {string} = {}
+  local logger = log.Logger("info", capture(lines))
+  test.assert(logger:level() == "info")
+  logger:debug("hidden")
+  logger:info("shown", {["n"] = 1})
+  logger:warn("warned")
+  logger:error("failed")
+  log.emit(logger, "info", "through_helper")
+  log.emit(nil, "error", "nobody_listens")
+  logger:close()
+  logger:close()
+  test.assert(#lines == 4, "expected four delivered lines, got " .. #lines)
+  test.assert(decode_line(lines[1])["event"] == "shown")
+  test.assert(decode_line(lines[1])["n"] == 1)
+  test.assert(decode_line(lines[2])["level"] == "warn")
+  test.assert(decode_line(lines[3])["event"] == "failed")
+  test.assert(decode_line(lines[4])["event"] == "through_helper")
+  logger:info("after_close")
+  test.assert(#lines == 4, "closed logger accepted a record")
+end
+
+function test_logger_level_names(_context: test.Context)
+  local levels: {string} = {"error", "warn", "info", "debug"}
+  for index = 1, #levels do
+    local logger = log.Logger(levels[index], capture({}))
+    test.assert(logger:level() == levels[index], "level() did not round-trip " .. levels[index])
+    logger:close()
+  end
+  local default = log.Logger(nil, capture({}))
+  test.assert(default:level() == "info")
+  default:close()
+  expect_raise(function() log.Logger("loud") end, "log level must be error, warn, info, or debug")
+  expect_raise(function() log.Logger("info", nil, 0) end, "log queue capacity must be positive")
+end
+
+function test_queue_overflow_is_counted(_context: test.Context)
+  local lines: {string} = {}
+  local logger = log.Logger("debug", capture(lines), 2)
+  -- No suspension between admissions: the writer cannot drain yet.
+  for index = 1, 5 do logger:info("item", {["index"] = index}) end
+  logger:close()
+  test.assert(count_events(lines, "item") == 2, "capacity admitted the wrong number of records")
+  test.assert(dropped_total(lines) == 3, "dropped records were not reported exactly")
+  local order: {integer} = {}
+  for index = 1, #lines do
+    local entry = decode_line(lines[index])
+    if entry["event"] == "item" then order[#order + 1] = entry["index"] as integer end
+  end
+  test.assert(order[1] == 1 and order[2] == 2, "admitted records were reordered")
+end
+
+function test_rejected_records_are_counted(_context: test.Context)
+  local lines: {string} = {}
+  local logger = log.Logger("debug", capture(lines))
+  logger:emit("loud", "unknown_level")
+  logger:info("bad_utf8", {["text"] = "\xFF"})
+  logger:info("oversized", {["pad"] = strings.rep("a", log.MAX_LINE_BYTES)})
+  local cycle: {string: value} = {}
+  cycle["self"] = cycle
+  logger:info("cycle", cycle)
+  logger:info("kept")
+  logger:close()
+  test.assert(count_events(lines, "kept") == 1)
+  test.assert(dropped_total(lines) == 4, "rejected records were not reported exactly")
+end
+
+function test_accept_preencoded_lines(_context: test.Context)
+  local lines: {string} = {}
+  local logger = log.Logger("error", capture(lines))
+  logger:accept(log.format_line("debug", "worker_line"))
+  logger:accept(strings.rep("x", log.MAX_LINE_BYTES + 2))
+  logger:close()
+  test.assert(count_events(lines, "worker_line") == 1, "accept applied the level filter or lost the line")
+  test.assert(dropped_total(lines) == 1, "oversized accepted line was not dropped")
+end
+
+function test_sink_failure_disables_logger(_context: test.Context)
+  local calls = 0
+  local logger = log.Logger("info", function (_: string)
+    calls = calls + 1
+    raise "sink is broken"
+  end)
+  logger:info("first")
+  logger:info("second")
+  logger:close()
+  test.assert(calls == 1, "a failed sink was called again")
+  logger:info("after_failure")
+  test.assert(calls == 1)
+end
+
+-- A sink that yields once per line keeps the writer busy across Task switches.
+local function slow_capture(lines: {string}): function (string): ()
+  return function (text: string)
+    async.yield()
+    lines[#lines + 1] = text
+  end
+end
+
+local function wait_finished(task: async.Task<|nil, value|>)
+  for _ = 1, 100 do
+    if task:status():has_finished() then return end
+    async.yield()
+  end
+  test.assert(false, "close Task never finished")
+end
+
+function test_close_survives_caller_cancellation(_context: test.Context)
+  local lines: {string} = {}
+  local logger = log.Logger("info", slow_capture(lines))
+  for _ = 1, 3 do logger:info("pending") end
+  local closer = async.run<|nil, value|>(function (): nil
+    logger:close()
+    return nil
+  end)
+  async.yield()
+  test.assert(not closer:status():has_finished(), "close returned before the writer drained")
+  closer:cancel()
+  wait_finished(closer)
+  test.assert(count_events(lines, "pending") == 3, "close returned before every queued record")
+end
+
+function test_concurrent_close_waits_for_drain(_context: test.Context)
+  local lines: {string} = {}
+  local logger = log.Logger("info", slow_capture(lines))
+  for _ = 1, 3 do logger:info("pending") end
+  local delivered_when_closed: {integer} = {}
+  local closer = function (): async.Task<|nil, value|>
+    return async.run<|nil, value|>(function (): nil
+      logger:close()
+      delivered_when_closed[#delivered_when_closed + 1] = #lines
+      return nil
+    end)
+  end
+  local first = closer()
+  async.yield()
+  local second = closer()
+  wait_finished(first)
+  wait_finished(second)
+  test.assert(#delivered_when_closed == 2)
+  test.assert(delivered_when_closed[1] == 3 and delivered_when_closed[2] == 3,
+    "a close call returned before the writer finished")
+end
+
+function test_forward_to_channel(context: test.Context)
+  context:run("absent_sender", function(_child: test.Context)
+    test.assert(log.forward("info", nil) == nil)
+  end)
+  context:run("delivers_lines", function(_child: test.Context)
+    local tx, rx = thread.channel<|string|>(8)
+    defer do
+      tx:close()
+      rx:close()
+    end
+    local logger = log.forward("info", tx)
+    test.assert(logger:level() == "info")
+    logger:info("hello", {["worker"] = 2})
+    logger:debug("filtered")
+    logger:close()
+    local delivered = drain_channel(rx)
+    test.assert(#delivered == 1, "expected exactly one forwarded line")
+    local entry = decode_line(delivered[1])
+    test.assert(entry["event"] == "hello" and entry["worker"] == 2)
+  end)
+  context:run("reports_lost_lines_on_close", function(_child: test.Context)
+    local tx, rx = thread.channel<|string|>(1)
+    defer do
+      tx:close()
+      rx:close()
+    end
+    local logger = log.forward("info", tx)
+    logger:info("one")
+    logger:info("two")
+    logger:info("three")
+    settle()
+    local first = drain_channel(rx)
+    test.assert(#first == 1 and decode_line(first[1])["event"] == "one")
+    logger:close()
+    local rest = drain_channel(rx)
+    test.assert(#rest == 1, "close did not flush the lost-line report")
+    local report = decode_line(rest[1])
+    test.assert(report["event"] == "log_dropped" and report["count"] == 2,
+      "expected a log_dropped count of 2")
+  end)
+  context:run("bulk_overflow_keeps_exact_count", function(_child: test.Context)
+    local tx, rx = thread.channel<|string|>(1)
+    defer do
+      tx:close()
+      rx:close()
+    end
+    test.assert(tx:try_send("prefill"))
+    local logger = log.forward("debug", tx)
+    -- 1024 lines fill the Logger queue and 6 more overflow it; the full
+    -- channel then refuses all 1024 queued lines.
+    for index = 1, 1030 do logger:debug("bulk", {["index"] = index}) end
+    settle()
+    local before = drain_channel(rx)
+    test.assert(#before == 1 and before[1] == "prefill", "a refused line reached the channel")
+    logger:close()
+    local after = drain_channel(rx)
+    test.assert(#after == 1, "close did not report the dropped lines")
+    local report = decode_line(after[1])
+    test.assert(report["event"] == "log_dropped" and report["count"] == 1030,
+      "expected a log_dropped count of 1030, got " .. strings.tostring(report["count"]))
+  end)
+  context:run("closed_channel_disables_logger", function(_child: test.Context)
+    local tx, rx = thread.channel<|string|>(4)
+    defer rx:close()
+    local logger = log.forward("info", tx)
+    tx:close()
+    logger:info("into_closed_channel")
+    settle()
+    logger:info("after_failure")
+    logger:close()
+    test.assert(#drain_channel(rx) == 0)
+  end)
+end
+
+function test_fatal_never_raises(_context: test.Context)
+  -- Invalid UTF-8 cannot be encoded; fatal must swallow that failure silently.
+  log.fatal("startup_failed", "\xFF", {["detail"] = "\xFE"})
+end

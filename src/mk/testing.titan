@@ -1,0 +1,217 @@
+-- In-memory App:test and loopback App:listen_test.
+
+--- One in-memory test request.
+record TestRequest
+  const method: string
+  const target: string
+  const headers: http.Headers?
+  const body: string?
+  const tls: boolean?
+end
+
+--- In-memory test options.
+-- @field timeout_ms Handler deadline (default 1000; 0 disables).
+-- @field fail_on_timeout Raise on timeout (default true); otherwise return what was committed.
+record TestConfig
+  const timeout_ms: integer?
+  const fail_on_timeout: boolean?
+end
+
+--- A captured response.
+record TestResponse
+  const status: integer
+  const headers: http.Headers
+  const body: string
+end
+
+--- First response header value, or nil.
+function TestResponse:header(name: string): string?
+  return self.headers:get(name)
+end
+
+--- Decode the body as JSON.
+function TestResponse:json(schema: reflect.Type?, ...: json.DecodeOption): value
+  return json.decode(self.body, schema, ...)
+end
+
+--- A started loopback server with its own HTTP client.
+record TestServer
+  const host: string
+  const port: integer
+  const base_url: string
+  local app: App
+  local serve_task: async.Task<|nil, value|>
+  local client: http.Client
+  local closed: boolean
+end
+
+--- Send a request to the server and read the complete response.
+function TestServer:request(method: string, target: string, options: http.RequestOptions?): TestResponse
+  local response = self.client:request(method, self.base_url .. target, options)
+  defer response:close()
+  local body = strings.writer()
+  for chunk in response:read do body:write(chunk) end
+  return TestResponse(response.status, response.headers, body:drain())
+end
+
+--- Close client connections, shut the app down, and join the accept loop.
+function TestServer:close()
+  if self.closed then return end
+  self.closed = true
+  self.client:close()
+  self.app:shutdown()
+  await_terminal(self.serve_task)
+end
+
+local function Context:run_in_memory(): async.Error?
+  local failure: async.Error? = nil
+  do
+    self:execute()
+  catch
+    self:force_abort()
+    if error is async.CancellationReason then
+      self:run_complete_hooks()
+      raise
+    end
+    failure = async.Error(error, traceback)
+  end
+  self:run_complete_hooks()
+  return failure
+end
+
+--- Dispatch `req` strictly in memory on the calling state, without sockets.
+-- Requests that would execute on a pool or session worker raise (use
+-- `App:listen_test`); session-selector errors and nil-session fallbacks to
+-- a parent root still run here. Unexpected handler errors propagate; an
+-- aborted response raises "mk: connection aborted".
+function App:test(req: TestRequest, config: TestConfig?): TestResponse
+  self:freeze()
+  local timeout = 1000
+  local fail_on_timeout = true
+  if config ~= nil then
+    timeout = config.timeout_ms or 1000
+    fail_on_timeout = config.fail_on_timeout ~= false
+  end
+  local headers = http.headers(nil)
+  local supplied? = req.headers
+  if supplied ~= nil then headers = http.headers(supplied:all()) end
+  if headers:get("Host") == nil then headers:set("Host", "example.com") end
+  local body = req.body or ""
+  if body ~= "" and headers:get("Content-Length") == nil and
+      headers:get("Transfer-Encoding") == nil then
+    headers:set("Content-Length", "" .. #body)
+  end
+  local scheme = "http"
+  if req.tls then scheme = "https" end
+  local method = upper_method(req.method)
+  local core = self.core
+  local meta, raw_path, target_error? = core:meta(method, req.target, headers, scheme)
+  local route?, found?, head_fallback = core:classify(method, raw_path)
+  if route ~= nil and found ~= nil then
+    meta.params_map = found.params
+    meta.route_pattern = route.pattern
+  end
+  local chain_id = self.root_dispatcher.id
+  if route ~= nil then chain_id = route.dispatcher_id end
+  local terminal: HttpError? = nil
+  local dispatcher = self.dispatchers[chain_id] as Dispatcher
+  if dispatcher.kind == DISPATCH_SESSION then
+    local session_id: string? = nil
+    do
+      local options = dispatcher.session as SessionOptions
+      session_id = options.session_id(meta)
+    catch
+      if not (error is HttpError) then raise end
+      terminal = error as HttpError
+    end
+    if terminal == nil and session_id == nil and self.root_dispatcher.kind == DISPATCH_SESSION then
+      terminal = HttpError(500, "session selector returned no session for the root dispatcher",
+                           "no_session", nil)
+    end
+    if terminal ~= nil then
+      chain_id = -1
+      dispatcher = self.dispatchers[1] as Dispatcher
+    elseif session_id == nil then
+      dispatcher = self.root_dispatcher
+    end
+  end
+  if dispatcher.kind ~= DISPATCH_PARENT then
+    raise "mk: App:test runs only parent-dispatched requests in memory; " ..
+      "pool and session worker routes need App:listen_test"
+  end
+  local ctx = Context.create(core, meta, raw_path, target_error, chain_id, head_fallback)
+  local capture = TestCapture(200, http.headers(nil), strings.writer(), false, false)
+  ctx.capture = capture
+  ctx.test_body = body
+  ctx.terminal_error = terminal
+  local runner = async.run<|TimeoutOutcome, value|>(function (): TimeoutOutcome
+    ctx.owner_task = async.running()
+    return TimeoutOutcome(ctx:run_in_memory())
+  end)
+  local timed_out = false
+  do
+    defer if not runner:status():has_finished() then
+      runner:cancel(async.CancellationReason.simple("App:test timeout"))
+      await_terminal(runner)
+    end
+    if timeout > 0 then
+      local deadline = async.run<|nil, value|>(function (): nil
+        timer.sleep(timeout)
+        return nil
+      end)
+      defer if not deadline:status():has_finished() then
+        deadline:cancel(async.CancellationReason.simple("App:test finished"))
+        await_terminal(deadline)
+      end
+      case async.race_two(runner, deadline)
+      when second() then timed_out = true
+      else
+      end
+    else
+      async.join(runner)
+    end
+  end
+  if timed_out then
+    if fail_on_timeout then raise "mk: App:test timed out after " .. timeout .. " ms" end
+    if not capture.committed then return TestResponse(0, http.headers(nil), "") end
+    return TestResponse(capture.status, capture.headers, capture.body:drain())
+  end
+  case runner:status()
+  when succeeded(outcome) then
+    local failure? = outcome.failure
+    if failure ~= nil then failure:raise() end
+  when failed(failure) then failure:raise()
+  when cancelled(reason) then raise reason
+  else
+  end
+  if ctx.aborted_flag then raise "mk: connection aborted" end
+  return TestResponse(capture.status, capture.headers, capture.body:drain())
+end
+
+--- Start the app on an OS-assigned loopback port and serve it in a Task.
+function App:listen_test(host: string?, listen_config: ListenConfig?): TestServer
+  local bind_host = host or "127.0.0.1"
+  if strings.sub(bind_host, 1, 1) == "[" and strings.sub(bind_host, -1) == "]" then
+    bind_host = strings.sub(bind_host, 2, #bind_host - 1)
+  end
+  local url_host = bind_host
+  if strings.find(bind_host, ":") then url_host = "[" .. bind_host .. "]" end
+  local scheme = "http"
+  if listen_config ~= nil and listen_config.cert_file ~= nil then scheme = "https" end
+  self:start(url_host .. ":0", listen_config)
+  local port = self.listen_port
+  -- A forced shutdown (for example a pool worker exit) already reached
+  -- on_post_shutdown observers; the test server only stops serving.
+  local serve_task = async.run<|nil, value|>(function (): nil
+    self:serve()
+    return nil
+  catch
+    if error is async.CancellationReason then raise end
+    return nil
+  end)
+  return TestServer {
+    host = bind_host, port = port,
+    base_url = scheme .. "://" .. url_host .. ":" .. port,
+    app = self, serve_task = serve_task, client = http.Client.new(), closed = false,
+  }
+end
