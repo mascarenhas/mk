@@ -11,7 +11,7 @@ local strings = import "string"
 local timer = import "timer"
 local mk = import "mk"
 local static = import "mk.middleware.static"
-local uv = import "uv"
+local path = import "path"
 
 local function within(ms: integer, what: string, action: function (): ())
   local worker = async.run<|nil, value|>(function (): nil
@@ -65,8 +65,7 @@ end
 -- Windows cannot hold `<`/`>` in file names and maps device names such as
 -- `con.txt` to devices, so those fixtures differ there.
 local function running_on_windows(): boolean
-  local status, info? = uv.os_uname()
-  return status == 0 and info ~= nil and info.sysname == "Windows_NT"
+  return path.separator == "\\"
 end
 
 -- A listed file name that needs HTML escaping, and its escaped form.
