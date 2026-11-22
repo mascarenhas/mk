@@ -375,6 +375,44 @@ function test_app_test_session_routes(context: test.Context)
   end)
 end
 
+-- Sessions keyed by the client's port, read from the pre-dispatch metadata.
+local function peer_sid(meta: mk.RequestMeta): string?
+  local peer? = meta:peer_address()
+  if peer == nil then return nil end
+  return "port-" .. peer.port
+end
+
+local function report_peer(ctx: mk.Context)
+  local peer? = ctx:peer_address()
+  local text = "none"
+  if peer ~= nil then text = peer.ip .. ":" .. peer.port end
+  ctx:send_string((ctx:session_id() or "nil") .. " " .. text)
+end
+
+function test_peer_address_on_session_workers(context: test.Context)
+  local app = mk.App()
+  app:get("/who", report_peer):workers(mk.WorkerMode.session(mk.SessionOptions { session_id = peer_sid }))
+  context:run("live_selector_and_worker_see_the_peer", function (_: test.Context)
+    local server = app:listen_test()
+    defer server:close()
+    within(5000, "session peer request", function ()
+      local connection = net.connect(server.host, server.port)
+      defer connection:close()
+      local port = connection:local_address().port
+      connection:write("GET /who HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+      local out = strings.writer()
+      for chunk in connection:read do out:write(chunk) end
+      local text = out:drain()
+      test.assert(status_of(text) == "200" and body_of(text) == "port-" .. port .. " 127.0.0.1:" .. port,
+        "session selected by and reporting the peer: " .. text)
+    end)
+  end)
+  context:run("in_memory_requests_have_no_peer", function (_: test.Context)
+    -- No peer: the selector returns nil and the parent root serves it.
+    test.assert(app:test(mk.TestRequest("GET", "/who")).body == "nil none", "App:test has no peer")
+  end)
+end
+
 function test_pooled_client_survives_retirement(context: test.Context)
   local app = mk.App()
   local persistent = mk.WorkerMode.session(mk.SessionOptions { session_id = query_sid })

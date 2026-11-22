@@ -742,7 +742,7 @@ local function App:deliver(dispatcher: Dispatcher, slot: WorkerSlot, env: Exchan
     end
     target = next_slot
     current = ExchangeEnvelope(payload, current.method, current.target, current.route_id,
-                               current.session_id, current.reroute_preserving_session)
+                               current.session_id, current.reroute_preserving_session, current.peer)
   end
 end
 
@@ -767,12 +767,31 @@ local function App:run_in_place(meta: RequestMeta, raw_path: string, target_erro
   self.core:run_live(ctx)
 end
 
+-- The client's socket address while the exchange is live; nil only when
+-- the peer already disconnected before the query.
+local function capture_peer(request: http.Request): net.Address?
+  do
+    return request:peer_address()
+  catch
+    if error is async.OperationError and
+        (error as async.OperationError).operation == "net.peer_address" then
+      return nil
+    end
+    raise
+  end
+end
+
 -- http.Handler body for the listener and for exchanges returned by workers.
 local function App:handle_http(request: http.Request, response: http.Response,
                                reroute: ExchangeEnvelope?)
   local core = self.core
   local meta, raw_path, target_error? = core:meta(request.method, request.target,
                                                  request.headers, request.url.scheme)
+  if reroute ~= nil and reroute.peer ~= nil then
+    meta.peer = reroute.peer
+  else
+    meta.peer = capture_peer(request)
+  end
   local route?, found?, head_fallback = core:classify(request.method, raw_path)
   if route ~= nil and found ~= nil then
     meta.params_map = found.params
@@ -844,7 +863,7 @@ local function App:handle_http(request: http.Request, response: http.Response,
   defer self:release_unused_ephemeral(target)
   local payload = http.Exchange(request, response):to_transfer_payload()
   self:deliver(dispatcher, target, ExchangeEnvelope(payload, request.method, request.target,
-    route_id, session_id or "", false))
+    route_id, session_id or "", false, meta.peer))
 end
 
 -- Serve an exchange returned by a worker on the parent (tracked for shutdown).
@@ -1007,6 +1026,7 @@ function App:start(addr: string, listen_config: ListenConfig?)
   end
   local listener = server as http.Server
   self.server = listener
+  if port == 0 then port = listener:local_address().port end
   self.listen_host = host
   self.listen_port = port
   local started = false

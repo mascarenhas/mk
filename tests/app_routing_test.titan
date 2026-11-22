@@ -207,6 +207,65 @@ function test_route_chain_and_add(_: test.Context)
   expect(request(app, "PATCH", "/multi"), 200, "PATCH", "add PATCH")
 end
 
+local function reply_method(prefix: string): mk.Handler
+  return function (ctx: mk.Context) ctx:send_string(prefix .. ctx:method()) end
+end
+
+-- Every Group and group RouteChain registration method lands below the group
+-- prefix with its method; group-scoped middleware stays inside its prefix.
+function test_group_registration_methods(context: test.Context)
+  local app = mk.App()
+  local api = app:group("/api")
+  api:get("/r", reply_method("r "))
+  api:post("/r", reply_method("r "))
+  api:put("/r", reply_method("r "))
+  api:delete("/r", reply_method("r "))
+  api:connect("/r", reply_method("r "))
+  api:options("/r", reply_method("r "))
+  api:trace("/r", reply_method("r "))
+  api:patch("/r", reply_method("r "))
+  api:head("/h", function (ctx: mk.Context) ctx:set("X-Head", "yes"):no_content() end)
+  api:all("/any", reply_method("any "))
+  local handles = api:add({"GET", "POST"}, "/added", reply_method("added "))
+  api:use_path("/scoped", function (ctx: mk.Context)
+    ctx:set("X-Scoped", "yes")
+    ctx:next()
+  end)
+  api:get("/scoped/x", reply_method("scoped "))
+  api:get("/unscoped", reply_method("unscoped "))
+  api:group("/v2"):get("/n", reply_method("nested "))
+  local chain = api:route_chain("/c")
+  chain:post(reply_method("c ")):put(reply_method("c ")):delete(reply_method("c "))
+    :connect(reply_method("c ")):options(reply_method("c ")):trace(reply_method("c "))
+    :patch(reply_method("c ")):head(function (ctx: mk.Context) ctx:set("X-Head", "chain"):no_content() end)
+    :add({"GET"}, reply_method("c "))
+  chain:route_chain("/all"):all(reply_method("c all "))
+  local methods: {string} = {"GET", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"}
+  context:run("group_methods", function (_: test.Context)
+    for index = 1, #methods do
+      expect(request(app, methods[index], "/api/r"), 200, "r " .. methods[index], "group " .. methods[index])
+    end
+    local head = request(app, "HEAD", "/api/h")
+    test.assert(head.status == 204 and head:header("X-Head") == "yes", "group HEAD")
+    expect(request(app, "PUT", "/api/any"), 200, "any PUT", "group all")
+    expect(request(app, "POST", "/api/added"), 200, "added POST", "group add")
+    test.assert(#handles == 2 and handles[1]:info().method == "GET" and
+      handles[2]:info().path == "/api/added", "add returns one handle per method")
+    expect(get(app, "/api/v2/n"), 200, "nested GET", "nested group")
+  end)
+  context:run("group_use_path", function (_: test.Context)
+    test.assert(get(app, "/api/scoped/x"):header("X-Scoped") == "yes", "middleware below its prefix")
+    test.assert(get(app, "/api/unscoped"):header("X-Scoped") == nil, "middleware stays in its prefix")
+  end)
+  context:run("group_route_chain", function (_: test.Context)
+    for index = 1, #methods do
+      expect(request(app, methods[index], "/api/c"), 200, "c " .. methods[index], "chain " .. methods[index])
+    end
+    test.assert(request(app, "HEAD", "/api/c"):header("X-Head") == "chain", "chain HEAD")
+    expect(request(app, "PATCH", "/api/c/all"), 200, "c all PATCH", "nested chain all")
+  end)
+end
+
 function test_mount_sub_app(_: test.Context)
   local sub = mk.App()
   sub:use(function (ctx: mk.Context)

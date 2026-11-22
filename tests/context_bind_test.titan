@@ -549,3 +549,95 @@ function test_run_with_timeout_revokes_ownership(_: test.Context)
   end
   test.assert(outcome == "context ownership revoked", "late write rejected: " .. outcome)
 end
+
+function test_host_upgrade_and_preflight_accessors(context: test.Context)
+  local app = mk.App()
+  app:get("/where", function (ctx: mk.Context)
+    ctx:send_string(ctx:hostname() .. "|" .. ctx:port() .. "|" .. ctx:protocol() .. "|" ..
+      tostring_bool(ctx:is_websocket()) .. "|" .. tostring_bool(ctx:is_upgrade_offer()))
+  end)
+  app:options("/where", function (ctx: mk.Context) ctx:send_string(tostring_bool(ctx:is_preflight())) end)
+  context:run("ipv6_hosts_and_default_ports", function (_: test.Context)
+    test.assert(call(app, "GET", "/where", {"Host", "[::1]:8080"}).body == "[::1]|8080|HTTP/1.1|false|false",
+      "bracketed IPv6 host with a port")
+    test.assert(call(app, "GET", "/where", {"Host", "[::1]"}).body == "[::1]|80|HTTP/1.1|false|false",
+      "bracketed IPv6 host without a port")
+    local secure = app:test(mk.TestRequest("GET", "/where", headers({"Host", "example.com"}), nil, true))
+    test.assert(secure.body == "example.com|443|HTTP/1.1|false|false", "https default port: " .. secure.body)
+  end)
+  context:run("upgrade_offers", function (_: test.Context)
+    test.assert(call(app, "GET", "/where", {"Upgrade", "websocket", "Connection", "keep-alive, Upgrade"}).body ==
+      "example.com|80|HTTP/1.1|true|true", "WebSocket offer")
+    test.assert(call(app, "GET", "/where", {"Upgrade", "h2c", "Connection", "Upgrade"}).body ==
+      "example.com|80|HTTP/1.1|false|true", "other upgrade offer")
+  end)
+  context:run("cors_preflight", function (_: test.Context)
+    test.assert(call(app, "OPTIONS", "/where",
+      {"Origin", "https://a.example", "Access-Control-Request-Method", "PUT"}).body == "true", "preflight")
+    test.assert(call(app, "OPTIONS", "/where", {"Origin", "https://a.example"}).body == "false",
+      "plain OPTIONS with Origin")
+  end)
+end
+
+function test_request_meta_accessors_in_selectors(_: test.Context)
+  local seen = ""
+  local app = mk.App()
+  app:get("/m/:id", function (ctx: mk.Context) ctx:send_string(seen) end)
+    :workers(mk.WorkerMode.session(mk.SessionOptions {
+      session_id = function (meta: mk.RequestMeta): string?
+        seen = meta:param("id") .. "|" .. (meta:param_opt("missing") or "nil") .. "|" ..
+          meta:param("missing", "fallback") .. "|" .. #meta:get_headers("X-Multi")
+        return nil
+      end,
+    }))
+  local response = call(app, "GET", "/m/42", {"X-Multi", "a", "X-Multi", "b"})
+  test.assert(response.body == "42|nil|fallback|2", "selector metadata: " .. response.body)
+end
+
+function test_response_header_copies_and_cookie_rules(context: test.Context)
+  local app = mk.App()
+  app:get("/headers", function (ctx: mk.Context)
+    ctx:set("X-Remove", "1"):set("X-Keep", "2"):remove_header("X-Remove")
+    ctx:resp_headers():set("X-Copy-Only", "3")
+    ctx:req_headers():set("X-In", "changed")
+    ctx:attachment():send_string(ctx:get("X-In", "none"))
+  end)
+  app:get("/bad-value", function (ctx: mk.Context) ctx:set_cookie(mk.Cookie { name = "a", value = "x;y" }) end)
+  app:get("/bad-same-site", function (ctx: mk.Context)
+    ctx:set_cookie(mk.Cookie { name = "a", value = "x", same_site = "Sometimes" })
+  end)
+  context:run("header_copies_do_not_alias", function (_: test.Context)
+    local response = call(app, "GET", "/headers", {"X-In", "original"})
+    test.assert(response:header("X-Remove") == nil and response:header("X-Keep") == "2", "remove_header")
+    test.assert(response:header("X-Copy-Only") == nil and response.body == "original",
+      "resp_headers and req_headers return copies")
+    test.assert(response:header("Content-Disposition") == "attachment", "attachment without a filename")
+  end)
+  context:run("invalid_cookies_raise", function (_: test.Context)
+    test.assert(raises(function () call(app, "GET", "/bad-value") end) == "mk: invalid cookie value",
+      "separator in a cookie value")
+    test.assert(raises(function () call(app, "GET", "/bad-same-site") end) ==
+      "mk: cookie same_site must be Lax, Strict, or None", "unknown SameSite")
+  end)
+end
+
+function test_in_memory_upgrades(context: test.Context)
+  local app = mk.App()
+  app:get("/ws", function (ctx: mk.Context) ctx:upgrade_websocket() end)
+  app:get("/reject", function (ctx: mk.Context) ctx:reject_upgrade(403) end)
+  app:get("/reject-bad", function (ctx: mk.Context) ctx:reject_upgrade(200) end)
+  local offer: {string} = {"Upgrade", "websocket", "Connection", "Upgrade",
+    "Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version", "13"}
+  context:run("accept_needs_a_live_server", function (_: test.Context)
+    expect_status(call(app, "GET", "/ws", offer), 501, "in-memory WebSocket upgrade")
+  end)
+  context:run("rejection_is_bodyless_and_closes", function (_: test.Context)
+    local response = call(app, "GET", "/reject", offer)
+    test.assert(response.status == 403 and response.body == "" and response:header("Content-Length") == "0" and
+      response:header("Connection") == "close", "rejected upgrade")
+  end)
+  context:run("rejection_status_range", function (_: test.Context)
+    test.assert(raises(function () call(app, "GET", "/reject-bad", offer) end) ==
+      "mk: upgrade rejection status must be 400..599", "2xx rejection")
+  end)
+end
