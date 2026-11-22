@@ -9,7 +9,7 @@
 - **Worker threads (`WorkerMode`):** Dispatch routes directly on the `parent` event loop, across a round-robin `pool` of OS worker threads, or onto on-demand per-`session` workers (persistent or `ephemeral`) with immediate `ctx:retire_worker()`.
 - **Non-suspending JSON logging (`mk.log`):** Bounded single-writer JSON-line logger with drop accounting and cross-thread forwarding.
 - **Built-in middleware (`mk.middleware.*`):** `env`, `healthcheck`, `helmet`, `keyauth`, `logger`, `recover`, `requestid`, `responsetime`, `static`, and `timeout`.
-- **Single-provider LuaRocks bundle:** All 13 public logical modules compile into one `mk.so` + `mk.a` provider pair (`mk.dll` on Windows).
+- **Single-provider LuaRocks bundle:** All 13 public logical modules compile into one `mk.so` + `mk.a` provider pair (`mk.dll` on Windows), with `doc/` and `skills/` installed alongside the rock via `copy_directories = { "doc", "skills" }`.
 
 ## Quickstart
 
@@ -59,7 +59,7 @@ From a checkout of this repository, build and install the `mk` provider into you
 luarocks make titan-mk-0.1.0-1.rockspec
 ```
 
-The rockspec compiles all 13 `mk*` logical modules into `build/mk.so` and `build/mk.a` (`build\mk.dll` on Windows), stages them under `$(PREFIX)/dist/modules/`, and runs `titan-install --path "$(PREFIX)"` from its `post_install` hook so other Titan projects can `import "mk"` without extra `--tree` flags or `TITAN_PATH_0_6` overrides.
+The rockspec compiles all 13 `mk*` logical modules into `build/mk.so` and `build/mk.a` (`build\mk.dll` on Windows), stages them under `$(PREFIX)/dist/modules/`, invokes `titan-install --path "$(PREFIX)"` from its `post_install` hook so other Titan projects can `import "mk"` without extra `--tree` flags or `TITAN_PATH_0_6` overrides, and installs `doc/` and `skills/` into the rock directory via `copy_directories = { "doc", "skills" }`.
 
 To remove the installed package and its staged provider files:
 
@@ -72,8 +72,8 @@ titan-uninstall titan-mk
 The repository `Makefile` delegates incremental compilation and native tests to `titanc`:
 
 ```sh
-make build                      # build build/mk.so and build/mk.a
-make test                       # build and run tests/ via build/mk-tests
+make build                              # build build/mk.so and build/mk.a
+make test                               # build and run tests/ via build/mk-tests
 make test TEST_ARGS='--filter=router'   # or TEST_ARGS='-f router'
 make clean
 ```
@@ -106,8 +106,6 @@ Routes and groups choose their execution model via `mk.WorkerMode`:
 | `mk.WorkerMode.pool(options?)` | Dispatches exchanges round-robin across `size` pre-spawned OS worker threads (default `1`, queue capacity `128`). An unexpected pool worker exit fails the `App`. |
 | `mk.WorkerMode.session(options)` | Extracts a session ID from `RequestMeta` and routes exchanges to an on-demand per-session OS worker (persistent or `ephemeral = true`). Failures stay isolated to that session. |
 
-See [Workers and Sessions](docs/workers-and-sessions.md) for cross-state closure transfer rules, `on_start` initialization, and shutdown semantics.
-
 ## Built-in Middleware
 
 | Module | Purpose |
@@ -123,9 +121,10 @@ See [Workers and Sessions](docs/workers-and-sessions.md) for cross-state closure
 | `mk.middleware.static` | Confined static file and directory serving with conditional requests and single-range support. |
 | `mk.middleware.timeout` | Cooperative handler deadlines via `ctx:run_with_timeout(...)`. |
 
-## Documentation
+## Documentation and Agent Skill
 
-Start with the [Documentation Index](docs/index.md) for detailed guides on routing, context and JSON binding, worker threads and sessions, and middleware and logging.
+- **Manual (Guide + Module Reference):** [doc/index.md](doc/index.md)
+- **Coding-agent skill for using `titan-mk`:** [skills/titan-mk/SKILL.md](skills/titan-mk/SKILL.md)
 
 ## License
 
