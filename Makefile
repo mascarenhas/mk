@@ -3,11 +3,14 @@ TITAN_JOBS ?= 2
 TEST_ARGS ?=
 # Coverage: COVERAGE_GCOV overrides titanc's gcov command (default: GCOV,
 # gcov, or llvm-cov gcov); COVERAGE_FORMAT lists extra gcovr reports (html,
-# lcov, cobertura); COVERAGE_FLAGS passes further titanc --coverage options.
+# lcov, cobertura) and COVERAGE_GCOVR overrides their gcovr command (default:
+# GCOVR or gcovr); COVERAGE_FLAGS passes further titanc --coverage options.
 COVERAGE_GCOV ?=
+COVERAGE_GCOVR ?=
 COVERAGE_FORMAT ?=
 COVERAGE_FLAGS ?=
 COVERAGE_OPTIONS = --coverage $(if $(COVERAGE_GCOV),--coverage-gcov "$(COVERAGE_GCOV)") \
+	$(if $(COVERAGE_GCOVR),--coverage-gcovr "$(COVERAGE_GCOVR)") \
 	$(foreach format,$(COVERAGE_FORMAT),--coverage-format $(format)) $(COVERAGE_FLAGS)
 
 # The thirteen public logical modules published together in one mk provider
