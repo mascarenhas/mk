@@ -6,7 +6,7 @@ source = {
    tag = "v0.1.0",
 }
 description = {
-   summary = "GoFiber-inspired HTTP micro-framework for Titan with PEG routing and worker threads",
+   summary = "Titan web framework with PEG routing and worker threads",
    homepage = "https://github.com/mascarenhas/mk",
    license = "MIT",
 }

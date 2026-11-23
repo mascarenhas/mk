@@ -1,6 +1,8 @@
-# titan-mk
+# titan-mk 0.1
 
-`titan-mk` is a GoFiber-inspired HTTP/1.1 micro-framework written in **Titan 0.6.0**. It combines pure `titan.peg` routing with guaranteed $O((M + L) \cdot A)$ worst-case matching, a typed `Context` and JSON body binder, structured JSON-line logging, ten focused middleware modules, and a shared-nothing OS worker thread model built on `titan.thread`, `titan.transfer`, `titan.async`, and `titan.http.Exchange`.
+`titan-mk` is a HTTP/1.1 web framework written in [**Titan**](https://titan-lang.dev). It combines pure `titan.peg` routing, a typed `Context` and JSON body binder, structured JSON-line logging, extensibility through request middleware, with ten included middleware modules, and a shared-nothing OS worker thread model built on `titan.thread`, `titan.transfer`, `titan.async`, and `titan.http.Exchange`.
+
+Why is it called `mk`? The name is a homage to [one of my old Kepler Project libraries](https://github.com/keplerproject/mk). It is not trying to break new ground, the ergonomics and concepts are similar to [Fiber](https://gofiber.io/), which in turn took ideas from Express, but the ideas go back to older web frameworks. The Parsing-Expression-Grammar-based route parser (which also uses PEGs to parse the routing DSL) is a refinement of what I had already used in [Orbit's router](https://github.com/keplerproject/orbit/blob/master/src/orbit/routes.lua) and improved in [Kepler's MK](https://github.com/keplerproject/mk/blob/master/src/mk/routes.lua).
 
 ## Features
 
@@ -9,7 +11,7 @@
 - **Worker threads (`WorkerMode`):** Dispatch routes directly on the `parent` event loop, across a round-robin `pool` of OS worker threads, or onto on-demand per-`session` workers (persistent or `ephemeral`) with immediate `ctx:retire_worker()`.
 - **Non-suspending JSON logging (`mk.log`):** Bounded single-writer JSON-line logger with drop accounting and cross-thread forwarding.
 - **Built-in middleware (`mk.middleware.*`):** `env`, `healthcheck`, `helmet`, `keyauth`, `logger`, `recover`, `requestid`, `responsetime`, `static`, and `timeout`.
-- **Single-provider LuaRocks bundle:** All 13 public logical modules compile into one `mk.so` + `mk.a` provider pair (`mk.dll` on Windows), with `doc/` and `skills/` installed alongside the rock via `copy_directories = { "doc", "skills" }`.
+- **Single-provider LuaRocks bundle:** All 13 public logical modules compile into one `mk.so` + `mk.a` provider pair (`mk.dll` on Windows), with `doc/` and `skills/` installed alongside the rock via `copy_directories = { "doc", "skills" }`. Applications in Linux and MacOS can statically link the framework and Titan stdlib into their executable.
 
 ## Quickstart
 
@@ -49,19 +51,17 @@ end
 
 ## Installation
 
-`titan-mk` requires Lua **5.5** and Titan **0.6** (`lua ~> 5.5`, `titan ~> 0.6`).
+`titan-mk` requires Lua **5.5** and Titan **0.6**.
 
 ### Install via LuaRocks
 
-From a checkout of this repository, build and install the `mk` provider into your active LuaRocks / Titan tree:
-
 ```sh
-luarocks make titan-mk-0.1.0-1.rockspec
+luarocks install titan-mk
 ```
 
-The rockspec compiles all 13 `mk*` logical modules into `build/mk.so` and `build/mk.a` (`build\mk.dll` on Windows), stages them under `$(PREFIX)/dist/modules/`, invokes `titan-install --path "$(PREFIX)"` from its `post_install` hook so other Titan projects can `import "mk"` without extra `--tree` flags or `TITAN_PATH_0_6` overrides, and installs `doc/` and `skills/` into the rock directory via `copy_directories = { "doc", "skills" }`.
+The source rock compiles all 13 `mk` modules into `mk.so` and `mk.a` (`mk.dll` on Windows) then installs them under the Titan 0.6 modules folder of your LuaRocks deployment tree, so the modules are discoverable by the Titan compiler. Documentation and a skill for coding agents are installed to the `titan-mk` folder in the LuaRocks package tree.
 
-To remove the installed package and its staged provider files:
+To remove the installed package and all its files:
 
 ```sh
 titan-uninstall titan-mk
@@ -92,7 +92,7 @@ GitHub Actions CI (`.github/workflows/ci.yml`) builds and tests `titan-mk` acros
   titanc -o build app.main
   ```
 
-- **Static build (`--static` on Linux and macOS):** Because `mk` imports `titan.http` and `titan.websocket` (which depend on `titan.ssl`), linking a standalone static executable against a **system-OpenSSL** Titan SDK requires passing OpenSSL's linker flags at final link:
+- **Static build (`--static` on Linux and macOS):** Because `mk` imports `titan.http` and `titan.websocket` (which depend on `titan.ssl`), linking a standalone static executable against a **system-OpenSSL** Titan SDK requires passing OpenSSL's linker flags at final link (or having them exported by your `.bashrc` or equivalent):
 
   ```sh
   TITAN_EXTRA_CPPFLAGS="$(pkg-config --cflags openssl)" \
