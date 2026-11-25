@@ -1,0 +1,46 @@
+/* ==========================================================================
+   mk.titan-lang.dev — Verdigris sister palette for @titan-lang/cassini
+   Overrides ONLY Cassini's 7-token brand accent contract; every surface,
+   ink, rule, and syntax token stays Cassini's. Contrast ratios are checked
+   by `npm run verify:contrast` (scripts/check-contrast.mjs).
+
+   Unlayered on purpose: Cassini declares its tokens inside `@layer base`, so
+   these declarations win regardless of stylesheet order, and the light
+   selector (higher specificity) still beats the dark `:root` block.
+   ========================================================================== */
+
+/* Cassini Dark — Titan's methane-haze verdigris over Saturn's umbra */
+:root {
+  --brand-accent: #8fd4c1;          /* Verdigris (primary interactive) */
+  --brand-accent-bright: #d3f0e6;   /* Ring-ice mint (hover / display) */
+  --brand-accent-muted: #78bcab;    /* Patina teal (kickers / active rails) */
+  --brand-accent-secondary: #e0c48e;/* Titan haze amber (types / tags) */
+  --brand-accent-ink: #04110d;      /* Foreground atop solid --brand-accent */
+  --brand-glow: rgba(143, 212, 193, 0.085);
+  --brand-ring-gradient: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(143, 212, 193, 0.26) 20%,
+    rgba(211, 240, 230, 0.56) 50%,
+    rgba(143, 212, 193, 0.26) 80%,
+    transparent 100%
+  );
+}
+
+/* Archival Paper — oxidized-copper ink on vellum */
+:root[data-theme="light"] {
+  --brand-accent: #165045;
+  --brand-accent-bright: #0e1a17;
+  --brand-accent-muted: #22594f;
+  --brand-accent-secondary: #663d0b;
+  --brand-accent-ink: #fcfaf4;
+  --brand-glow: rgba(22, 80, 69, 0.07);
+  --brand-ring-gradient: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(34, 89, 79, 0.24) 20%,
+    rgba(22, 80, 69, 0.6) 50%,
+    rgba(34, 89, 79, 0.24) 80%,
+    transparent 100%
+  );
+}

@@ -11,7 +11,7 @@ set -euxo pipefail
 
 workspace=${1:?usage: package-smoke.sh ABSENT_WORKSPACE}
 sdk=${TITAN_PREFIX:?set TITAN_PREFIX to the Titan SDK}
-rockspec=titan-mk-0.1.0-1.rockspec
+rockspec=titan-mk-0.1.1-1.rockspec
 lib=$sdk/lib/titan/0.6
 
 case $(uname -s) in

@@ -1,0 +1,27 @@
+{
+  "name": "mk-titan-lang-dev",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.23.4"
+  },
+  "scripts": {
+    "fetch-sources": "node scripts/fetch-sources.mjs",
+    "dev": "node scripts/fetch-sources.mjs && astro dev",
+    "build": "node scripts/fetch-sources.mjs && astro build && pagefind --site dist",
+    "preview": "astro preview",
+    "verify:contrast": "node scripts/check-contrast.mjs",
+    "verify:site": "node scripts/verify-site.mjs",
+    "verify": "npm run verify:contrast && npm run verify:site"
+  },
+  "dependencies": {
+    "@astrojs/markdown-remark": "^7.3.10",
+    "@titan-lang/cassini": "file:.generated/cassini",
+    "astro": "^7.4.13"
+  },
+  "devDependencies": {
+    "pagefind": "^1.6.0",
+    "wrangler": "^4.167.0"
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "mk": {
+    "repo": "mascarenhas/mk",
+    "ref": "master",
+    "version": "0.1.1",
+    "titanVersion": "0.6.1",
+    "paths": [
+      "doc",
+      "skills/titan-mk/SKILL.md"
+    ]
+  },
+  "cassini": {
+    "repo": "mascarenhas/titan-lang-dev",
+    "ref": "main",
+    "sha": "67478a1935f463b5f84e9aac4f6b72a46f7086fb",
+    "paths": [
+      "packages/cassini"
+    ]
+  },
+  "vscodeTitan": {
+    "repo": "mascarenhas/vscode-titan",
+    "ref": "main",
+    "sha": "11528ffbb3eae097781c683c8a831474e6dd2054",
+    "paths": [
+      "syntaxes/titan.tmLanguage.json"
+    ]
+  },
+  "titan": {
+    "repo": "mascarenhas/titan",
+    "ref": "v0.6.1",
+    "sha": "704d481451661d87b1ddcd72638cac8db37718f5",
+    "version": "0.6.1",
+    "paths": [
+      "doc/images/titan-logo.svg"
+    ]
+  }
+}

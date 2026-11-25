@@ -1,44 +1,50 @@
 # `titan-mk` Manual
 
-`titan-mk` is a GoFiber-inspired HTTP/1.1 micro-framework written in **Titan 0.6.0**. All 13 public logical modules compile into a single `mk` provider (`mk.so` + `mk.a` on POSIX; `mk.dll` on Windows).
+`titan-mk 0.1.1` is an HTTP/1.1 web framework written in Titan (targeting Lua 5.5 and Titan 0.6, tested on Titan 0.6.1). All 13 public logical modules compile into one `mk` provider (`mk.so` and `mk.a` on Linux and macOS; `mk.dll` on Windows).
 
-- **New to `titan-mk`?** Read **Part I: Guide** sequentially for concepts, idioms, and runnable patterns.
-- **Looking up an exact signature, field, default, or error code?** Jump to **Part II: Module Reference**.
-- **Using a coding agent with `titan-mk`?** Load the bundled operational skill at [skills/titan-mk/SKILL.md](../skills/titan-mk/SKILL.md) (copied alongside `doc/` into the installed LuaRocks rock directory).
+Start with **Part I** to build a working service step by step, use **Part II** when solving a specific operational task, consult **Part III** for exact module signatures and error codes, and read **Part IV** for architectural rationale. If you use a coding agent with `titan-mk`, load the operational skill bundled alongside this manual at [skills/titan-mk/SKILL.md](../skills/titan-mk/SKILL.md).
 
----
+## Part I — Tutorials
 
-## Part I — Guide
+| Tutorial | Summary |
+| --- | --- |
+| [Build Your First HTTP Service](tutorials/first-service.md) | Create a typed bookmark service with JSON validation, structured logging, and an in-memory test. |
 
-| Ch. | Guide | Summary |
-| ---: | --- | --- |
-| 1 | [Getting Started](guide/getting-started.md) | LuaRocks installation (`luarocks make`, `titan-install`, `titan-uninstall`), `make coverage`, consumer project layout, first application, dynamic vs. `--static` (`-lssl -lcrypto`) linking, and testing with `App:test` vs. `App:listen_test`. |
-| 2 | [Routing and Handlers](guide/routing-and-handlers.md) | PEG route grammar and why inline constraints are rejected, groups, `RouteChain`, `App:mount`, `auto_head` and first-occurrence `405 Allow`, `Context` and `RequestMeta`, JSON-only `Bind`, `HttpError` flow, buffered vs. streaming output, and WebSocket upgrades. |
-| 3 | [Middleware and Logging](guide/middleware-and-logging.md) | Middleware chain execution, `on_before_commit` and `on_complete` observers, `mk.log` bounded JSON-line logging, composing the 10 built-in middlewares, and admission vs. completion request logging. |
-| 4 | [Workers and Sessions](guide/workers-and-sessions.md) | Shared-nothing Titan OS worker threads, `parent`/`pool`/`session` and `ephemeral` dispatch, `Context:retire_worker()`, per-state module locals in `on_start`, Titan cross-state closure transfer rules and `Transferable*`, pool failure vs. session isolation, and ordered shutdown. |
+## Part II — How-to Guides
 
----
+| Guide | Summary |
+| --- | --- |
+| [How to Install, Build, and Link `titan-mk`](how-to/install-and-build.md) | Install via LuaRocks, structure a consumer project, and link dynamically or statically. |
+| [How to Define Routes, Bind JSON, and Return Errors](how-to/routes-and-json-apis.md) | Register groups, chains, and mounted sub-apps, decode JSON bodies, and return `HttpError` responses. |
+| [How to Compose Middleware and Structured Logging](how-to/middleware-and-logging.md) | Order middleware, configure `mk.log`, authenticate requests, set timeouts, and serve static files. |
+| [How to Stream Responses and Upgrade WebSockets](how-to/streaming-and-websockets.md) | Flush chunks, stream `io.Reader` payloads, read raw request bodies, and manage WebSocket upgrades. |
+| [How to Run Handlers on OS Worker Pools and Session Workers](how-to/worker-threads-and-sessions.md) | Configure `pool` and `session` dispatch, initialize per-worker state, and shut down cleanly. |
+| [How to Test Services and Measure Line Coverage](how-to/testing-and-coverage.md) | Combine fast `App:test` checks with `App:listen_test` integration tests and `titanc --coverage`. |
 
-## Part II — Module Reference
+## Part III — Reference
 
-| Reference | Logical Modules | Summary |
+| Module | Logical Modules | Summary |
 | --- | --- | --- |
-| [`mk`](reference/mk.md) | `mk` | `App`, `Config`, `ListenConfig`, `Group`, `GroupOptions`, `RouteChain`, `RouteHandle`, `Hooks`, `ListenData`, `RouteInfo`, `GroupInfo`, `WorkerInfo`, `Context` (including `classified_route` and `peer_address`), `RequestMeta`, `Cookie`, `Bind`, `HttpError`, `ErrorHandler`, status catalog, MIME defaults, `WorkerMode`, `PoolOptions`, `SessionOptions`, `WorkerContext`, `Transferable*`, and test types. |
-| [`mk.router`](reference/mk-router.md) | `mk.router` | Constants, PEG route grammar, `RouteError` codes, `SegmentToken`, `RouteSegment`, `PatternOptions`, `CompiledPattern`, `MatchResult`, `Target`, `parse_target`, `percent_decode`, `percent_encode_segment`, `join_paths`, and `allow_header`. |
-| [`mk.log`](reference/mk-log.md) | `mk.log` | `MAX_LINE_BYTES`, `Logger`, level vocabulary and `resolve_level`, `format_line`, `emit`, `forward`, and `fatal`. |
-| [`mk.middleware.*`](reference/mk-middleware.md) | `mk.middleware.{env, healthcheck, helmet, keyauth, logger, recover, requestid, responsetime, static, timeout}` | Complete API, defaults, validation rules, and behavior for all 10 built-in middleware modules. |
+| [`mk`](reference/mk.md) | `mk` | `App`, `Config`, `Group`, `RouteChain`, `Hooks`, `Context`, `RequestMeta`, `Bind`, `HttpError`, `WorkerMode`, and test helpers. |
+| [`mk.router`](reference/mk-router.md) | `mk.router` | Constants, PEG route grammar, `RouteError` codes, `CompiledPattern`, `Target`, and URI helpers. |
+| [`mk.log`](reference/mk-log.md) | `mk.log` | `MAX_LINE_BYTES`, `Logger`, level vocabulary, JSON-line formatting, drop accounting, and forwarding. |
+| [`mk.middleware.*`](reference/mk-middleware.md) | All 10 `mk.middleware.*` modules | Complete APIs, defaults, validation rules, and behavior for every built-in middleware module. |
 
----
+## Part IV — Explanation
 
-## Explicit Scope Boundaries
+| Topic | Summary |
+| --- | --- |
+| [About PEG Routing and Route Constraints](explanation/peg-routing.md) | Two-tier PEG matching, linear worst-case bounds, atomic percent escapes, and why inline constraints are rejected. |
+| [About the Request, Middleware, and Error Lifecycle](explanation/request-lifecycle.md) | Execution order, non-intercepting response observers, JSON-only `Bind` classification, and non-suspending logging. |
+| [About Shared-Nothing Workers and Closure Transfer](explanation/worker-architecture.md) | Isolation trade-offs across `parent`, `pool`, and `session` modes, keep-alive handoff, transfer rules, and shutdown order. |
 
-`titan-mk` keeps its surface focused on Titan's standard library:
+## Scope Boundaries
 
-- **No template views** (no `Context:render`).
-- **JSON-only body binding** (use `Context` accessors for path params, query strings, headers, and cookies).
-- **JSON-only structured logging** (`mk.log` and `mk.middleware.logger`).
-- **No routing constraints** (`:id<int>` is rejected at pattern compile time with `RouteError` code `"routing_constraints_unsupported"`).
-- **No HTTP client wrapper** (import Titan's `http` standard library directly).
-- **No custom struct validator, service registry, or OS `prefork` mode** (workers use per-state module `local` variables initialized in `on_start`).
+`titan-mk` stays close to Titan's standard library and omits six categories of framework machinery by design:
 
-See the [README](../README.md) for repository build commands and license details.
+- **No HTML template views:** There is no `Context:render` engine.
+- **JSON-only body binding:** Use `Context` accessors for path parameters, query strings, headers, and cookies.
+- **JSON-only structured logging:** `mk.log` and `mk.middleware.logger` emit UTF-8 JSON lines exclusively.
+- **No inline routing constraints:** Patterns like `:id<int>` fail at route registration with `RouteError.code == "routing_constraints_unsupported"`.
+- **No HTTP client wrapper:** Import Titan's `http` standard library directly.
+- **No struct validator, service registry, or OS `prefork`:** Workers hold per-state resources in module-level `local` variables initialized in `on_start`.

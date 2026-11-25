@@ -1,0 +1,28 @@
+---
+import BaseLayout from "@titan-lang/cassini/layouts/BaseLayout.astro";
+import "../styles/brand.css";
+import { LAYOUT_PROPS, SITE } from "../site.config.mjs";
+---
+
+<BaseLayout
+  {...LAYOUT_PROPS}
+  title={`Page Not Found — ${SITE.brandName}`}
+  description={`The requested page could not be found on ${SITE.siteLabel}.`}
+>
+  <main class="single-page">
+    <div class="not-found-box">
+      <p class="not-found-code">404 · Not Found</p>
+      <h1 style="margin:0.6rem 0 0.75rem;font-family:var(--font-display);font-weight:400;color:var(--ink-display);">
+        No route matched this path.
+      </h1>
+      <p style="margin:0 auto 1.65rem;max-width:30rem;color:var(--ink-secondary);">
+        The page or asset you requested doesn't exist at this address. Try the manual, or search with ⌘K.
+      </p>
+      <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:0.75rem;">
+        <a class="btn btn-primary" href="/">Home</a>
+        <a class="btn" href="/docs/">Read the Manual</a>
+        <a class="btn" href="/skill/">Agent Skill</a>
+      </div>
+    </div>
+  </main>
+</BaseLayout>

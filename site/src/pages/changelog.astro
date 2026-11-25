@@ -1,0 +1,19 @@
+---
+import { getEntry, render } from "astro:content";
+import BaseLayout from "@titan-lang/cassini/layouts/BaseLayout.astro";
+import "../styles/brand.css";
+import { LAYOUT_PROPS, SITE } from "../site.config.mjs";
+
+const entry = await getEntry("site", "changelog");
+if (!entry) throw new Error("Missing src/content/site/changelog.md");
+const { Content } = await render(entry);
+const data = entry.data as { title?: string; description?: string };
+---
+
+<BaseLayout {...LAYOUT_PROPS} title={`${data.title || "Changelog"} — ${SITE.brandName}`} description={data.description}>
+  <main class="single-page" data-pagefind-body data-pagefind-meta="section:Changelog">
+    <article class="prose">
+      <Content />
+    </article>
+  </main>
+</BaseLayout>
