@@ -1,0 +1,39 @@
+---
+import { getCollection, render } from "astro:content";
+import DocsLayout from "@titan-lang/cassini/layouts/DocsLayout.astro";
+import { findPrevNext } from "@titan-lang/cassini/nav";
+import "../../styles/brand.css";
+import { LAYOUT_PROPS, MANUAL_TITLE, SITE, getManualToc, kickerFor } from "../../site.config.mjs";
+import { DOCS_BASE } from "../../routes.mjs";
+
+export async function getStaticPaths() {
+  const entries = await getCollection("docs");
+  return entries.map((entry) => ({
+    params: { slug: entry.id === "index" ? undefined : entry.id },
+    props: { entry },
+  }));
+}
+
+const { entry } = Astro.props;
+const { Content, headings } = await render(entry);
+const title = headings.find((h) => h.depth === 1)?.text ?? entry.id;
+const toc = getManualToc();
+const isIndex = entry.id === "index";
+const currentHref = isIndex ? `${DOCS_BASE}/` : `${DOCS_BASE}/${entry.id}/`;
+const { prev, next } = findPrevNext(toc.readingOrder, currentHref);
+---
+
+<DocsLayout
+  {...LAYOUT_PROPS}
+  title={title}
+  pageTitle={isIndex ? `${MANUAL_TITLE} — ${SITE.brandName}` : `${title} — ${MANUAL_TITLE}`}
+  description={`${title} — ${MANUAL_TITLE} (${SITE.versionBadge})`}
+  sidebarGroups={toc.sidebarGroups}
+  headings={headings}
+  prev={prev}
+  next={next}
+  sectionLabel="Manual"
+  kicker={kickerFor(currentHref)}
+>
+  <Content />
+</DocsLayout>

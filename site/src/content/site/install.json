@@ -1,0 +1,69 @@
+[
+  {
+    "id": "luarocks",
+    "label": "LuaRocks",
+    "steps": [
+      {
+        "num": "01",
+        "label": "Install package",
+        "commands": "luarocks install titan-mk"
+      },
+      {
+        "num": "02",
+        "label": "Compile a consumer app",
+        "commands": "titanc --incremental --tree src -o build --exe build/my-service service.main"
+      },
+      {
+        "num": "03",
+        "label": "Uninstall cleanly",
+        "commands": "titan-uninstall titan-mk"
+      }
+    ],
+    "note": "Requires Lua 5.5 and Titan 0.6 (tested on 0.6.1). Installs mk.so and mk.a (mk.dll on Windows) into Titan's module path; luarocks show --rock-dir titan-mk locates the bundled manual and coding-agent skill.",
+    "docsLabel": "Full installation & linking guide",
+    "docsHref": "/docs/how-to/install-and-build/"
+  },
+  {
+    "id": "static",
+    "label": "Static Link",
+    "steps": [
+      {
+        "num": "01",
+        "label": "Bundled-OpenSSL SDK",
+        "commands": "titanc --static --tree src -o build --exe build/my-service service.main"
+      },
+      {
+        "num": "02",
+        "label": "System-OpenSSL SDK (Linux & macOS)",
+        "commands": "TITAN_EXTRA_CPPFLAGS=\"$(pkg-config --cflags openssl)\" \\\nTITAN_EXTRA_LDFLAGS=\"$(pkg-config --libs openssl)\" \\\n  titanc --static --tree src -o build --exe build/my-service service.main"
+      }
+    ],
+    "note": "mk imports titan.http and titan.websocket (backed by titan.ssl). Static linking is supported on Linux and macOS.",
+    "docsLabel": "Static linking details",
+    "docsHref": "/docs/how-to/install-and-build/#link-dynamically-or-statically"
+  },
+  {
+    "id": "checkout",
+    "label": "From Checkout",
+    "steps": [
+      {
+        "num": "01",
+        "label": "Build & run tests",
+        "commands": "make build\nmake test"
+      },
+      {
+        "num": "02",
+        "label": "Install local rock",
+        "commands": "luarocks make titan-mk-0.1.1-1.rockspec"
+      },
+      {
+        "num": "03",
+        "label": "Measure line coverage",
+        "commands": "make coverage COVERAGE_FORMAT=lcov"
+      }
+    ],
+    "note": "Pass TEST_ARGS='--filter=router' (or '-f router') to filter native tests.",
+    "docsLabel": "Testing and coverage guide",
+    "docsHref": "/docs/how-to/testing-and-coverage/"
+  }
+]

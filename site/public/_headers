@@ -1,0 +1,25 @@
+# Cloudflare Workers Static Assets response headers.
+# Copied verbatim into ./dist/_headers by Astro; Workers parses it and never serves it publicly.
+# Matching rules apply in file order; duplicate headers comma-join, so detach with `! Cache-Control`
+# before overriding Workers' default `public, max-age=0, must-revalidate` + `ETag`.
+
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+
+# Content-hashed Astro static bundles (CSS, JS)
+/_astro/*
+  ! Cache-Control
+  Cache-Control: public, max-age=31536000, immutable
+
+# Self-hosted vendored WOFF2 fonts (unhashed paths, long revalidated cache)
+/fonts/*
+  ! Cache-Control
+  Cache-Control: public, max-age=2592000, must-revalidate
+
+# Keep PR preview / Version URLs on workers.dev out of search indexes
+https://:worker.:subdomain.workers.dev/*
+  X-Robots-Tag: noindex, nofollow

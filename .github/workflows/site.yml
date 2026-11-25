@@ -1,0 +1,266 @@
+name: Site
+
+# Builds, verifies, and deploys mk.titan-lang.dev (site/) to the assets-only
+# Cloudflare Worker `titan-mk`: same-repo PRs get a preview version, master
+# deploys to production.
+on:
+  push:
+    branches: [master]
+    paths: &site-inputs
+      - "site/**"
+      - "doc/**"
+      - "skills/titan-mk/SKILL.md"
+      - ".github/workflows/site.yml"
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: *site-inputs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel stale PR builds on new pushes, but never cancel an in-flight production deploy.
+concurrency:
+  group: site-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CF_MAX_ASSET_BYTES: "26214400"
+  CF_MAX_ASSET_FILES: "20000"
+
+defaults:
+  run:
+    shell: bash
+    working-directory: site
+
+jobs:
+  build:
+    name: Build & Verify
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Cache pinned upstream tarballs
+        uses: actions/cache@v6
+        with:
+          path: site/.generated/cache
+          key: site-upstream-${{ hashFiles('site/sources.json') }}
+
+      # Before `npm ci`: it links @titan-lang/cassini from .generated/cassini.
+      - name: Fetch pinned sources and stage docs
+        run: node scripts/fetch-sources.mjs
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build site and Pagefind index
+        run: npm run build
+
+      - name: Verify brand contrast and site links
+        run: npm run verify
+
+      - name: Verify Cloudflare Static Assets limits
+        run: |
+          set -euo pipefail
+          test -f dist/index.html || { echo "::error::Missing dist/index.html"; exit 1; }
+          test -f dist/404.html || { echo "::error::Missing dist/404.html (not_found_handling is 404-page)"; exit 1; }
+
+          file_count="$(find dist -type f | wc -l)"
+          echo "Static asset files: $file_count (limit: $CF_MAX_ASSET_FILES)"
+          if [ "$file_count" -gt "$CF_MAX_ASSET_FILES" ]; then
+            echo "::error::Asset count ($file_count) exceeds Cloudflare's $CF_MAX_ASSET_FILES-file limit."
+            exit 1
+          fi
+
+          oversized="$(find dist -type f -size +"${CF_MAX_ASSET_BYTES}"c)"
+          if [ -n "$oversized" ]; then
+            echo "::error::Files exceed Cloudflare's 25 MiB per-asset limit:"
+            echo "$oversized"
+            exit 1
+          fi
+
+      - name: Upload built site
+        uses: actions/upload-artifact@v7
+        with:
+          name: site-dist
+          path: site/dist
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Fork PR notice
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          {
+            echo "### PR Preview Skipped (Fork PR)"
+            echo "Site build and verification passed. Cloudflare preview upload is skipped on fork PRs to protect credentials."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  preview:
+    name: PR Preview
+    needs: build
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Download built site
+        uses: actions/download-artifact@v8
+        with:
+          name: site-dist
+          path: site/dist
+
+      - name: Upload Cloudflare Workers preview version
+        id: cf_preview
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          rm -f "$WRANGLER_OUTPUT_FILE_PATH"
+          # The exact wrangler version locked in package-lock.json.
+          wrangler="wrangler@$(node -p "require('./package-lock.json').packages['node_modules/wrangler'].version")"
+
+          npx --yes "$wrangler" versions upload \
+            --preview-alias "pr-${PR_NUMBER}" \
+            --tag "pr-${PR_NUMBER}" \
+            --message "PR #${PR_NUMBER} (${COMMIT_SHA:0:7})"
+
+          alias_url="$(jq -r 'select(.type == "version-upload") | .preview_alias_url // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n 1)"
+          version_url="$(jq -r 'select(.type == "version-upload") | .preview_url // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n 1)"
+          version_id="$(jq -r 'select(.type == "version-upload") | .version_id // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n 1)"
+
+          if [ -z "$alias_url" ]; then
+            echo "::error::Wrangler uploaded version ${version_id:-unknown} without returning preview_alias_url. Ensure Version URLs (preview_urls: true) are enabled on Worker 'titan-mk'."
+            exit 1
+          fi
+
+          {
+            echo "alias_url=$alias_url"
+            echo "version_url=$version_url"
+            echo "version_id=$version_id"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### PR Preview Uploaded"
+            echo "- **Preview URL:** $alias_url"
+            echo "- **Immutable Version URL:** $version_url"
+            echo "- **Version ID:** \`$version_id\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post or update PR preview comment
+        uses: actions/github-script@v9
+        env:
+          ALIAS_URL: ${{ steps.cf_preview.outputs.alias_url }}
+          VERSION_URL: ${{ steps.cf_preview.outputs.version_url }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const marker = "<!-- mk-titan-lang-dev-preview -->";
+            const shortSha = process.env.COMMIT_SHA.slice(0, 7);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              marker,
+              "### mk.titan-lang.dev preview deployed",
+              "",
+              `- **Preview URL:** ${process.env.ALIAS_URL}`,
+              `- **Commit snapshot:** ${process.env.VERSION_URL}`,
+              `- **Commit:** \`${shortSha}\` ([workflow run](${runUrl}))`,
+            ].join("\n");
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((c) => c.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  production:
+    name: Production Deploy
+    needs: build
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    environment:
+      name: production
+      url: https://mk.titan-lang.dev
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Download built site
+        uses: actions/download-artifact@v8
+        with:
+          name: site-dist
+          path: site/dist
+
+      - name: Deploy to Cloudflare Workers (titan-mk)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-deploy.ndjson
+        run: |
+          set -euo pipefail
+          rm -f "$WRANGLER_OUTPUT_FILE_PATH"
+          # The exact wrangler version locked in package-lock.json.
+          wrangler="wrangler@$(node -p "require('./package-lock.json').packages['node_modules/wrangler'].version")"
+
+          npx --yes "$wrangler" deploy --message "Deploy ${GITHUB_SHA:0:7}"
+
+          version_id="$(jq -r 'select(.type == "deploy") | .version_id // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n 1)"
+          {
+            echo "### Production Deployed"
+            echo "- **Site:** https://mk.titan-lang.dev"
+            echo "- **Worker:** \`titan-mk\`"
+            echo "- **Version ID:** \`${version_id:-unknown}\`"
+            echo "- **Commit:** \`${GITHUB_SHA:0:7}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

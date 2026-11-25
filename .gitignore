@@ -3,3 +3,11 @@
 /dist/
 .titan-ls/
 *.rock
+
+# mk.titan-lang.dev site: dependencies, fetched/staged sources, and build outputs.
+/site/node_modules/
+/site/.astro/
+/site/.generated/
+/site/dist/
+/site/public/fonts/
+/site/public/assets/titan-logo.svg

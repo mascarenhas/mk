@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "titan-mk",
+  "compatibility_date": "2026-11-24",
+
+  // Intentionally omit `routes`:
+  // - Preserves the dashboard-managed Custom Domain (mk.titan-lang.dev).
+  // - Avoids requiring `Zone > Workers Routes > Write` on CF_API_TOKEN.
+  //
+  // Keep `titan-mk.<subdomain>.workers.dev` disabled while enabling PR Version URLs
+  // (`pr-<N>-titan-mk.<subdomain>.workers.dev`).
+  "workers_dev": false,
+  "preview_urls": true,
+
+  // Assets-only Worker: static assets (including 404.html) are served directly.
+  "assets": {
+    "directory": "./dist",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  }
+}

@@ -1,0 +1,31 @@
+---
+import { getEntry, render } from "astro:content";
+import DocsLayout from "@titan-lang/cassini/layouts/DocsLayout.astro";
+import { findPrevNext } from "@titan-lang/cassini/nav";
+import "../styles/brand.css";
+import { LAYOUT_PROPS, SITE, getManualToc } from "../site.config.mjs";
+import { SKILL_ROUTE } from "../routes.mjs";
+
+const entry = await getEntry("skill", "titan-mk");
+if (!entry) throw new Error("Missing staged skills/titan-mk/SKILL.md");
+const { Content, headings } = await render(entry);
+const title = headings.find((h) => h.depth === 1)?.text ?? "Using titan-mk";
+const data = entry.data as { name?: string; description?: string };
+const { prev, next } = findPrevNext(getManualToc().readingOrder, SKILL_ROUTE);
+---
+
+<DocsLayout
+  {...LAYOUT_PROPS}
+  title={title}
+  pageTitle={`${title} — Agent Skill — ${SITE.brandName}`}
+  description={data.description || `${title} — titan-mk agent skill`}
+  sidebarGroups={getManualToc().sidebarGroups}
+  headings={headings}
+  prev={prev}
+  next={next}
+  sectionLabel="Agent Skill"
+  kicker={`Agent Skill · ${data.name || "titan-mk"}`}
+  headerAction={{ label: "SKILL.md source ↗", href: SITE.skillSourceUrl }}
+>
+  <Content />
+</DocsLayout>

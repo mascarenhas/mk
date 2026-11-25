@@ -1,0 +1,236 @@
+---
+import { Code } from "astro:components";
+import BaseLayout from "@titan-lang/cassini/layouts/BaseLayout.astro";
+import InstallTabs from "@titan-lang/cassini/components/InstallTabs.astro";
+import { cassiniDarkTheme, cassiniPrintTheme, loadTitanLanguage } from "@titan-lang/cassini/shiki";
+import "../styles/brand.css";
+import { GRAMMAR_PATH, LAYOUT_PROPS, SITE, getManualToc } from "../site.config.mjs";
+import installPlatforms from "../content/site/install.json";
+
+const titanLang = loadTitanLanguage(GRAMMAR_PATH);
+
+const quickstart = `local mk = import "mk"
+local log = import "mk.log"
+local recover = import "mk.middleware.recover"
+local requestid = import "mk.middleware.requestid"
+local logger_mw = import "mk.middleware.logger"
+
+local function hello(ctx: mk.Context)
+  local name = ctx:param("name", "world")
+  local payload: {string: string} = {
+    ["hello"] = name,
+    ["request_id"] = ctx:request_id(),
+  }
+  ctx:json(payload)
+end
+
+function main(_args: {string}): integer
+  local app_logger = log.Logger("info")
+  defer app_logger:close()
+
+  local app = mk.App(mk.Config {
+    app_name = "demo",
+    logger = app_logger,
+    error_handler = mk.json_error_handler,
+  })
+
+  app:use(
+    requestid.new(),
+    recover.new(),
+    logger_mw.new()
+  )
+  app:get("/hello/:name?", hello):name("hello")
+
+  app:listen("127.0.0.1:8080")
+  return 0
+end`;
+
+// One card per Diátaxis quadrant, each opening that part's first chapter.
+const toc = getManualToc();
+const quadrants = [
+  {
+    match: /tutorial/i,
+    title: "Tutorials",
+    kicker: "Start Here",
+    body: "Step through a working bookmark service from the first route to typed JSON input, structured logging, and an in-memory test.",
+  },
+  {
+    match: /how-to/i,
+    title: "How-to Guides",
+    kicker: "Task Recipes",
+    body: "Focused directions for installation, static linking, routing, middleware stacks, streaming, WebSockets, worker pools, and coverage.",
+  },
+  {
+    match: /reference/i,
+    title: "Reference",
+    kicker: "13 Public Modules",
+    body: "Exact signatures, record fields, defaults, status codes, and error contracts across <code>mk</code>, <code>mk.router</code>, <code>mk.log</code>, and <code>mk.middleware.*</code>.",
+  },
+  {
+    match: /explanation/i,
+    title: "Explanation",
+    kicker: "Architecture",
+    body: "Design rationale behind two-tier PEG routing, non-intercepting observers, shared-nothing workers, and cross-state closure transfer.",
+  },
+].map((q) => {
+  const part = toc.parts.find((p) => q.match.test(p.title));
+  return { ...q, href: part?.entries[0]?.href ?? "/docs/" };
+});
+const tutorialHref = quadrants[0].href;
+const chapterCount = toc.parts.reduce((n, p) => n + p.entries.filter((e) => e.href.startsWith("/docs/")).length, 0);
+---
+
+<BaseLayout {...LAYOUT_PROPS} title={SITE.title} description={SITE.description}>
+  <main class="landing-page" data-pagefind-body>
+    <section class="hero">
+      <div class="logo-wrap">
+        <img
+          src={SITE.logoSrc}
+          alt="Titan passing in front of Saturn with edge-on rings"
+          width="136"
+          height="136"
+        />
+      </div>
+
+      <a class="release-pill" href="/changelog/">
+        <span class="release-dot" aria-hidden="true"></span>
+        <span>{SITE.versionBadge}</span>
+      </a>
+
+      <h1>titan-mk</h1>
+
+      <p class="hero-tagline">
+        An HTTP/1.1 web framework written in <a href="https://titan-lang.dev">Titan</a>.
+      </p>
+
+      <p class="hero-lead">
+        Compiled PEG routing, typed JSON body binding, non-suspending JSON-line logging, ten built-in
+        middleware modules, and shared-nothing OS worker threads—packaged as a single LuaRocks provider
+        for Titan {SITE.titanSeries}.
+      </p>
+
+      <nav class="hero-actions" aria-label="Primary actions">
+        <a class="btn btn-primary" href={tutorialHref}>Build Your First Service</a>
+        <a class="btn" href="/docs/">Read the Manual</a>
+        <a class="btn" href="/skill/">Agent Skill</a>
+      </nav>
+    </section>
+
+    <hr class="cassini-ring hero-divider" />
+
+    <section class="showcase-card" aria-label="titan-mk quickstart">
+      <div class="showcase-bar">
+        <span>app.titan</span>
+        <span class="showcase-bar-tag">Titan · Build &amp; Run</span>
+      </div>
+      <div class="showcase-body">
+        <div class="showcase-code">
+          <Code
+            code={quickstart}
+            lang={titanLang}
+            themes={{ dark: cassiniDarkTheme, light: cassiniPrintTheme }}
+            defaultColor="dark"
+          />
+        </div>
+        <div class="showcase-shell">
+          <pre><code><span class="t-pr">$ </span>titanc -o build --exe build/app app
+<span class="t-pr">$ </span>./build/app
+<span class="t-cm"># listening on 127.0.0.1:8080</span>
+<span class="t-pr">$ </span>curl -s 127.0.0.1:8080/hello/titan
+{'{"hello":"titan","request_id":"..."}'}</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="spotlights-grid" aria-label="Documentation map">
+      {quadrants.map((q) => (
+        <article class="spotlight-card">
+          <div>
+            <div class="kicker">{q.kicker}</div>
+            <h3>{q.title}</h3>
+            <p set:html={q.body} />
+          </div>
+          <div class="spotlight-links">
+            <a href={q.href}>Open {q.title} →</a>
+          </div>
+        </article>
+      ))}
+    </section>
+
+    <section class="features-grid" aria-label="Key capabilities">
+      <article class="feature-item">
+        <h2>Compiled PEG routing (<code>mk.router</code>)</h2>
+        <p>
+          Deterministic routes compile to single-pass <code>titan.peg</code> matchers; optional
+          parameters, in-segment delimiters, and multiple wildcards run in linear worst-case time
+          without backtracking.
+        </p>
+      </article>
+
+      <article class="feature-item">
+        <h2>Typed <code>Context</code> and JSON binding</h2>
+        <p>
+          Immutable <code>RequestMeta</code>, buffered and streaming responses, WebSocket upgrades,
+          commit and completion observers, and JSON-only <code>ctx:bind()</code> with exact
+          <code>415</code>, <code>413</code>, <code>400</code>, and <code>422</code> errors.
+        </p>
+      </article>
+
+      <article class="feature-item">
+        <h2>Shared-nothing worker threads</h2>
+        <p>
+          Dispatch routes on the <code>parent</code> event loop, across a round-robin
+          <code>pool</code> of OS worker threads, or onto isolated per-<code>session</code> workers
+          (persistent or <code>ephemeral</code>) with causal retirement.
+        </p>
+      </article>
+
+      <article class="feature-item">
+        <h2>Single-provider LuaRocks bundle</h2>
+        <p>
+          All 13 public modules compile into one <code>mk.so</code> + <code>mk.a</code> provider
+          (<code>mk.dll</code> on Windows), ready for dynamic or <code>--static</code> executables on
+          Linux and macOS.
+        </p>
+      </article>
+    </section>
+
+    <InstallTabs
+      heading="Install titan-mk"
+      kicker={`Version ${SITE.version} · Lua 5.5 & Titan ${SITE.titanSeries}`}
+      platforms={installPlatforms}
+    />
+
+    <section class="spotlights-grid" aria-label="Manual and agent skill">
+      <article class="spotlight-card">
+        <div>
+          <div class="kicker">The Manual · Version {SITE.version}</div>
+          <h3>The titan-mk Manual</h3>
+          <p>
+            {chapterCount} chapters covering tutorials, task-oriented how-to guides, complete module
+            references, and architecture notes—browse online or read directly inside the installed
+            LuaRocks package.
+          </p>
+        </div>
+        <div class="spotlight-links">
+          <a href="/docs/">Browse the Manual →</a>
+        </div>
+      </article>
+
+      <article class="spotlight-card">
+        <div>
+          <div class="kicker">Coding Agents · Bundled Skill</div>
+          <h3>Agent Operational Skill</h3>
+          <p>
+            A concise operational guide for coding agents covering routing rules, JSON binding errors,
+            worker closure transfer constraints, and middleware defaults—shipped directly inside the
+            LuaRocks package.
+          </p>
+        </div>
+        <div class="spotlight-links">
+          <a href="/skill/">Read the Agent Skill →</a>
+        </div>
+      </article>
+    </section>
+  </main>
+</BaseLayout>
